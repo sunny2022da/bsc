@@ -198,6 +198,9 @@ type Config struct {
 
 	// blob setting
 	BlobExtraReserve uint64
+
+	// EnableOpcodeOptimizations enables opcode level optimizations.
+	EnableOpcodeOptimizations bool
 }
 
 // CreateConsensusEngine creates a consensus engine for the given chain config.

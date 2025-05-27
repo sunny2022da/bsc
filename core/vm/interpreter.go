@@ -21,6 +21,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/math"
+	"github.com/ethereum/go-ethereum/core/opcodeCompiler/compiler"
 	"github.com/ethereum/go-ethereum/core/tracing"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/log"
@@ -29,10 +30,11 @@ import (
 
 // Config are the configuration options for the Interpreter
 type Config struct {
-	Tracer                  *tracing.Hooks
-	NoBaseFee               bool  // Forces the EIP-1559 baseFee to 0 (needed for 0 price calls)
-	EnablePreimageRecording bool  // Enables recording of SHA3/keccak preimages
-	ExtraEips               []int // Additional EIPS that are to be enabled
+	Tracer                    *tracing.Hooks
+	NoBaseFee                 bool  // Forces the EIP-1559 baseFee to 0 (needed for 0 price calls)
+	EnablePreimageRecording   bool  // Enables recording of SHA3/keccak preimages
+	ExtraEips                 []int // Additional EIPS that are to be enabled
+	EnableOpcodeOptimizations bool  // Enables opcode level optimizations
 
 	StatelessSelfValidation bool // Generate execution witnesses and self-check against them (testing purpose)
 }
@@ -99,6 +101,8 @@ type EVMInterpreter struct {
 
 	readOnly   bool   // Whether to throw on stateful modifications
 	returnData []byte // Last CALL's return data for subsequent reuse
+
+	opcodeProcessor *compiler.OpcodeProcessor // Opcode processor for optimizations
 }
 
 // NewEVMInterpreter returns a new instance of the Interpreter.
@@ -151,7 +155,18 @@ func NewEVMInterpreter(evm *EVM) *EVMInterpreter {
 		}
 	}
 	evm.Config.ExtraEips = extraEips
-	return &EVMInterpreter{evm: evm, table: table}
+
+	interpreter := &EVMInterpreter{
+		evm:   evm,
+		table: table,
+	}
+
+	// Initialize opcode processor if optimizations are enabled
+	if evm.Config.EnableOpcodeOptimizations {
+		interpreter.opcodeProcessor = compiler.NewOpcodeProcessor()
+	}
+
+	return interpreter
 }
 
 // Run loops and evaluates the contract's code with the given input data and returns
@@ -181,6 +196,11 @@ func (in *EVMInterpreter) Run(contract *Contract, input []byte, readOnly bool) (
 		return nil, nil
 	}
 
+	// Optimize the contract code if opcode optimizations are enabled
+	if in.evm.Config.EnableOpcodeOptimizations && in.opcodeProcessor != nil {
+		contract.Code = in.opcodeProcessor.Optimize(contract.Code)
+	}
+
 	var (
 		op          OpCode        // current opcode
 		mem         = NewMemory() // bound memory
@@ -196,9 +216,9 @@ func (in *EVMInterpreter) Run(contract *Contract, input []byte, readOnly bool) (
 		pc   = uint64(0) // program counter
 		cost uint64
 		// copies used by tracer
-		pcCopy  uint64 // needed for the deferred EVMLogger
-		gasCopy uint64 // for EVMLogger to log gas remaining before execution
-		logged  bool   // deferred EVMLogger should ignore already logged steps
+		pcCopy  uint64 // needed for the deferred Tracer
+		gasCopy uint64 // for Tracer to log gas remaining before execution
+		logged  bool   // deferred Tracer should ignore already logged steps
 		res     []byte // result of the opcode execution function
 		debug   = in.evm.Config.Tracer != nil
 	)

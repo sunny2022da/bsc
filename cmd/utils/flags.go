@@ -682,15 +682,19 @@ var (
 		Usage:    "Record information useful for VM and contract debugging",
 		Category: flags.VMCategory,
 	}
+	VMOpcodeOptimizeFlag = &cli.BoolFlag{
+		Name:     "vm.opcode.optimize",
+		Usage:    "Enable opcode level optimizations",
+		Category: flags.VMCategory,
+	}
 	VMTraceFlag = &cli.StringFlag{
-		Name:     "vmtrace",
-		Usage:    "Name of tracer which should record internal VM operations (costly)",
+		Name:     "vm.trace",
+		Usage:    "Enable VM tracing with the given tracer (e.g. 'callTracer')",
 		Category: flags.VMCategory,
 	}
 	VMTraceJsonConfigFlag = &cli.StringFlag{
-		Name:     "vmtrace.jsonconfig",
-		Usage:    "Tracer configuration (JSON)",
-		Value:    "{}",
+		Name:     "vm.trace.json",
+		Usage:    "JSON configuration for the VM tracer",
 		Category: flags.VMCategory,
 	}
 	// API options.
