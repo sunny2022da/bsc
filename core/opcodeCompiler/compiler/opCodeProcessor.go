@@ -1075,3 +1075,1073 @@ func isBlockTerminator(op ByteCode) bool {
 		return false
 	}
 }
+
+// CFGNode represents a node in the Control Flow Graph
+type CFGNode struct {
+	BlockIndex     int        // Index of the basic block in the blocks array
+	Block          BasicBlock // The basic block this node represents
+	Successors     []int      // Indices of successor blocks
+	Predecessors   []int      // Indices of predecessor blocks
+	Dominators     []int      // Indices of blocks that dominate this block
+	PostDominators []int      // Indices of blocks that post-dominate this block
+}
+
+// CFG represents the Control Flow Graph of a contract
+type CFG struct {
+	Nodes  []CFGNode    // All nodes in the CFG
+	Blocks []BasicBlock // The basic blocks
+	Entry  int          // Index of the entry block
+	Exit   int          // Index of the exit block (if any)
+}
+
+// BasicBlockOptimizations performs comprehensive basic block level optimizations
+// including CFG construction and various optimization passes
+func BasicBlockOptimizations(code []byte) ([]byte, error) {
+	if len(code) == 0 {
+		return code, nil
+	}
+
+	// Step 1: Generate basic blocks
+	blocks := GenerateBasicBlocks(code)
+	if len(blocks) == 0 {
+		return code, nil
+	}
+
+	// Step 2: Build Control Flow Graph
+	cfg, err := buildCFG(blocks, code)
+	if err != nil {
+		return code, err
+	}
+
+	// Step 3: Perform various optimization passes
+	optimizedCode, err := performOptimizationPasses(code, blocks, cfg)
+	if err != nil {
+		return code, err
+	}
+
+	return optimizedCode, nil
+}
+
+// detectFunctionSelectorPattern detects if a block contains a function selector pattern
+// This is common in Solidity contracts where the first 4 bytes of calldata determine the function
+func detectFunctionSelectorPattern(block BasicBlock) bool {
+	if len(block.Opcodes) < 4 {
+		return false
+	}
+
+	// Look for the common pattern: PUSH1 0x04, CALLDATALOAD, PUSH1 0xe0, SHR
+	// This extracts the function selector from calldata
+	for i := 0; i <= len(block.Opcodes)-4; i++ {
+		// Check for PUSH1 0x04
+		if ByteCode(block.Opcodes[i]) == PUSH1 && block.Opcodes[i+1] == 0x04 {
+			// Check for CALLDATALOAD
+			if i+2 < len(block.Opcodes) && ByteCode(block.Opcodes[i+2]) == CALLDATALOAD {
+				// Check for PUSH1 0xe0
+				if i+3 < len(block.Opcodes) && ByteCode(block.Opcodes[i+3]) == PUSH1 && block.Opcodes[i+4] == 0xe0 {
+					// Check for SHR
+					if i+5 < len(block.Opcodes) && ByteCode(block.Opcodes[i+5]) == SHR {
+						return true
+					}
+				}
+			}
+		}
+	}
+
+	return false
+}
+
+// buildCFG constructs a Control Flow Graph from basic blocks
+func buildCFG(blocks []BasicBlock, code []byte) (*CFG, error) {
+	if len(blocks) == 0 {
+		return nil, errors.New("no basic blocks to build CFG from")
+	}
+
+	cfg := &CFG{
+		Nodes:  make([]CFGNode, len(blocks)),
+		Blocks: blocks,
+		Entry:  0,
+		Exit:   -1,
+	}
+
+	// Initialize nodes
+	for i := range blocks {
+		cfg.Nodes[i] = CFGNode{
+			BlockIndex:     i,
+			Block:          blocks[i],
+			Successors:     []int{},
+			Predecessors:   []int{},
+			Dominators:     []int{},
+			PostDominators: []int{},
+		}
+	}
+
+	// Build edges between blocks
+	for i, block := range blocks {
+		// Find successors based on the last instruction
+		successors := findBlockSuccessors(block, blocks, code)
+		cfg.Nodes[i].Successors = successors
+
+		// Update predecessors for successors
+		for _, succ := range successors {
+			if succ >= 0 && succ < len(cfg.Nodes) {
+				cfg.Nodes[succ].Predecessors = append(cfg.Nodes[succ].Predecessors, i)
+			}
+		}
+	}
+
+	// Find exit blocks (blocks that end with STOP, RETURN, REVERT, etc.)
+	for i, block := range blocks {
+		if len(block.Opcodes) > 0 {
+			lastOp := ByteCode(block.Opcodes[len(block.Opcodes)-1])
+			if isExitOpcode(lastOp) {
+				cfg.Exit = i
+				break
+			}
+		}
+	}
+
+	// Compute dominators
+	computeDominators(cfg)
+
+	// Compute post-dominators
+	computePostDominators(cfg)
+
+	return cfg, nil
+}
+
+// findBlockSuccessors determines the successor blocks of a given block
+func findBlockSuccessors(block BasicBlock, blocks []BasicBlock, code []byte) []int {
+	var successors []int
+
+	if len(block.Opcodes) == 0 {
+		return successors
+	}
+
+	// Get the last instruction
+	lastOp := ByteCode(block.Opcodes[len(block.Opcodes)-1])
+
+	switch lastOp {
+	case STOP, RETURN, REVERT, SELFDESTRUCT:
+		// These are exit instructions, no successors
+		return successors
+
+	case JUMP:
+		// Unconditional jump - try to find the target block
+		targetPC := extractJumpTarget(block, code)
+		if targetPC > 0 {
+			// We found a constant target
+			targetBlock := findBlockByPC(blocks, targetPC)
+			if targetBlock >= 0 {
+				successors = append(successors, targetBlock)
+			}
+		} else {
+			// Dynamic jump - we can't determine the target statically
+			// Conservatively add all JUMPDEST blocks as potential targets
+			for i, b := range blocks {
+				if b.IsJumpDest {
+					successors = append(successors, i)
+				}
+			}
+		}
+
+	case JUMPI:
+		// Conditional jump - has two successors: fallthrough and jump target
+		// Fallthrough (next block)
+		nextBlock := findNextBlock(blocks, block.EndPC)
+		if nextBlock >= 0 {
+			successors = append(successors, nextBlock)
+		}
+
+		// Jump target
+		targetPC := extractJumpTarget(block, code)
+		if targetPC > 0 {
+			// We found a constant target
+			targetBlock := findBlockByPC(blocks, targetPC)
+			if targetBlock >= 0 {
+				successors = append(successors, targetBlock)
+			}
+		} else {
+			// Dynamic jump - we can't determine the target statically
+			// Conservatively add all JUMPDEST blocks as potential targets
+			for i, b := range blocks {
+				if b.IsJumpDest {
+					successors = append(successors, i)
+				}
+			}
+		}
+
+	default:
+		// Fallthrough to next block
+		nextBlock := findNextBlock(blocks, block.EndPC)
+		if nextBlock >= 0 {
+			successors = append(successors, nextBlock)
+		}
+	}
+
+	return successors
+}
+
+// extractJumpTarget extracts the jump target from a jump instruction
+// Note: This is a simplified approach that only handles constant jump targets
+// For dynamic jumps, we need more sophisticated analysis
+func extractJumpTarget(block BasicBlock, code []byte) uint64 {
+	if len(block.Opcodes) < 3 {
+		return 0
+	}
+
+	// Look for PUSH2 followed by JUMP/JUMPI pattern (constant targets only)
+	for i := 0; i < len(block.Opcodes)-3; i++ {
+		if ByteCode(block.Opcodes[i]) == PUSH2 {
+			// Check if the next instruction is JUMP or JUMPI
+			if i+3 < len(block.Opcodes) {
+				nextOp := ByteCode(block.Opcodes[i+3])
+				if nextOp == JUMP || nextOp == JUMPI {
+					// Extract the 2-byte target
+					target := uint64(block.Opcodes[i+1])<<8 | uint64(block.Opcodes[i+2])
+					return target
+				}
+			}
+		}
+	}
+
+	// Also check for PUSH1 followed by JUMP/JUMPI (1-byte targets)
+	for i := 0; i < len(block.Opcodes)-2; i++ {
+		if ByteCode(block.Opcodes[i]) == PUSH1 {
+			// Check if the next instruction is JUMP or JUMPI
+			if i+2 < len(block.Opcodes) {
+				nextOp := ByteCode(block.Opcodes[i+2])
+				if nextOp == JUMP || nextOp == JUMPI {
+					// Extract the 1-byte target
+					target := uint64(block.Opcodes[i+1])
+					return target
+				}
+			}
+		}
+	}
+
+	return 0
+}
+
+// findBlockByPC finds the block that contains the given PC
+func findBlockByPC(blocks []BasicBlock, pc uint64) int {
+	for i, block := range blocks {
+		if pc >= block.StartPC && pc < block.EndPC {
+			return i
+		}
+	}
+	return -1
+}
+
+// findNextBlock finds the block that starts at the given PC
+func findNextBlock(blocks []BasicBlock, pc uint64) int {
+	for i, block := range blocks {
+		if block.StartPC == pc {
+			return i
+		}
+	}
+	return -1
+}
+
+// isExitOpcode checks if an opcode is an exit instruction
+func isExitOpcode(op ByteCode) bool {
+	switch op {
+	case STOP, RETURN, REVERT, SELFDESTRUCT:
+		return true
+	default:
+		return false
+	}
+}
+
+// computeDominators computes the dominators for each node in the CFG
+func computeDominators(cfg *CFG) {
+	if len(cfg.Nodes) == 0 {
+		return
+	}
+
+	// Initialize dominators as sets
+	for i := range cfg.Nodes {
+		cfg.Nodes[i].Dominators = []int{}
+	}
+
+	// Entry node dominates itself
+	cfg.Nodes[cfg.Entry].Dominators = append(cfg.Nodes[cfg.Entry].Dominators, cfg.Entry)
+
+	// Iterative algorithm to compute dominators
+	changed := true
+	iterations := 0
+	maxIterations := len(cfg.Nodes) * 2 // Prevent infinite loops
+
+	for changed && iterations < maxIterations {
+		changed = false
+		iterations++
+
+		for i := range cfg.Nodes {
+			if i == cfg.Entry {
+				continue
+			}
+
+			// Find intersection of dominators of all predecessors
+			var newDominators []int
+
+			for _, pred := range cfg.Nodes[i].Predecessors {
+				if len(cfg.Nodes[pred].Dominators) > 0 {
+					if len(newDominators) == 0 {
+						newDominators = append(newDominators, cfg.Nodes[pred].Dominators...)
+					} else {
+						newDominators = intersect(newDominators, cfg.Nodes[pred].Dominators)
+					}
+				}
+			}
+
+			// Add self to dominators
+			newDominators = append(newDominators, i)
+
+			// Check if dominators changed
+			if !equalSlices(cfg.Nodes[i].Dominators, newDominators) {
+				cfg.Nodes[i].Dominators = newDominators
+				changed = true
+			}
+		}
+	}
+}
+
+// computePostDominators computes the post-dominators for each node in the CFG
+func computePostDominators(cfg *CFG) {
+	if len(cfg.Nodes) == 0 || cfg.Exit == -1 {
+		return
+	}
+
+	// Initialize post-dominators as sets
+	for i := range cfg.Nodes {
+		cfg.Nodes[i].PostDominators = []int{}
+	}
+
+	// Exit node post-dominates itself
+	cfg.Nodes[cfg.Exit].PostDominators = append(cfg.Nodes[cfg.Exit].PostDominators, cfg.Exit)
+
+	// Iterative algorithm to compute post-dominators
+	changed := true
+	iterations := 0
+	maxIterations := len(cfg.Nodes) * 2 // Prevent infinite loops
+
+	for changed && iterations < maxIterations {
+		changed = false
+		iterations++
+
+		for i := range cfg.Nodes {
+			if i == cfg.Exit {
+				continue
+			}
+
+			// Find intersection of post-dominators of all successors
+			var newPostDominators []int
+			for _, succ := range cfg.Nodes[i].Successors {
+				if len(cfg.Nodes[succ].PostDominators) > 0 {
+					if len(newPostDominators) == 0 {
+						newPostDominators = append(newPostDominators, cfg.Nodes[succ].PostDominators...)
+					} else {
+						newPostDominators = intersect(newPostDominators, cfg.Nodes[succ].PostDominators)
+					}
+				}
+			}
+
+			// Add self to post-dominators
+			newPostDominators = append(newPostDominators, i)
+
+			// Check if post-dominators changed
+			if !equalSlices(cfg.Nodes[i].PostDominators, newPostDominators) {
+				cfg.Nodes[i].PostDominators = newPostDominators
+				changed = true
+			}
+		}
+	}
+}
+
+// intersect returns the intersection of two slices
+func intersect(a, b []int) []int {
+	// Create a map for faster lookup
+	bMap := make(map[int]bool)
+	for _, val := range b {
+		bMap[val] = true
+	}
+
+	var result []int
+	for _, val := range a {
+		if bMap[val] {
+			result = append(result, val)
+		}
+	}
+	return result
+}
+
+// equalSlices checks if two slices are equal
+func equalSlices(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// performOptimizationPasses applies various optimization passes to the code
+func performOptimizationPasses(code []byte, blocks []BasicBlock, cfg *CFG) ([]byte, error) {
+	optimizedCode := make([]byte, len(code))
+	copy(optimizedCode, code)
+
+	// Pass 1: Unreachable Block Elimination
+	optimizedCode = eliminateUnreachableBlocks(optimizedCode, blocks, cfg)
+
+	// Pass 2: Constant Folding
+	optimizedCode = foldConstants(optimizedCode, blocks)
+
+	// Pass 3: Peephole Optimizations
+	optimizedCode = applyPeepholeOptimizations(optimizedCode, blocks)
+
+	// Pass 4: Opcode Fusion (existing logic)
+	fusedCode, err := applyOpcodeFusion(optimizedCode, blocks)
+	if err != nil {
+		// If opcode fusion fails, continue with the original code
+		// This is safe because opcode fusion is an optimization, not a requirement
+	} else {
+		optimizedCode = fusedCode
+	}
+
+	// Pass 5: Jump Optimization
+	optimizedCode = optimizeJumps(optimizedCode, blocks, cfg)
+
+	// Pass 6: Stack Optimization
+	optimizedCode = optimizeStack(optimizedCode, blocks)
+
+	return optimizedCode, nil
+}
+
+// applyPeepholeOptimizations applies various peephole optimizations
+func applyPeepholeOptimizations(code []byte, blocks []BasicBlock) []byte {
+	optimizedCode := make([]byte, len(code))
+	copy(optimizedCode, code)
+
+	// Process each block for peephole optimizations
+	for _, block := range blocks {
+		optimizedCode = applyPeepholeOptimizationsInBlock(optimizedCode, block)
+	}
+
+	return optimizedCode
+}
+
+// applyPeepholeOptimizationsInBlock applies peephole optimizations within a single block
+func applyPeepholeOptimizationsInBlock(code []byte, block BasicBlock) []byte {
+	startPC := int(block.StartPC)
+	endPC := int(block.EndPC)
+
+	// Look for peephole optimization patterns
+	for i := startPC; i < endPC-1; i++ {
+		if i >= len(code) {
+			break
+		}
+
+		// Pattern 1: Arithmetic optimizations
+		optimizedCode := applyArithmeticOptimizations(code, i, endPC)
+		if optimizedCode != nil {
+			code = optimizedCode
+			continue
+		}
+
+		// Pattern 2: Comparison optimizations
+		optimizedCode = applyComparisonOptimizations(code, i, endPC)
+		if optimizedCode != nil {
+			code = optimizedCode
+			continue
+		}
+
+		// Pattern 3: Stack operation optimizations
+		optimizedCode = applyStackOptimizations(code, i, endPC)
+		if optimizedCode != nil {
+			code = optimizedCode
+			continue
+		}
+
+		// Pattern 4: Memory/Storage optimizations
+		optimizedCode = applyMemoryOptimizations(code, i, endPC)
+		if optimizedCode != nil {
+			code = optimizedCode
+			continue
+		}
+
+		// Pattern 5: Logical operation optimizations
+		optimizedCode = applyLogicalOptimizations(code, i, endPC)
+		if optimizedCode != nil {
+			code = optimizedCode
+			continue
+		}
+	}
+
+	return code
+}
+
+// applyArithmeticOptimizations applies arithmetic peephole optimizations
+func applyArithmeticOptimizations(code []byte, i int, endPC int) []byte {
+	// Pattern 1: PUSH1 0 ADD -> NOP (add zero)
+	if i+2 < endPC && i+2 < len(code) {
+		if ByteCode(code[i]) == PUSH1 && code[i+1] == 0 && ByteCode(code[i+2]) == ADD {
+			code[i] = byte(Nop)
+			code[i+1] = byte(Nop)
+			code[i+2] = byte(Nop)
+			return code
+		}
+	}
+
+	// Pattern 2: PUSH1 0 MUL -> PUSH1 0 (multiply by zero)
+	if i+2 < endPC && i+2 < len(code) {
+		if ByteCode(code[i]) == PUSH1 && code[i+1] == 0 && ByteCode(code[i+2]) == MUL {
+			code[i] = byte(PUSH1)
+			code[i+1] = 0
+			code[i+2] = byte(Nop)
+			return code
+		}
+	}
+
+	// Pattern 3: PUSH1 1 MUL -> NOP (multiply by one)
+	if i+2 < endPC && i+2 < len(code) {
+		if ByteCode(code[i]) == PUSH1 && code[i+1] == 1 && ByteCode(code[i+2]) == MUL {
+			code[i] = byte(Nop)
+			code[i+1] = byte(Nop)
+			code[i+2] = byte(Nop)
+			return code
+		}
+	}
+
+	// Pattern 4: PUSH1 0 SUB -> NOP (subtract zero)
+	if i+2 < endPC && i+2 < len(code) {
+		if ByteCode(code[i]) == PUSH1 && code[i+1] == 0 && ByteCode(code[i+2]) == SUB {
+			code[i] = byte(Nop)
+			code[i+1] = byte(Nop)
+			code[i+2] = byte(Nop)
+			return code
+		}
+	}
+
+	// Pattern 5: PUSH1 1 DIV -> NOP (divide by one)
+	if i+2 < endPC && i+2 < len(code) {
+		if ByteCode(code[i]) == PUSH1 && code[i+1] == 1 && ByteCode(code[i+2]) == DIV {
+			code[i] = byte(Nop)
+			code[i+1] = byte(Nop)
+			code[i+2] = byte(Nop)
+			return code
+		}
+	}
+
+	// Pattern 6: PUSH1 0 EXP -> PUSH1 1 (zero to any power is one)
+	if i+2 < endPC && i+2 < len(code) {
+		if ByteCode(code[i]) == PUSH1 && code[i+1] == 0 && ByteCode(code[i+2]) == EXP {
+			code[i] = byte(PUSH1)
+			code[i+1] = 1
+			code[i+2] = byte(Nop)
+			return code
+		}
+	}
+
+	return nil
+}
+
+// applyComparisonOptimizations applies comparison peephole optimizations
+func applyComparisonOptimizations(code []byte, i int, endPC int) []byte {
+	// Pattern 1: PUSH1 0 EQ -> ISZERO
+	if i+2 < endPC && i+2 < len(code) {
+		if ByteCode(code[i]) == PUSH1 && code[i+1] == 0 && ByteCode(code[i+2]) == EQ {
+			code[i] = byte(ISZERO)
+			code[i+1] = byte(Nop)
+			code[i+2] = byte(Nop)
+			return code
+		}
+	}
+
+	// Pattern 2: PUSH1 0 GT -> PUSH1 0 (always false)
+	if i+2 < endPC && i+2 < len(code) {
+		if ByteCode(code[i]) == PUSH1 && code[i+1] == 0 && ByteCode(code[i+2]) == GT {
+			code[i] = byte(PUSH1)
+			code[i+1] = 0
+			code[i+2] = byte(Nop)
+			return code
+		}
+	}
+
+	// Pattern 3: PUSH1 0 LT -> PUSH1 0 (always false)
+	if i+2 < endPC && i+2 < len(code) {
+		if ByteCode(code[i]) == PUSH1 && code[i+1] == 0 && ByteCode(code[i+2]) == LT {
+			code[i] = byte(PUSH1)
+			code[i+1] = 0
+			code[i+2] = byte(Nop)
+			return code
+		}
+	}
+
+	// Pattern 4: PUSH1 0 SGT -> PUSH1 0 (always false)
+	if i+2 < endPC && i+2 < len(code) {
+		if ByteCode(code[i]) == PUSH1 && code[i+1] == 0 && ByteCode(code[i+2]) == SGT {
+			code[i] = byte(PUSH1)
+			code[i+1] = 0
+			code[i+2] = byte(Nop)
+			return code
+		}
+	}
+
+	// Pattern 5: PUSH1 0 SLT -> PUSH1 0 (always false)
+	if i+2 < endPC && i+2 < len(code) {
+		if ByteCode(code[i]) == PUSH1 && code[i+1] == 0 && ByteCode(code[i+2]) == SLT {
+			code[i] = byte(PUSH1)
+			code[i+1] = 0
+			code[i+2] = byte(Nop)
+			return code
+		}
+	}
+
+	return nil
+}
+
+// applyStackOptimizations applies stack operation peephole optimizations
+func applyStackOptimizations(code []byte, i int, endPC int) []byte {
+	// Pattern 1: DUP1 DUP1 -> DUP1 DUP2
+	if i+1 < endPC && i+1 < len(code) {
+		if ByteCode(code[i]) == DUP1 && ByteCode(code[i+1]) == DUP1 {
+			code[i+1] = byte(DUP2)
+			return code
+		}
+	}
+
+	// Pattern 2: SWAP1 SWAP1 -> NOP (swap twice is no-op)
+	if i+1 < endPC && i+1 < len(code) {
+		if ByteCode(code[i]) == SWAP1 && ByteCode(code[i+1]) == SWAP1 {
+			code[i] = byte(Nop)
+			code[i+1] = byte(Nop)
+			return code
+		}
+	}
+
+	// Pattern 3: DUP1 SWAP1 -> SWAP1 DUP2
+	if i+1 < endPC && i+1 < len(code) {
+		if ByteCode(code[i]) == DUP1 && ByteCode(code[i+1]) == SWAP1 {
+			code[i] = byte(SWAP1)
+			code[i+1] = byte(DUP2)
+			return code
+		}
+	}
+
+	// Pattern 4: POP POP -> POP2 (if available)
+	if i+1 < endPC && i+1 < len(code) {
+		if ByteCode(code[i]) == POP && ByteCode(code[i+1]) == POP {
+			code[i] = byte(Pop2)
+			code[i+1] = byte(Nop)
+			return code
+		}
+	}
+
+	// Pattern 5: DUP1 POP -> NOP (duplicate then pop is no-op)
+	if i+1 < endPC && i+1 < len(code) {
+		if ByteCode(code[i]) == DUP1 && ByteCode(code[i+1]) == POP {
+			code[i] = byte(Nop)
+			code[i+1] = byte(Nop)
+			return code
+		}
+	}
+
+	// Pattern 6: SWAP1 POP -> POP (swap then pop is just pop)
+	if i+1 < endPC && i+1 < len(code) {
+		if ByteCode(code[i]) == SWAP1 && ByteCode(code[i+1]) == POP {
+			code[i] = byte(POP)
+			code[i+1] = byte(Nop)
+			return code
+		}
+	}
+
+	return nil
+}
+
+// applyMemoryOptimizations applies memory and storage peephole optimizations
+func applyMemoryOptimizations(code []byte, i int, endPC int) []byte {
+	// Pattern 1: PUSH1 0 MSTORE -> MSTORE8 (if value is small)
+	if i+3 < endPC && i+3 < len(code) {
+		if ByteCode(code[i]) == PUSH1 && code[i+1] == 0 && ByteCode(code[i+2]) == MSTORE {
+			// Check if the next instruction is a small value
+			if i+4 < len(code) && ByteCode(code[i+4]) == PUSH1 {
+				value := code[i+5]
+				if value <= 255 {
+					code[i+2] = byte(MSTORE8)
+				}
+			}
+			return code
+		}
+	}
+
+	// Pattern 2: PUSH1 0 SLOAD -> PUSH1 0 (load zero slot)
+	if i+2 < endPC && i+2 < len(code) {
+		if ByteCode(code[i]) == PUSH1 && code[i+1] == 0 && ByteCode(code[i+2]) == SLOAD {
+			code[i] = byte(PUSH1)
+			code[i+1] = 0
+			code[i+2] = byte(Nop)
+			return code
+		}
+	}
+
+	// Pattern 3: PUSH1 0 SSTORE -> NOP (store to zero slot, but keep for side effects)
+	// Note: We don't optimize this as SSTORE has side effects
+
+	return nil
+}
+
+// applyLogicalOptimizations applies logical operation peephole optimizations
+func applyLogicalOptimizations(code []byte, i int, endPC int) []byte {
+	// Pattern 1: PUSH1 0 AND -> PUSH1 0 (AND with zero is zero)
+	if i+2 < endPC && i+2 < len(code) {
+		if ByteCode(code[i]) == PUSH1 && code[i+1] == 0 && ByteCode(code[i+2]) == AND {
+			code[i] = byte(PUSH1)
+			code[i+1] = 0
+			code[i+2] = byte(Nop)
+			return code
+		}
+	}
+
+	// Pattern 2: PUSH1 0 OR -> NOP (OR with zero is no-op)
+	if i+2 < endPC && i+2 < len(code) {
+		if ByteCode(code[i]) == PUSH1 && code[i+1] == 0 && ByteCode(code[i+2]) == OR {
+			code[i] = byte(Nop)
+			code[i+1] = byte(Nop)
+			code[i+2] = byte(Nop)
+			return code
+		}
+	}
+
+	// Pattern 3: PUSH1 0 XOR -> NOP (XOR with zero is no-op)
+	if i+2 < endPC && i+2 < len(code) {
+		if ByteCode(code[i]) == PUSH1 && code[i+1] == 0 && ByteCode(code[i+2]) == XOR {
+			code[i] = byte(Nop)
+			code[i+1] = byte(Nop)
+			code[i+2] = byte(Nop)
+			return code
+		}
+	}
+
+	// Pattern 4: PUSH1 0xFF AND -> NOP (AND with 0xFF is no-op for single byte)
+	if i+2 < endPC && i+2 < len(code) {
+		if ByteCode(code[i]) == PUSH1 && code[i+1] == 0xFF && ByteCode(code[i+2]) == AND {
+			code[i] = byte(Nop)
+			code[i+1] = byte(Nop)
+			code[i+2] = byte(Nop)
+			return code
+		}
+	}
+
+	// Pattern 5: NOT NOT -> NOP (double negation)
+	if i+1 < endPC && i+1 < len(code) {
+		if ByteCode(code[i]) == NOT && ByteCode(code[i+1]) == NOT {
+			code[i] = byte(Nop)
+			code[i+1] = byte(Nop)
+			return code
+		}
+	}
+
+	// Pattern 6: ISZERO ISZERO -> NOP (double iszero)
+	if i+1 < endPC && i+1 < len(code) {
+		if ByteCode(code[i]) == ISZERO && ByteCode(code[i+1]) == ISZERO {
+			code[i] = byte(Nop)
+			code[i+1] = byte(Nop)
+			return code
+		}
+	}
+
+	return nil
+}
+
+// eliminateUnreachableBlocks removes unreachable basic blocks using CFG-based reachability analysis
+// This is different from traditional "dead code elimination" because basic blocks by definition
+// don't contain dead code - they end at terminators. This function removes entire blocks
+// that cannot be reached from the entry point.
+func eliminateUnreachableBlocks(code []byte, blocks []BasicBlock, cfg *CFG) []byte {
+	if len(blocks) == 0 {
+		return code
+	}
+
+	// Mark all reachable blocks starting from entry
+	reachable := make(map[int]bool)
+	markReachable(cfg.Entry, cfg, reachable)
+
+	// Create new code with only reachable blocks
+	var newCode []byte
+	lastEndPC := uint64(0)
+
+	for i, block := range blocks {
+		if reachable[i] {
+			// Add any gap between blocks
+			if block.StartPC > lastEndPC {
+				// Fill gap with NOPs or keep original bytes
+				gapSize := block.StartPC - lastEndPC
+				for j := uint64(0); j < gapSize; j++ {
+					newCode = append(newCode, byte(Nop))
+				}
+			}
+
+			// Add the reachable block
+			newCode = append(newCode, block.Opcodes...)
+			lastEndPC = block.EndPC
+		}
+	}
+
+	// If no reachable blocks, return original code
+	if len(newCode) == 0 {
+		return code
+	}
+
+	return newCode
+}
+
+// markReachable recursively marks all reachable blocks
+func markReachable(blockIndex int, cfg *CFG, reachable map[int]bool) {
+	if reachable[blockIndex] {
+		return
+	}
+	reachable[blockIndex] = true
+
+	// Mark all successors as reachable
+	for _, succ := range cfg.Nodes[blockIndex].Successors {
+		if succ >= 0 && succ < len(cfg.Nodes) {
+			markReachable(succ, cfg, reachable)
+		}
+	}
+}
+
+// foldConstants performs constant folding optimization
+func foldConstants(code []byte, blocks []BasicBlock) []byte {
+	// Create a copy of the code
+	optimizedCode := make([]byte, len(code))
+	copy(optimizedCode, code)
+
+	// Process each block for constant folding
+	for _, block := range blocks {
+		optimizedCode = foldConstantsInBlock(optimizedCode, block)
+	}
+
+	return optimizedCode
+}
+
+// foldConstantsInBlock performs constant folding within a single block
+func foldConstantsInBlock(code []byte, block BasicBlock) []byte {
+	startPC := int(block.StartPC)
+	endPC := int(block.EndPC)
+
+	// Simple constant folding patterns
+	for i := startPC; i < endPC-2; i++ {
+		if i >= len(code) {
+			break
+		}
+
+		// Pattern 1: PUSH1 x PUSH1 y ADD -> PUSH1 (x+y)
+		if i+4 < endPC && i+4 < len(code) {
+			if ByteCode(code[i]) == PUSH1 && ByteCode(code[i+2]) == PUSH1 && ByteCode(code[i+4]) == ADD {
+				val1 := uint64(code[i+1])
+				val2 := uint64(code[i+2+1])
+				result := val1 + val2
+				if result <= 255 {
+					// Replace with single PUSH1
+					code[i] = byte(PUSH1)
+					code[i+1] = byte(result)
+					// NOP out the rest
+					code[i+2] = byte(Nop)
+					code[i+3] = byte(Nop)
+					code[i+4] = byte(Nop)
+				}
+			}
+		}
+
+		// Pattern 2: PUSH1 x PUSH1 y SUB -> PUSH1 (x-y) if x >= y
+		if i+4 < endPC && i+4 < len(code) {
+			if ByteCode(code[i]) == PUSH1 && ByteCode(code[i+2]) == PUSH1 && ByteCode(code[i+4]) == SUB {
+				val1 := uint64(code[i+1])
+				val2 := uint64(code[i+2+1])
+				if val1 >= val2 {
+					result := val1 - val2
+					// Replace with single PUSH1
+					code[i] = byte(PUSH1)
+					code[i+1] = byte(result)
+					// NOP out the rest
+					code[i+2] = byte(Nop)
+					code[i+3] = byte(Nop)
+					code[i+4] = byte(Nop)
+				}
+			}
+		}
+
+		// Pattern 3: PUSH1 0 ISZERO -> PUSH1 1
+		if i+2 < endPC && i+2 < len(code) {
+			if ByteCode(code[i]) == PUSH1 && code[i+1] == 0 && ByteCode(code[i+2]) == ISZERO {
+				code[i] = byte(PUSH1)
+				code[i+1] = 1
+				code[i+2] = byte(Nop)
+			}
+		}
+
+		// Pattern 4: PUSH1 x PUSH1 0 ADD -> PUSH1 x
+		if i+4 < endPC && i+4 < len(code) {
+			if ByteCode(code[i]) == PUSH1 && ByteCode(code[i+2]) == PUSH1 && code[i+2+1] == 0 && ByteCode(code[i+4]) == ADD {
+				// Keep the first PUSH1, NOP out the rest
+				code[i+2] = byte(Nop)
+				code[i+3] = byte(Nop)
+				code[i+4] = byte(Nop)
+			}
+		}
+
+		// Pattern 5: PUSH1 x PUSH1 0 MUL -> PUSH1 0
+		if i+4 < endPC && i+4 < len(code) {
+			if ByteCode(code[i]) == PUSH1 && ByteCode(code[i+2]) == PUSH1 && code[i+2+1] == 0 && ByteCode(code[i+4]) == MUL {
+				code[i] = byte(PUSH1)
+				code[i+1] = 0
+				code[i+2] = byte(Nop)
+				code[i+3] = byte(Nop)
+				code[i+4] = byte(Nop)
+			}
+		}
+	}
+
+	return code
+}
+
+// applyOpcodeFusion applies the existing opcode fusion logic
+func applyOpcodeFusion(code []byte, blocks []BasicBlock) ([]byte, error) {
+	// Use the existing CFG-based fusion logic
+	return DoCFGBasedOpcodeFusion(code)
+}
+
+// optimizeJumps optimizes jump instructions
+func optimizeJumps(code []byte, blocks []BasicBlock, cfg *CFG) []byte {
+	optimizedCode := make([]byte, len(code))
+	copy(optimizedCode, code)
+
+	// Process each block for jump optimizations
+	for _, block := range blocks {
+		optimizedCode = optimizeJumpsInBlock(optimizedCode, block, blocks)
+	}
+
+	return optimizedCode
+}
+
+// optimizeJumpsInBlock performs jump optimizations within a single block
+func optimizeJumpsInBlock(code []byte, block BasicBlock, blocks []BasicBlock) []byte {
+	startPC := int(block.StartPC)
+	endPC := int(block.EndPC)
+
+	// Look for jump optimization patterns
+	for i := startPC; i < endPC-2; i++ {
+		if i >= len(code) {
+			break
+		}
+
+		// Pattern 1: Remove unnecessary jumps (jump to next instruction)
+		if i+3 < endPC && i+3 < len(code) {
+			if ByteCode(code[i]) == PUSH2 && ByteCode(code[i+3]) == JUMP {
+				target := uint64(code[i+1])<<8 | uint64(code[i+2])
+				if target == uint64(i+4) { // Jump to next instruction
+					// Replace with NOPs
+					code[i] = byte(Nop)
+					code[i+1] = byte(Nop)
+					code[i+2] = byte(Nop)
+					code[i+3] = byte(Nop)
+				}
+			}
+		}
+
+		// Pattern 2: Optimize conditional jumps with constant conditions
+		if i+4 < endPC && i+4 < len(code) {
+			if ByteCode(code[i]) == PUSH1 && ByteCode(code[i+2]) == PUSH2 && ByteCode(code[i+5]) == JUMPI {
+				condition := code[i+1]
+				if condition == 0 { // Always false condition
+					// Remove the conditional jump entirely
+					code[i] = byte(Nop)
+					code[i+1] = byte(Nop)
+					code[i+2] = byte(Nop)
+					code[i+3] = byte(Nop)
+					code[i+4] = byte(Nop)
+					code[i+5] = byte(Nop)
+				} else if condition == 1 { // Always true condition
+					// Convert to unconditional jump
+					target := uint64(code[i+3])<<8 | uint64(code[i+4])
+					code[i] = byte(PUSH2)
+					code[i+1] = byte(target >> 8)
+					code[i+2] = byte(target & 0xFF)
+					code[i+3] = byte(JUMP)
+					code[i+4] = byte(Nop)
+					code[i+5] = byte(Nop)
+				}
+			}
+		}
+
+		// Pattern 3: Optimize ISZERO + JUMPI patterns
+		if i+4 < endPC && i+4 < len(code) {
+			if ByteCode(code[i]) == ISZERO && ByteCode(code[i+1]) == PUSH2 && ByteCode(code[i+4]) == JUMPI {
+				// This is already optimized by the existing fusion patterns
+				// Just ensure it's properly handled
+			}
+		}
+	}
+
+	return code
+}
+
+// optimizeStack optimizes stack operations
+func optimizeStack(code []byte, blocks []BasicBlock) []byte {
+	optimizedCode := make([]byte, len(code))
+	copy(optimizedCode, code)
+
+	// Process each block for stack optimizations
+	for _, block := range blocks {
+		optimizedCode = optimizeStackInBlock(optimizedCode, block)
+	}
+
+	return optimizedCode
+}
+
+// optimizeStackInBlock performs stack optimizations within a single block
+func optimizeStackInBlock(code []byte, block BasicBlock) []byte {
+	startPC := int(block.StartPC)
+	endPC := int(block.EndPC)
+
+	// Look for stack optimization patterns
+	for i := startPC; i < endPC-1; i++ {
+		if i >= len(code) {
+			break
+		}
+
+		// Pattern 1: Remove unnecessary DUP operations
+		if i+2 < endPC && i+2 < len(code) {
+			if ByteCode(code[i]) == DUP1 && ByteCode(code[i+1]) == POP {
+				// DUP1 followed by POP is a no-op
+				code[i] = byte(Nop)
+				code[i+1] = byte(Nop)
+			}
+		}
+
+		// Pattern 2: Optimize SWAP sequences
+		if i+3 < endPC && i+3 < len(code) {
+			if ByteCode(code[i]) == SWAP1 && ByteCode(code[i+1]) == SWAP1 {
+				// SWAP1 SWAP1 is a no-op
+				code[i] = byte(Nop)
+				code[i+1] = byte(Nop)
+			}
+		}
+
+		// Pattern 3: Remove dead code after STOP/RETURN/REVERT
+		if i < endPC && i < len(code) {
+			op := ByteCode(code[i])
+			if op == STOP || op == RETURN || op == REVERT {
+				// NOP out any remaining instructions in this block
+				for j := i + 1; j < endPC && j < len(code); j++ {
+					code[j] = byte(Nop)
+				}
+				break
+			}
+		}
+	}
+
+	return code
+}
