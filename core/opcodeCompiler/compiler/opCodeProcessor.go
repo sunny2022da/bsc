@@ -8,8 +8,9 @@ import (
 )
 
 var (
-	enabled     bool
-	codeCache   *OpCodeCache
+	enabled bool
+	// codeCache   *OpCodeCache
+	codeCache   *OptimizedOpCodeCache
 	taskChannel chan optimizeTask
 )
 
@@ -48,8 +49,9 @@ func init() {
 	if taskNumber < 1 {
 		taskNumber = 1
 	}
-	codeCache = getOpCodeCacheInstance()
+	//codeCache = getOpCodeCacheInstance()
 
+	codeCache = getOptimizedOpCodeCacheInstance()
 	for i := 0; i < taskNumber; i++ {
 		go taskProcessor()
 	}

@@ -151,7 +151,7 @@ func nextPowerOfTwoLockFree(n int) int {
 var lockFreeOpcodeCache *LockFreeOpCodeCache
 
 func init() {
-	lockFreeOpcodeCache = NewLockFreeOpCodeCache(1024)
+	lockFreeOpcodeCache = NewLockFreeOpCodeCache(1024 * 1024)
 }
 
 func getLockFreeOpCodeCacheInstance() *LockFreeOpCodeCache {

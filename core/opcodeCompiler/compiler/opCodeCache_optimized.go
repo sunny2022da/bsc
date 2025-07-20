@@ -116,7 +116,7 @@ var optimizedOpcodeCache *OptimizedOpCodeCache
 
 func init() {
 	// Initialize with 16 shards, 64 entries per shard (total 1024 entries)
-	optimizedOpcodeCache = NewOptimizedOpCodeCache(16, 64)
+	optimizedOpcodeCache = NewOptimizedOpCodeCache(1024, 1024)
 }
 
 func getOptimizedOpCodeCacheInstance() *OptimizedOpCodeCache {
