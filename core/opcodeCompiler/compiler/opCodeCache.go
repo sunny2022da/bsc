@@ -6,7 +6,7 @@ import (
 )
 
 type OpCodeCache struct {
-	optimizedCodeCache *lru.Cache[common.Hash, []byte]
+	optimizedCodeCache *lru.LockFreeCache[common.Hash, []byte]
 	bitvecCache        *lru.Cache[common.Hash, []byte]
 }
 
@@ -41,7 +41,7 @@ const (
 
 func init() {
 	opcodeCache = &OpCodeCache{
-		optimizedCodeCache: lru.NewCache[common.Hash, []byte](optimizedCodeCacheCap),
+		optimizedCodeCache: lru.NewLockFreeCache[common.Hash, []byte](optimizedCodeCacheCap),
 		bitvecCache:        lru.NewCache[common.Hash, []byte](bitvecCacheCap),
 	}
 }
