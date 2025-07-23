@@ -125,6 +125,9 @@ type EVM struct {
 	precompiles     map[common.Address]PrecompiledContract
 	optInterpreter  *EVMInterpreter
 	baseInterpreter *EVMInterpreter
+	mirInterpreter  *MIRInterpreterAdapter
+	// cache MIR CFGs per code hash to avoid regenerating each call
+	mirCFGCache sync.Map // key: common.Hash, value: interface{} (compiler.CFG)
 }
 
 // NewEVM constructs an EVM instance with the supplied block context, state
@@ -148,6 +151,9 @@ func NewEVM(blockCtx BlockContext, statedb StateDB, chainConfig *params.ChainCon
 		evm.optInterpreter.CopyAndInstallSuperInstruction()
 		evm.interpreter = evm.optInterpreter
 		compiler.EnableOptimization()
+
+		// Initialize MIR interpreter for advanced optimizations
+		evm.mirInterpreter = NewMIRInterpreterAdapter(evm)
 	}
 	return evm
 }
@@ -263,16 +269,24 @@ func (evm *EVM) Call(caller ContractRef, addr common.Address, input []byte, gas 
 				contract := GetContract(caller, AccountRef(addrCopy), value, gas)
 				defer ReturnContract(contract)
 				codeHash := evm.resolveCodeHash(addrCopy)
-				contract.optimized, code = tryGetOptimizedCode(evm, codeHash, code)
-				if contract.optimized {
+				contract.optimized, code = tryGetOptimizedCodeWithMIR(evm, codeHash, code, contract)
+				//runStart := time.Now()
+
+				// Choose interpreter based on available optimizations
+				if contract.HasMIRCode() && evm.mirInterpreter != nil {
+					// Use MIR interpreter for contracts with MIR representation
+					contract.SetCallCode(&addrCopy, codeHash, code)
+					ret, err = evm.mirInterpreter.Run(contract, input, false)
+				} else if contract.optimized {
 					evm.UseOptInterpreter()
-					contract.codeBitmapFunc = codeBitmapWhitSI
+					contract.SetCallCode(&addrCopy, codeHash, code)
+					ret, err = evm.interpreter.Run(contract, input, false)
 				} else {
 					evm.UseBaseInterpreter()
+					contract.SetCallCode(&addrCopy, codeHash, code)
+					ret, err = evm.interpreter.Run(contract, input, false)
 				}
 				contract.IsSystemCall = isSystemCall(caller)
-				contract.SetCallCode(&addrCopy, codeHash, code)
-				ret, err = evm.interpreter.Run(contract, input, false)
 				gas = contract.Gas
 			} else {
 				addrCopy := addr
@@ -547,8 +561,53 @@ func tryGetOptimizedCode(evm *EVM, codeHash common.Hash, rawCode []byte) (bool, 
 		code = optCode
 		optimized = true
 	} else {
-		compiler.GenOrLoadOptimizedCode(codeHash, rawCode)
+		// Try to generate optimized code synchronously
+		optCode, err := compiler.GenOrRewriteOptimizedCode(codeHash, rawCode)
+		if err == nil && len(optCode) != 0 {
+			code = optCode
+			optimized = true
+		}
 	}
+	return optimized, code
+}
+
+// tryGetOptimizedCodeWithMIR attempts to get optimized code and load MIR CFG from cache for MIR interpreter execution
+func tryGetOptimizedCodeWithMIR(evm *EVM, codeHash common.Hash, rawCode []byte, contract *Contract) (bool, []byte) {
+	var code []byte
+	optimized := false
+	code = rawCode
+
+	// Check if MIR optimization is enabled
+	if evm.Config.EnableOpcodeOptimizations && evm.mirInterpreter != nil && compiler.IsOpcodeParseEnabled() {
+		// Try global compiler MIR CFG cache first
+		if cfg := compiler.LoadMIRCFG(codeHash); cfg != nil {
+			contract.SetMIRCFG(cfg)
+			return false, rawCode
+		}
+
+		// If no cached CFG, try to generate-and-cache synchronously as fallback
+		cfg, err := compiler.TryGenerateMIRCFG(codeHash, rawCode)
+		if err == nil && cfg != nil {
+			contract.SetMIRCFG(cfg)
+			return false, rawCode
+		}
+	}
+
+	// Superinstruction path: Traditional bytecode optimization
+	// First try to load cached optimized code
+	optCode := compiler.LoadOptimizedCode(codeHash)
+	if len(optCode) != 0 {
+		code = optCode
+		optimized = true
+	} else {
+		// Generate optimized code (superinstruction only, MIR already attempted above)
+		optCode, err := compiler.GenOrRewriteOptimizedCode(codeHash, rawCode)
+		if err == nil && len(optCode) != 0 {
+			code = optCode
+			optimized = true
+		}
+	}
+
 	return optimized, code
 }
 

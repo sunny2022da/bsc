@@ -8,9 +8,12 @@ import (
 )
 
 var (
-	enabled     bool
-	codeCache   *OpCodeCache
-	taskChannel chan optimizeTask
+	enabled            bool
+	opcodeParseEnabled bool
+	codeCache          *OpCodeCache
+	taskChannel        chan optimizeTask
+	// MIR-related variables
+	mirTaskChannel chan mirOptimizeTask
 )
 
 var (
@@ -28,6 +31,12 @@ const (
 	maxOptimizedOpcode = 0xcf
 )
 
+// MIR task types
+const (
+	generateMIR mirOptimizeTaskType = 1
+	flushMIR    mirOptimizeTaskType = 2
+)
+
 type OpCodeProcessorConfig struct {
 	DoOpcodeFusion bool
 }
@@ -42,16 +51,36 @@ type optimizeTask struct {
 	rawCode  []byte
 }
 
+// MIR optimization task structure
+type mirOptimizeTask struct {
+	taskType mirOptimizeTaskType
+	hash     common.Hash
+	rawCode  []byte
+}
+
+type mirOptimizeTaskType byte
+
 func init() {
 	taskChannel = make(chan optimizeTask, taskChannelSize)
 	taskNumber := runtime.NumCPU() / 8 // No need to use too many threads.
+	mirTaskChannel = make(chan mirOptimizeTask, taskChannelSize)
 	if taskNumber < 1 {
 		taskNumber = 1
 	}
 	codeCache = getOpCodeCacheInstance()
 
+	// Start superinstruction task processors
 	for i := 0; i < taskNumber; i++ {
 		go taskProcessor()
+	}
+
+	// Start MIR task processors (fewer threads due to larger memory footprint)
+	mirTaskNumber := taskNumber / 2
+	if mirTaskNumber < 1 {
+		mirTaskNumber = 1
+	}
+	for i := 0; i < mirTaskNumber; i++ {
+		go mirTaskProcessor()
 	}
 }
 
@@ -68,6 +97,18 @@ func DisableOptimization() {
 
 func IsEnabled() bool {
 	return enabled
+}
+
+func EnableOpcodeParse() {
+	if opcodeParseEnabled {
+		return
+	}
+	opcodeParseEnabled = true
+}
+
+// IsOpcodeParseEnabled returns whether opcode parsing (MIR optimization) is enabled
+func IsOpcodeParseEnabled() bool {
+	return opcodeParseEnabled
 }
 
 func LoadOptimizedCode(hash common.Hash) []byte {
@@ -118,18 +159,42 @@ func handleOptimizationTask(task optimizeTask) {
 	}
 }
 
+// MIR task processor (similar to taskProcessor)
+func mirTaskProcessor() {
+	for {
+		task := <-mirTaskChannel
+		handleMIROptimizationTask(task)
+	}
+}
+
+// Handle MIR optimization tasks
+func handleMIROptimizationTask(task mirOptimizeTask) {
+	switch task.taskType {
+	case generateMIR:
+		TryGenerateMIRCFG(task.hash, task.rawCode)
+	case flushMIR:
+		DeleteMIRCFGCache(task.hash)
+	}
+}
+
 // GenOrRewriteOptimizedCode generate the optimized code and refresh the code cache.
+// This function now only handles superinstruction optimization, as MIR CFG is generated separately
 func GenOrRewriteOptimizedCode(hash common.Hash, code []byte) ([]byte, error) {
 	if !enabled {
 		return nil, ErrOptimizedDisabled
 	}
+
 	processedCode, err := processByteCodes(code)
 	if err != nil {
 		return nil, err
 	}
+
 	codeCache.AddCodeCache(hash, processedCode)
 	return processedCode, err
 }
+
+// GenOrRewriteOptimizedCodeWithoutMIR function removed - it was identical to GenOrRewriteOptimizedCode after MIR refactoring
+// All calls have been replaced with GenOrRewriteOptimizedCode for simplicity
 
 func TryGenerateOptimizedCode(hash common.Hash, code []byte) ([]byte, error) {
 	processedCode := codeCache.GetCachedCode(hash)
@@ -148,8 +213,39 @@ func DeleteCodeCache(hash common.Hash) {
 	codeCache.RemoveCachedCode(hash)
 }
 
+// MIR-related functions (similar to superinstruction functions)
+
+// GenOrLoadMIRCFG triggers async MIR CFG generation (similar to GenOrLoadOptimizedCode)
+func GenOrLoadMIRCFG(hash common.Hash, code []byte) {
+	if !enabled || !opcodeParseEnabled {
+		return
+	}
+	task := mirOptimizeTask{generateMIR, hash, code}
+	mirTaskChannel <- task
+}
+
+// TryGenerateMIRCFG attempts to generate and cache MIR CFG (similar to TryGenerateOptimizedCode)
+func TryGenerateMIRCFG(hash common.Hash, code []byte) (*CFG, error) {
+	cachedCFG := mirCache.GetCachedCFG(hash)
+	var err error = nil
+	if cachedCFG == nil {
+		cachedCFG, err = GenerateMIRCFG(hash, code)
+		if err == nil && cachedCFG != nil {
+			mirCache.AddCFGCache(hash, cachedCFG)
+		}
+	}
+	return cachedCFG, err
+}
+
+// DeleteMIRCFGCache removes MIR CFG from cache (similar to DeleteCodeCache)
+func DeleteMIRCFGCache(hash common.Hash) {
+	if !enabled {
+		return
+	}
+	mirCache.RemoveCFGCache(hash)
+}
+
 func processByteCodes(code []byte) ([]byte, error) {
-	//return doOpcodesProcess(code)
 	return DoCFGBasedOpcodeFusion(code)
 }
 
