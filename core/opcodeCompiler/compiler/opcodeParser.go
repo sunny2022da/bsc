@@ -313,12 +313,16 @@ func GenerateMIRCFG(hash common.Hash, code []byte) (*CFG, error) {
 			// No known entry; clear stack to start fresh and let PHI creation fill in
 			valueStack.resetTo(nil)
 		}
-		// Only rebuild if entry height changed or block wasn't built before
+		// Rebuild if entry height changed, parent count changed, or block wasn't built before
 		currentEntryH := -1
 		if es := curBB.EntryStack(); es != nil {
 			currentEntryH = len(es)
 		}
-		if !curBB.built || curBB.lastEntryHeight != currentEntryH {
+		currentParentCount := len(curBB.Parents())
+		
+		if !curBB.built || 
+			curBB.lastEntryHeight != currentEntryH || 
+			curBB.lastParentCount != currentParentCount {
 			err := cfg.buildBasicBlock(curBB, &valueStack, memoryAccessor, stateAccessor, &unprcessedBBs)
 			if err != nil {
 				log.Error(err.Error())
@@ -326,6 +330,7 @@ func GenerateMIRCFG(hash common.Hash, code []byte) (*CFG, error) {
 			}
 			curBB.built = true
 			curBB.lastEntryHeight = currentEntryH
+			curBB.lastParentCount = currentParentCount
 		}
 	}
 	log.Warn("===================CFG DUMP=============================")
@@ -894,14 +899,20 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 						}
 						// Enqueue target if newly created, or if it existed but just gained a new parent
 						if !targetExists || (targetExists && !hadParentBefore) {
-							// Rebuild only if entry height changed to avoid churn
+							// Rebuild if entry height changed OR parent count changed
 							newEntryH := depth
 							if targetBB.EntryStack() != nil {
 								newEntryH = len(targetBB.EntryStack())
 							}
-							if !targetBB.queued && targetBB.lastEntryHeight != newEntryH {
+							newParentCount := len(targetBB.Parents())
+							
+							// Trigger rebuild on height change OR parent count change
+							if !targetBB.queued && (
+								targetBB.lastEntryHeight != newEntryH || 
+								targetBB.lastParentCount != newParentCount) {
 								targetBB.queued = true
 								targetBB.lastEntryHeight = newEntryH
+								targetBB.lastParentCount = newParentCount
 								unprcessedBBs.Push(targetBB)
 							}
 						}
@@ -970,9 +981,15 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 								if fallthroughBB.EntryStack() != nil {
 									newEntryHF = len(fallthroughBB.EntryStack())
 								}
-								if !fallthroughBB.queued && fallthroughBB.lastEntryHeight != newEntryHF {
+								newFallParentCount := len(fallthroughBB.Parents())
+								
+								// Trigger rebuild on height change OR parent count change
+								if !fallthroughBB.queued && (
+									fallthroughBB.lastEntryHeight != newEntryHF || 
+									fallthroughBB.lastParentCount != newFallParentCount) {
 									fallthroughBB.queued = true
 									fallthroughBB.lastEntryHeight = newEntryHF
+									fallthroughBB.lastParentCount = newFallParentCount
 									unprcessedBBs.Push(fallthroughBB)
 								}
 							}
@@ -991,9 +1008,15 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 							if targetBB.EntryStack() != nil {
 								newEntryH = len(targetBB.EntryStack())
 							}
-							if !targetBB.queued && targetBB.lastEntryHeight != newEntryH {
+							newParentCount := len(targetBB.Parents())
+							
+							// Trigger rebuild on height change OR parent count change
+							if !targetBB.queued && (
+								targetBB.lastEntryHeight != newEntryH || 
+								targetBB.lastParentCount != newParentCount) {
 								targetBB.queued = true
 								targetBB.lastEntryHeight = newEntryH
+								targetBB.lastParentCount = newParentCount
 								unprcessedBBs.Push(targetBB)
 							}
 						}
@@ -1002,9 +1025,15 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 							if fallthroughBB.EntryStack() != nil {
 								newEntryHF = len(fallthroughBB.EntryStack())
 							}
-							if !fallthroughBB.queued && fallthroughBB.lastEntryHeight != newEntryHF {
+							newFallParentCount := len(fallthroughBB.Parents())
+							
+							// Trigger rebuild on height change OR parent count change
+							if !fallthroughBB.queued && (
+								fallthroughBB.lastEntryHeight != newEntryHF || 
+								fallthroughBB.lastParentCount != newFallParentCount) {
 								fallthroughBB.queued = true
 								fallthroughBB.lastEntryHeight = newEntryHF
+								fallthroughBB.lastParentCount = newFallParentCount
 								unprcessedBBs.Push(fallthroughBB)
 							}
 						}

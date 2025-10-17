@@ -57,9 +57,10 @@ type MIRBasicBlock struct {
 	// Precomputed live-outs: definitions (MIR) whose values are live at block exit
 	liveOutDefs []*MIR
 	// Build bookkeeping
-	built           bool // set true after first successful build
-	queued          bool // true if currently enqueued for (re)build
-	lastEntryHeight int  // last known/assumed entry stack height used to build (-1 if unknown)
+	built            bool // set true after first successful build
+	queued           bool // true if currently enqueued for (re)build
+	lastEntryHeight  int  // last known/assumed entry stack height used to build (-1 if unknown)
+	lastParentCount  int  // last known parent count when block was built
 }
 
 func (b *MIRBasicBlock) Size() uint {
@@ -323,6 +324,7 @@ func NewMIRBasicBlock(blockNum, pc uint, parent *MIRBasicBlock) *MIRBasicBlock {
 	bb.built = false
 	bb.queued = false
 	bb.lastEntryHeight = -1
+	bb.lastParentCount = 0
 	if parent != nil {
 		bb.SetParents([]*MIRBasicBlock{parent})
 	}
