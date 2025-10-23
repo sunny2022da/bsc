@@ -33,15 +33,15 @@ type StateDBAccessor interface {
 	AddAddressToAccessList(addr common.Address)
 	IsSlotInAccessList(addr common.Address, slot common.Hash) bool
 	AddSlotToAccessList(addr common.Address, slot common.Hash)
-	
+
 	// State operations
 	GetState(addr common.Address, slot common.Hash) common.Hash
 	GetCommittedState(addr common.Address, slot common.Hash) common.Hash
-	
+
 	// Refund operations
 	AddRefund(gas uint64)
 	SubRefund(gas uint64)
-	
+
 	// Account operations
 	IsAccountEmpty(addr common.Address) bool
 	HasSelfDestructed(addr common.Address) bool
@@ -113,13 +113,13 @@ type MIRExecutionEnv struct {
 	Origin [20]byte
 
 	// Gas metering (provided by adapter)
-	GasLookup      GasLookup      // Gas cost lookup interface (queries JumpTable)
-	GasConsumer    GasConsumer    // Gas consumption interface (accesses contract.Gas)
+	GasLookup       GasLookup       // Gas cost lookup interface (queries JumpTable)
+	GasConsumer     GasConsumer     // Gas consumption interface (accesses contract.Gas)
 	StateDBAccessor StateDBAccessor // State access interface (for warm/cold gas, refunds, etc.)
-	
+
 	// Contract context (for gas calculations)
 	ContractAddress common.Address // Current contract address
-	SelfBalance     uint64          // Contract's balance (for SELFDESTRUCT)
+	SelfBalance     uint64         // Contract's balance (for SELFDESTRUCT)
 }
 
 // MIRInterpreter executes MIR instructions and produces values.
@@ -319,7 +319,7 @@ func needsMemoryUpdate(op MirOperation) bool {
 // This is called after charging dynamic gas for memory expansion
 func (it *MIRInterpreter) updateLastMemoryGasCost(m *MIR) {
 	var offset, length uint64
-	
+
 	// Extract memory parameters based on opcode
 	switch m.op {
 	case MirMLOAD:
@@ -405,25 +405,25 @@ func (it *MIRInterpreter) updateLastMemoryGasCost(m *MIR) {
 	default:
 		return
 	}
-	
+
 	if length == 0 {
 		return
 	}
-	
+
 	// Calculate new memory size
 	newMemSize := offset + length
 	if newMemSize == 0 {
 		return
 	}
-	
+
 	newMemSizeWords := toWordSize(newMemSize)
 	newMemSize = newMemSizeWords * 32
-	
+
 	currentMemSize := uint64(len(it.memory))
 	if newMemSize <= currentMemSize {
 		return
 	}
-	
+
 	// Update cumulative memory gas cost
 	const MemoryGas = uint64(3)
 	const QuadCoeffDiv = uint64(512)
@@ -492,7 +492,7 @@ func (it *MIRInterpreter) RunMIR(block *MIRBasicBlock) ([]byte, error) {
 	}
 	// Track current block for PHI resolution
 	it.currentBB = block
-	
+
 	// ============================================================================
 	// Gas Metering: Charge static gas for the entire BasicBlock
 	// ============================================================================
@@ -506,7 +506,7 @@ func (it *MIRInterpreter) RunMIR(block *MIRBasicBlock) ([]byte, error) {
 	if err := it.chargeStaticGasForBlock(block); err != nil {
 		return nil, err // Out of gas
 	}
-	
+
 	// Fast path: if the block contains only NOPs and a terminal STOP, skip the exec loop.
 	// This is common for trivially folded sequences like PUSH/PUSH/ADD/MUL -> NOPs + STOP.
 	{
@@ -713,7 +713,7 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 			}
 		}
 	}
-	
+
 	// Try fast handler if available
 	if h := mirHandlers[byte(m.op)]; h != nil {
 		if it.tracerEx != nil {
@@ -1194,7 +1194,7 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 		}
 		dataOff := it.evalValue(m.oprands[0])
 		dataSz := it.evalValue(m.oprands[1])
-		
+
 		data := it.readMem(dataOff, dataSz)
 		// collect topics (each is 32 bytes in value form)
 		topics := make([][32]byte, 0, numTopics)
@@ -1527,7 +1527,7 @@ func mirHandleMLOAD(it *MIRInterpreter, m *MIR) error {
 		return fmt.Errorf("MLOAD missing operands")
 	}
 	off := it.evalValue(m.oprands[0])
-	
+
 	it.readMem32Into(off, &it.scratch32)
 	it.setResult(m, it.tmpA.Clear().SetBytes(it.scratch32[:]))
 	return nil
@@ -1741,7 +1741,7 @@ func mirHandleMCOPY(it *MIRInterpreter, m *MIR) error {
 	d := it.evalValue(m.oprands[0])
 	s := it.evalValue(m.oprands[1])
 	l := it.evalValue(m.oprands[2])
-	
+
 	it.memCopy(d, s, l)
 	return nil
 }
@@ -1795,7 +1795,7 @@ func mirHandleEXP(it *MIRInterpreter, m *MIR) error {
 	if err != nil {
 		return err
 	}
-	
+
 	// Dynamic gas calculation based on exponent byte length
 	if it.env != nil && it.env.GasConsumer != nil {
 		expByteLen := uint64((b.BitLen() + 7) / 8)
@@ -1813,7 +1813,7 @@ func mirHandleEXP(it *MIRInterpreter, m *MIR) error {
 			}
 		}
 	}
-	
+
 	// EVM EXP: base is top (a), exponent is next (b)
 	it.setResult(m, it.tmpA.Clear().Exp(a, b))
 	return nil
@@ -1834,7 +1834,7 @@ func mirHandleKECCAK(it *MIRInterpreter, m *MIR) error {
 	} else {
 		off, sz = aval, bval
 	}
-	
+
 	bytesToHash := it.readMemView(off, sz)
 	h := crypto.Keccak256(bytesToHash)
 	it.setResult(m, it.tmpA.Clear().SetBytes(h))
@@ -1920,23 +1920,7 @@ func (it *MIRInterpreter) execArithmetic(m *MIR) error {
 		out = it.tmpA.Clear().SMod(a, b)
 	case MirEXP:
 		// EVM EXP: base is top (a), exponent is next (b) => a^b
-		// Dynamic gas calculation based on exponent byte length
-		if it.env != nil && it.env.GasConsumer != nil {
-			expByteLen := uint64((b.BitLen() + 7) / 8)
-			var dynamicGas uint64
-			if it.env.IsEIP158 {
-				// EIP-158 (Spurious Dragon): 50 gas per byte
-				dynamicGas = expByteLen * 50
-			} else {
-				// Frontier: 10 gas per byte
-				dynamicGas = expByteLen * 10
-			}
-			if dynamicGas > 0 {
-				if !it.useGas(dynamicGas) {
-					return errors.New("out of gas")
-				}
-			}
-		}
+		// Note: Dynamic gas is now handled centrally in exec() via mirGasTable
 		out = it.tmpA.Clear().Exp(a, b)
 	case MirSIGNEXT:
 		// Sign-extend byte at index a in value b
@@ -2528,46 +2512,48 @@ func toWordSize(size uint64) uint64 {
 }
 
 // calculateMemoryGasCost computes the gas cost for expanding memory to newMemSize bytes.
-// This implements the quadratic memory expansion formula: 
-//   cost = (memory_size_word * memory_size_word) / 512 + (3 * memory_size_word)
+// This implements the quadratic memory expansion formula:
+//
+//	cost = (memory_size_word * memory_size_word) / 512 + (3 * memory_size_word)
+//
 // Returns only the *incremental* gas (newTotalCost - lastTotalCost)
-// 
+//
 // Constants used:
-//   MemoryGas = 3 (linear coefficient)
-//   QuadCoeffDiv = 512 (quadratic coefficient divisor)
+//
+//	MemoryGas = 3 (linear coefficient)
+//	QuadCoeffDiv = 512 (quadratic coefficient divisor)
 func (it *MIRInterpreter) calculateMemoryGasCost(newMemSize uint64) (uint64, error) {
 	if newMemSize == 0 {
 		return 0, nil
 	}
-	
+
 	// Check for overflow: maximum memory size that won't overflow gas calculation
 	// 0x1FFFFFFFE0 is the highest number that can be used without overflowing
 	if newMemSize > 0x1FFFFFFFE0 {
 		return 0, errors.New("gas uint overflow")
 	}
-	
+
 	newMemSizeWords := toWordSize(newMemSize)
 	newMemSize = newMemSizeWords * 32
-	
+
 	currentMemSize := uint64(len(it.memory))
-	
+
 	// Only charge gas if we're expanding memory
 	if newMemSize > currentMemSize {
 		const MemoryGas = uint64(3)
 		const QuadCoeffDiv = uint64(512)
-		
+
 		square := newMemSizeWords * newMemSizeWords
 		linCoef := newMemSizeWords * MemoryGas
 		quadCoef := square / QuadCoeffDiv
 		newTotalFee := linCoef + quadCoef
-		
+
 		// Calculate incremental gas
 		fee := newTotalFee - it.lastMemoryGasCost
 		it.lastMemoryGasCost = newTotalFee
-		
+
 		return fee, nil
 	}
-	
+
 	return 0, nil
 }
-

@@ -666,17 +666,17 @@ func (b *MIRBasicBlock) CreateBlockInfoMIR(op MirOperation, stack *ValueStack) *
 		mir.oprands = []*Value{&offset}
 
 	case MirCALLDATACOPY:
-		// pops: dest, offset, size
-		size := stack.pop()
-		offset := stack.pop()
+		// pops: dest, offset, size (from stack top to bottom)
 		dest := stack.pop()
+		offset := stack.pop()
+		size := stack.pop()
 		mir.oprands = []*Value{&dest, &offset, &size}
 
 	case MirCODECOPY:
-		// pops: dest, offset, size
-		size := stack.pop()
-		offset := stack.pop()
+		// pops: dest, offset, size (from stack top to bottom)
 		dest := stack.pop()
+		offset := stack.pop()
+		size := stack.pop()
 		mir.oprands = []*Value{&dest, &offset, &size}
 
 	case MirEXTCODESIZE:
@@ -685,18 +685,18 @@ func (b *MIRBasicBlock) CreateBlockInfoMIR(op MirOperation, stack *ValueStack) *
 		mir.oprands = []*Value{&addr}
 
 	case MirEXTCODECOPY:
-		// pops: address, dest, offset, size
-		size := stack.pop()
-		offset := stack.pop()
-		dest := stack.pop()
+		// pops: address, dest, offset, size (from stack top to bottom)
 		addr := stack.pop()
+		dest := stack.pop()
+		offset := stack.pop()
+		size := stack.pop()
 		mir.oprands = []*Value{&addr, &dest, &offset, &size}
 
 	case MirRETURNDATACOPY:
-		// pops: dest, offset, size
-		size := stack.pop()
-		offset := stack.pop()
+		// pops: dest, offset, size (from stack top to bottom)
 		dest := stack.pop()
+		offset := stack.pop()
+		size := stack.pop()
 		mir.oprands = []*Value{&dest, &offset, &size}
 
 	case MirEXTCODEHASH:
@@ -714,10 +714,10 @@ func (b *MIRBasicBlock) CreateBlockInfoMIR(op MirOperation, stack *ValueStack) *
 		// Immediate-indexed load in EOF; not modeled via stack here
 
 	case MirDATACOPY:
-		// pops: dest, offset, size
-		size := stack.pop()
-		offset := stack.pop()
+		// pops: dest, offset, size (from stack top to bottom)
 		dest := stack.pop()
+		offset := stack.pop()
+		size := stack.pop()
 		mir.oprands = []*Value{&dest, &offset, &size}
 
 	case MirRETURNDATALOAD:
@@ -826,6 +826,24 @@ func (b *MIRBasicBlock) CreateSystemOpMIR(op MirOperation, stack *ValueStack) *M
 func (b *MIRBasicBlock) CreateLogMIR(op MirOperation, stack *ValueStack) *MIR {
 	mir := new(MIR)
 	mir.op = op
+
+	// EVM LOG 操作：从栈顶依次 pop offset, size, topics
+	// LOG0: pops offset, size (2 operands)
+	// LOG1: pops offset, size, topic1 (3 operands)
+	// LOG2: pops offset, size, topic1, topic2 (4 operands)
+	// LOG3: pops offset, size, topic1, topic2, topic3 (5 operands)
+	// LOG4: pops offset, size, topic1, topic2, topic3, topic4 (6 operands)
+	offset := stack.pop()
+	size := stack.pop()
+	mir.oprands = []*Value{&offset, &size}
+
+	// 根据 LOG0-LOG4，pop 相应数量的 topics
+	numTopics := int(op - MirLOG0)
+	for i := 0; i < numTopics; i++ {
+		topic := stack.pop()
+		mir.oprands = append(mir.oprands, &topic)
+	}
+
 	stack.push(mir.Result())
 	mir = b.appendMIR(mir)
 	mir.genStackDepth = stack.size()
