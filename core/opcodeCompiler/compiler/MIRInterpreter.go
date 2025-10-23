@@ -64,6 +64,7 @@ type MIRExecutionEnv struct {
 	BlobHashFunc func(index uint64) [32]byte
 
 	// Fork flags (set by adapter from EVM chain rules)
+	IsEIP158         bool // Spurious Dragon (EIP-158)
 	IsByzantium      bool
 	IsConstantinople bool
 	IsIstanbul       bool
@@ -1015,6 +1016,25 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 		}
 		dataOff := it.evalValue(m.oprands[0])
 		dataSz := it.evalValue(m.oprands[1])
+		
+		// Dynamic gas calculation for LOG
+		// LOG gas = memory expansion gas + 8 gas per byte of data
+		if it.env.GasConsumer != nil {
+			// Calculate memory expansion gas
+			if err := it.chargeDynamicMemoryGas(dataOff.Uint64(), dataSz.Uint64()); err != nil {
+				return err
+			}
+			
+			// Calculate and charge data gas: 8 gas per byte
+			const LogDataGas = uint64(8)
+			dataGas := dataSz.Uint64() * LogDataGas
+			if dataGas > 0 {
+				if !it.useGas(dataGas) {
+					return errors.New("out of gas")
+				}
+			}
+		}
+		
 		data := it.readMem(dataOff, dataSz)
 		// collect topics (each is 32 bytes in value form)
 		topics := make([][32]byte, 0, numTopics)
@@ -1637,6 +1657,25 @@ func mirHandleEXP(it *MIRInterpreter, m *MIR) error {
 	if err != nil {
 		return err
 	}
+	
+	// Dynamic gas calculation based on exponent byte length
+	if it.env != nil && it.env.GasConsumer != nil {
+		expByteLen := uint64((b.BitLen() + 7) / 8)
+		var dynamicGas uint64
+		if it.env.IsEIP158 {
+			// EIP-158 (Spurious Dragon): 50 gas per byte
+			dynamicGas = expByteLen * 50
+		} else {
+			// Frontier: 10 gas per byte
+			dynamicGas = expByteLen * 10
+		}
+		if dynamicGas > 0 {
+			if !it.useGas(dynamicGas) {
+				return errors.New("out of gas")
+			}
+		}
+	}
+	
 	// EVM EXP: base is top (a), exponent is next (b)
 	it.setResult(m, it.tmpA.Clear().Exp(a, b))
 	return nil
@@ -1748,6 +1787,23 @@ func (it *MIRInterpreter) execArithmetic(m *MIR) error {
 		out = it.tmpA.Clear().SMod(a, b)
 	case MirEXP:
 		// EVM EXP: base is top (a), exponent is next (b) => a^b
+		// Dynamic gas calculation based on exponent byte length
+		if it.env != nil && it.env.GasConsumer != nil {
+			expByteLen := uint64((b.BitLen() + 7) / 8)
+			var dynamicGas uint64
+			if it.env.IsEIP158 {
+				// EIP-158 (Spurious Dragon): 50 gas per byte
+				dynamicGas = expByteLen * 50
+			} else {
+				// Frontier: 10 gas per byte
+				dynamicGas = expByteLen * 10
+			}
+			if dynamicGas > 0 {
+				if !it.useGas(dynamicGas) {
+					return errors.New("out of gas")
+				}
+			}
+		}
 		out = it.tmpA.Clear().Exp(a, b)
 	case MirSIGNEXT:
 		// Sign-extend byte at index a in value b

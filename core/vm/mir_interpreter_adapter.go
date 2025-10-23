@@ -312,6 +312,7 @@ func (adapter *MIRInterpreterAdapter) setupExecutionEnvironment(contract *Contra
 
 	// Set fork flags from chain rules
 	rules := adapter.evm.chainRules
+	env.IsEIP158 = rules.IsEIP158
 	env.IsByzantium = rules.IsByzantium
 	env.IsConstantinople = rules.IsConstantinople
 	env.IsIstanbul = rules.IsIstanbul
