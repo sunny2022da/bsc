@@ -11,6 +11,69 @@ import (
 	"github.com/holiman/uint256"
 )
 
+// ============================================================================
+// Gas Metering Wrappers
+// ============================================================================
+
+// jumpTableGasLookup implements compiler.GasLookup interface
+// It queries gas costs from the EVMInterpreter's JumpTable
+type jumpTableGasLookup struct {
+	table *JumpTable // Reference to EVMInterpreter's JumpTable
+	evm   *EVM       // Reference to EVM (for potential dynamic gas calculation)
+}
+
+// GetStaticGas returns the constantGas for the specified opcode
+func (g *jumpTableGasLookup) GetStaticGas(opcode byte) uint64 {
+	if g.table == nil {
+		return 0
+	}
+	if int(opcode) >= len(g.table) {
+		return 0
+	}
+	operation := g.table[opcode]
+	if operation == nil {
+		return 0
+	}
+	return operation.constantGas
+}
+
+// contractGasConsumer implements compiler.GasConsumer interface
+// It wraps *Contract's gas operations to avoid circular dependency
+type contractGasConsumer struct {
+	contract *Contract
+}
+
+// UseGas consumes the specified amount of gas
+// Behavior matches Contract.UseGas() in interpreter.go:
+// - If insufficient gas: return error WITHOUT modifying contract.Gas
+// - If sufficient gas: deduct gas and return nil
+func (c *contractGasConsumer) UseGas(gas uint64) error {
+	if c.contract == nil {
+		return nil
+	}
+	if c.contract.Gas < gas {
+		// Match EVMInterpreter behavior: do NOT modify gas on OOG
+		return ErrOutOfGas
+	}
+	c.contract.Gas -= gas
+	return nil
+}
+
+// RefundGas refunds the specified amount of gas
+func (c *contractGasConsumer) RefundGas(gas uint64) {
+	if c.contract != nil {
+		c.contract.Gas += gas
+	}
+}
+
+// GetGas returns the remaining gas
+func (c *contractGasConsumer) GetGas() uint64 {
+	if c.contract == nil {
+		return 0
+	}
+	return c.contract.Gas
+}
+
 // MIRInterpreterAdapter adapts MIRInterpreter to work with EVM's interpreter interface
 type MIRInterpreterAdapter struct {
 	evm            *EVM
@@ -266,6 +329,20 @@ func (adapter *MIRInterpreterAdapter) setupExecutionEnvironment(contract *Contra
 			return false
 		}
 		return contract.isCode(pc)
+	}
+
+	// ============================================================================
+	// Gas Metering Setup
+	// ============================================================================
+	// Set up GasLookup to query gas costs from the EVMInterpreter's JumpTable
+	env.GasLookup = &jumpTableGasLookup{
+		table: adapter.evm.interpreter.table,
+		evm:   adapter.evm,
+	}
+
+	// Set up GasConsumer to access contract's gas state
+	env.GasConsumer = &contractGasConsumer{
+		contract: contract,
 	}
 }
 

@@ -9,6 +9,20 @@ import (
 	"github.com/holiman/uint256"
 )
 
+// GasConsumer defines the interface for gas consumption operations
+// This interface is implemented by vm.Contract through a wrapper in mir_interpreter_adapter.go
+type GasConsumer interface {
+	UseGas(gas uint64) error // Consume gas, return error if insufficient
+	RefundGas(gas uint64)    // Refund gas
+	GetGas() uint64          // Get remaining gas
+}
+
+// GasLookup defines the interface for querying gas costs from JumpTable
+// This interface is implemented in mir_interpreter_adapter.go to access vm.JumpTable
+type GasLookup interface {
+	GetStaticGas(opcode byte) uint64 // Get constantGas for an opcode
+}
+
 // MIRExecutionEnv contains minimal execution context required by the interpreter.
 // It is intentionally small; we can expand as more MIROperations are wired.
 type MIRExecutionEnv struct {
@@ -73,6 +87,10 @@ type MIRExecutionEnv struct {
 	Self   [20]byte
 	Caller [20]byte
 	Origin [20]byte
+
+	// Gas metering (provided by adapter)
+	GasLookup   GasLookup   // Gas cost lookup interface (queries JumpTable)
+	GasConsumer GasConsumer // Gas consumption interface (accesses contract.Gas)
 }
 
 // MIRInterpreter executes MIR instructions and produces values.
@@ -225,6 +243,86 @@ func (it *MIRInterpreter) GetEnv() *MIRExecutionEnv {
 	return it.env
 }
 
+// ============================================================================
+// Gas Metering Helper Methods
+// ============================================================================
+
+// useGas attempts to consume the specified amount of gas
+// Returns false if there is insufficient gas
+func (it *MIRInterpreter) useGas(gas uint64) bool {
+	if it.env == nil || it.env.GasConsumer == nil {
+		return true // No gas consumer, skip check (for testing/simulation)
+	}
+	err := it.env.GasConsumer.UseGas(gas)
+	return err == nil
+}
+
+// refundGas refunds the specified amount of gas
+func (it *MIRInterpreter) refundGas(gas uint64) {
+	if it.env != nil && it.env.GasConsumer != nil {
+		it.env.GasConsumer.RefundGas(gas)
+	}
+}
+
+// getGas returns the remaining gas
+func (it *MIRInterpreter) getGas() uint64 {
+	if it.env == nil || it.env.GasConsumer == nil {
+		return ^uint64(0) // Return max value to indicate unlimited gas
+	}
+	return it.env.GasConsumer.GetGas()
+}
+
+// chargeStaticGasForBlock charges static gas for an entire BasicBlock
+// by iterating through the original EVM bytecode (firstPC to lastPC)
+// This ensures PUSH instructions' gas is correctly accounted for
+func (it *MIRInterpreter) chargeStaticGasForBlock(block *MIRBasicBlock) error {
+	if it.env == nil {
+		return nil // No environment, skip
+	}
+	if it.env.GasLookup == nil {
+		return nil // No gas lookup available, skip
+	}
+	if it.env.GasConsumer == nil {
+		return nil // No gas consumer available, skip
+	}
+	if it.env.Code == nil || len(it.env.Code) == 0 {
+		return nil // No code available, skip
+	}
+
+	code := it.env.Code
+	firstPC := block.FirstPC()
+	lastPC := block.LastPC()
+
+	// Iterate through EVM bytecode range
+	for pc := firstPC; pc <= lastPC; {
+		if pc >= uint(len(code)) {
+			break
+		}
+
+		op := code[pc]
+
+		// Query static gas (constantGas) from JumpTable
+		staticGas := it.env.GasLookup.GetStaticGas(op)
+
+		// Deduct static gas
+		if staticGas > 0 {
+			if !it.useGas(staticGas) {
+				return errors.New("out of gas")
+			}
+		}
+
+		// Handle PUSH instruction data bytes (must skip to avoid treating data as opcodes)
+		if op >= 0x60 && op <= 0x7f { // PUSH1 (0x60) ~ PUSH32 (0x7f)
+			pushSize := uint(op - 0x5f) // PUSH1=1, PUSH2=2, ..., PUSH32=32
+			pc += pushSize              // Skip data bytes
+		}
+
+		pc++ // Next opcode
+	}
+
+	return nil
+}
+
 // RunMIR executes all instructions in the given basic block list sequentially.
 // For now, control-flow is assumed to be linear within a basic block.
 func (it *MIRInterpreter) RunMIR(block *MIRBasicBlock) ([]byte, error) {
@@ -233,6 +331,21 @@ func (it *MIRInterpreter) RunMIR(block *MIRBasicBlock) ([]byte, error) {
 	}
 	// Track current block for PHI resolution
 	it.currentBB = block
+	
+	// ============================================================================
+	// Gas Metering: Charge static gas for the entire BasicBlock
+	// ============================================================================
+	// This iterates through the original EVM bytecode (firstPC to lastPC) and
+	// charges static gas for all opcodes, including PUSH instructions.
+	// PUSH instructions have no corresponding MIR instruction (they're inlined),
+	// so we must iterate EVM bytecode to ensure their gas is accounted for.
+	// IMPORTANT: This must happen BEFORE the fast path check, because even if
+	// instructions are optimized away (e.g., PUSH/ADD -> NOP), we still need to
+	// charge gas for the original EVM opcodes.
+	if err := it.chargeStaticGasForBlock(block); err != nil {
+		return nil, err // Out of gas
+	}
+	
 	// Fast path: if the block contains only NOPs and a terminal STOP, skip the exec loop.
 	// This is common for trivially folded sequences like PUSH/PUSH/ADD/MUL -> NOPs + STOP.
 	{
@@ -259,6 +372,7 @@ func (it *MIRInterpreter) RunMIR(block *MIRBasicBlock) ([]byte, error) {
 			return it.returndata, nil
 		}
 	}
+
 	// Avoid per-run clearing of results to reduce overhead for trivial blocks;
 	// results slots are allocated lazily on first write via setResult.
 	// iterate by index to reduce overhead
@@ -766,7 +880,10 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 		it.setResult(m, it.tmpA.Clear().SetUint64(it.env.BlobBaseFee))
 		return nil
 	case MirGAS:
-		if it.env != nil && it.env.GasLeft != nil {
+		// Prioritize GasConsumer over GasLeft function
+		if it.env != nil && it.env.GasConsumer != nil {
+			it.setResult(m, it.tmpA.Clear().SetUint64(it.env.GasConsumer.GetGas()))
+		} else if it.env != nil && it.env.GasLeft != nil {
 			it.setResult(m, it.tmpA.Clear().SetUint64(it.env.GasLeft()))
 		} else {
 			it.setResult(m, it.zeroConst)
