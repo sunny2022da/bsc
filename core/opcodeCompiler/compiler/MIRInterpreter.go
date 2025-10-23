@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/holiman/uint256"
@@ -23,6 +24,29 @@ type GasLookup interface {
 	GetStaticGas(opcode byte) uint64 // Get constantGas for an opcode
 }
 
+// StateDBAccessor defines the interface for state access operations (warm/cold tracking, refunds)
+// This interface is implemented in mir_interpreter_adapter.go to access vm.StateDB
+// Note: Renamed from StateAccessor to avoid conflict with existing StateAccessor struct in MemoryAccessor.go
+type StateDBAccessor interface {
+	// Access list operations (EIP-2929)
+	IsAddressInAccessList(addr common.Address) bool
+	AddAddressToAccessList(addr common.Address)
+	IsSlotInAccessList(addr common.Address, slot common.Hash) bool
+	AddSlotToAccessList(addr common.Address, slot common.Hash)
+	
+	// State operations
+	GetState(addr common.Address, slot common.Hash) common.Hash
+	GetCommittedState(addr common.Address, slot common.Hash) common.Hash
+	
+	// Refund operations
+	AddRefund(gas uint64)
+	SubRefund(gas uint64)
+	
+	// Account operations
+	IsAccountEmpty(addr common.Address) bool
+	HasSelfDestructed(addr common.Address) bool
+}
+
 // MIRExecutionEnv contains minimal execution context required by the interpreter.
 // It is intentionally small; we can expand as more MIROperations are wired.
 type MIRExecutionEnv struct {
@@ -39,7 +63,6 @@ type MIRExecutionEnv struct {
 	ChainID     uint64
 	GasPrice    uint64
 	BaseFee     uint64
-	SelfBalance uint64
 	ReturnData  []byte
 
 	// Code accessors (optional, provided by adapter)
@@ -90,8 +113,13 @@ type MIRExecutionEnv struct {
 	Origin [20]byte
 
 	// Gas metering (provided by adapter)
-	GasLookup   GasLookup   // Gas cost lookup interface (queries JumpTable)
-	GasConsumer GasConsumer // Gas consumption interface (accesses contract.Gas)
+	GasLookup      GasLookup      // Gas cost lookup interface (queries JumpTable)
+	GasConsumer    GasConsumer    // Gas consumption interface (accesses contract.Gas)
+	StateDBAccessor StateDBAccessor // State access interface (for warm/cold gas, refunds, etc.)
+	
+	// Contract context (for gas calculations)
+	ContractAddress common.Address // Current contract address
+	SelfBalance     uint64          // Contract's balance (for SELFDESTRUCT)
 }
 
 // MIRInterpreter executes MIR instructions and produces values.
@@ -273,6 +301,136 @@ func (it *MIRInterpreter) getGas() uint64 {
 		return ^uint64(0) // Return max value to indicate unlimited gas
 	}
 	return it.env.GasConsumer.GetGas()
+}
+
+// needsMemoryUpdate checks if an opcode requires updating lastMemoryGasCost
+func needsMemoryUpdate(op MirOperation) bool {
+	switch op {
+	case MirMLOAD, MirMSTORE, MirMSTORE8, MirMCOPY,
+		MirKECCAK256, MirCALLDATACOPY, MirRETURNDATACOPY, MirCODECOPY,
+		MirRETURN, MirREVERT, MirCALL, MirCALLCODE, MirDELEGATECALL, MirSTATICCALL,
+		MirCREATE, MirCREATE2, MirEXTCODECOPY:
+		return true
+	}
+	return false
+}
+
+// updateLastMemoryGasCost updates the cumulative memory gas cost
+// This is called after charging dynamic gas for memory expansion
+func (it *MIRInterpreter) updateLastMemoryGasCost(m *MIR) {
+	var offset, length uint64
+	
+	// Extract memory parameters based on opcode
+	switch m.op {
+	case MirMLOAD:
+		if len(m.oprands) >= 1 {
+			offset = it.evalValue(m.oprands[0]).Uint64()
+			length = 32
+		}
+	case MirMSTORE:
+		if len(m.oprands) >= 1 {
+			offset = it.evalValue(m.oprands[0]).Uint64()
+			length = 32
+		}
+	case MirMSTORE8:
+		if len(m.oprands) >= 1 {
+			offset = it.evalValue(m.oprands[0]).Uint64()
+			length = 1
+		}
+	case MirMCOPY:
+		if len(m.oprands) >= 3 {
+			offset = it.evalValue(m.oprands[0]).Uint64()
+			length = it.evalValue(m.oprands[2]).Uint64()
+		}
+	case MirKECCAK256:
+		if len(m.oprands) >= 2 {
+			aval := it.evalValue(m.oprands[0])
+			bval := it.evalValue(m.oprands[1])
+			if (aval.Uint64() == 32 && bval.Uint64() < 32) || (aval.Uint64() != 0 && bval.Uint64() == 0) {
+				offset, length = bval.Uint64(), aval.Uint64()
+			} else {
+				offset, length = aval.Uint64(), bval.Uint64()
+			}
+		}
+	case MirCALLDATACOPY, MirRETURNDATACOPY, MirCODECOPY:
+		if len(m.oprands) >= 3 {
+			offset = it.evalValue(m.oprands[0]).Uint64()
+			length = it.evalValue(m.oprands[2]).Uint64()
+		}
+	case MirRETURN, MirREVERT:
+		if len(m.oprands) >= 2 {
+			offset = it.evalValue(m.oprands[0]).Uint64()
+			length = it.evalValue(m.oprands[1]).Uint64()
+		}
+	case MirCALL, MirCALLCODE:
+		// 需要考虑 input 和 output 两个区域
+		if len(m.oprands) >= 7 {
+			inOffset := it.evalValue(m.oprands[3]).Uint64()
+			inSize := it.evalValue(m.oprands[4]).Uint64()
+			outOffset := it.evalValue(m.oprands[5]).Uint64()
+			outSize := it.evalValue(m.oprands[6]).Uint64()
+			// 取较大的内存边界
+			offset1 := inOffset + inSize
+			offset2 := outOffset + outSize
+			if offset1 > offset2 {
+				offset, length = inOffset, inSize
+			} else {
+				offset, length = outOffset, outSize
+			}
+		}
+	case MirDELEGATECALL, MirSTATICCALL:
+		if len(m.oprands) >= 6 {
+			inOffset := it.evalValue(m.oprands[2]).Uint64()
+			inSize := it.evalValue(m.oprands[3]).Uint64()
+			outOffset := it.evalValue(m.oprands[4]).Uint64()
+			outSize := it.evalValue(m.oprands[5]).Uint64()
+			offset1 := inOffset + inSize
+			offset2 := outOffset + outSize
+			if offset1 > offset2 {
+				offset, length = inOffset, inSize
+			} else {
+				offset, length = outOffset, outSize
+			}
+		}
+	case MirCREATE, MirCREATE2:
+		if len(m.oprands) >= 3 {
+			offset = it.evalValue(m.oprands[1]).Uint64()
+			length = it.evalValue(m.oprands[2]).Uint64()
+		}
+	case MirEXTCODECOPY:
+		if len(m.oprands) >= 4 {
+			offset = it.evalValue(m.oprands[1]).Uint64()
+			length = it.evalValue(m.oprands[3]).Uint64()
+		}
+	default:
+		return
+	}
+	
+	if length == 0 {
+		return
+	}
+	
+	// Calculate new memory size
+	newMemSize := offset + length
+	if newMemSize == 0 {
+		return
+	}
+	
+	newMemSizeWords := toWordSize(newMemSize)
+	newMemSize = newMemSizeWords * 32
+	
+	currentMemSize := uint64(len(it.memory))
+	if newMemSize <= currentMemSize {
+		return
+	}
+	
+	// Update cumulative memory gas cost
+	const MemoryGas = uint64(3)
+	const QuadCoeffDiv = uint64(512)
+	square := newMemSizeWords * newMemSizeWords
+	linCoef := newMemSizeWords * MemoryGas
+	quadCoef := square / QuadCoeffDiv
+	it.lastMemoryGasCost = linCoef + quadCoef
 }
 
 // chargeStaticGasForBlock charges static gas for an entire BasicBlock
@@ -536,6 +694,26 @@ var (
 )
 
 func (it *MIRInterpreter) exec(m *MIR) error {
+	// ============================================================================
+	// 集中处理 Dynamic Gas (模仿 interpreter.go 的统一处理方式)
+	// ============================================================================
+	// 在执行指令前，检查是否有 dynamic gas 计算函数
+	if gasFunc := mirGasTable[byte(m.op)]; gasFunc != nil {
+		dynamicGas, err := gasFunc(it, m)
+		if err != nil {
+			return err
+		}
+		if dynamicGas > 0 {
+			if !it.useGas(dynamicGas) {
+				return errors.New("out of gas")
+			}
+			// 如果是内存扩展，更新 lastMemoryGasCost
+			if needsMemoryUpdate(m.op) {
+				it.updateLastMemoryGasCost(m)
+			}
+		}
+	}
+	
 	// Try fast handler if available
 	if h := mirHandlers[byte(m.op)]; h != nil {
 		if it.tracerEx != nil {
@@ -1017,24 +1195,6 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 		dataOff := it.evalValue(m.oprands[0])
 		dataSz := it.evalValue(m.oprands[1])
 		
-		// Dynamic gas calculation for LOG
-		// LOG gas = memory expansion gas + 8 gas per byte of data
-		if it.env.GasConsumer != nil {
-			// Calculate memory expansion gas
-			if err := it.chargeDynamicMemoryGas(dataOff.Uint64(), dataSz.Uint64()); err != nil {
-				return err
-			}
-			
-			// Calculate and charge data gas: 8 gas per byte
-			const LogDataGas = uint64(8)
-			dataGas := dataSz.Uint64() * LogDataGas
-			if dataGas > 0 {
-				if !it.useGas(dataGas) {
-					return errors.New("out of gas")
-				}
-			}
-		}
-		
 		data := it.readMem(dataOff, dataSz)
 		// collect topics (each is 32 bytes in value form)
 		topics := make([][32]byte, 0, numTopics)
@@ -1368,11 +1528,6 @@ func mirHandleMLOAD(it *MIRInterpreter, m *MIR) error {
 	}
 	off := it.evalValue(m.oprands[0])
 	
-	// Charge dynamic gas for memory expansion (MLOAD accesses 32 bytes)
-	if err := it.chargeDynamicMemoryGas(off.Uint64(), 32); err != nil {
-		return err
-	}
-	
 	it.readMem32Into(off, &it.scratch32)
 	it.setResult(m, it.tmpA.Clear().SetBytes(it.scratch32[:]))
 	return nil
@@ -1564,12 +1719,6 @@ func mirHandleMSTORE(it *MIRInterpreter, m *MIR) error {
 		return fmt.Errorf("MSTORE missing operands")
 	}
 	off := it.evalValue(m.oprands[0])
-	
-	// Charge dynamic gas for memory expansion (MSTORE writes 32 bytes)
-	if err := it.chargeDynamicMemoryGas(off.Uint64(), 32); err != nil {
-		return err
-	}
-	
 	val := it.evalValue(m.oprands[2])
 	it.writeMem32(off, val)
 	return nil
@@ -1580,12 +1729,6 @@ func mirHandleMSTORE8(it *MIRInterpreter, m *MIR) error {
 		return fmt.Errorf("MSTORE8 missing operands")
 	}
 	off := it.evalValue(m.oprands[0])
-	
-	// Charge dynamic gas for memory expansion (MSTORE8 writes 1 byte)
-	if err := it.chargeDynamicMemoryGas(off.Uint64(), 1); err != nil {
-		return err
-	}
-	
 	val := it.evalValue(m.oprands[2])
 	it.writeMem8(off, val)
 	return nil
@@ -1598,11 +1741,6 @@ func mirHandleMCOPY(it *MIRInterpreter, m *MIR) error {
 	d := it.evalValue(m.oprands[0])
 	s := it.evalValue(m.oprands[1])
 	l := it.evalValue(m.oprands[2])
-	
-	// Charge dynamic gas for memory copy (includes expansion + copy cost)
-	if err := it.chargeDynamicCopyGas(d.Uint64(), s.Uint64(), l.Uint64()); err != nil {
-		return err
-	}
 	
 	it.memCopy(d, s, l)
 	return nil
@@ -1695,11 +1833,6 @@ func mirHandleKECCAK(it *MIRInterpreter, m *MIR) error {
 		off, sz = bval, aval
 	} else {
 		off, sz = aval, bval
-	}
-	
-	// Charge dynamic gas for hashing (includes memory expansion + hashing cost)
-	if err := it.chargeDynamicHashGas(off.Uint64(), sz.Uint64()); err != nil {
-		return err
 	}
 	
 	bytesToHash := it.readMemView(off, sz)
@@ -2438,93 +2571,3 @@ func (it *MIRInterpreter) calculateMemoryGasCost(newMemSize uint64) (uint64, err
 	return 0, nil
 }
 
-// chargeDynamicMemoryGas calculates and charges dynamic gas for memory expansion
-// This should be called before any memory operation (MLOAD, MSTORE, MSTORE8, etc.)
-func (it *MIRInterpreter) chargeDynamicMemoryGas(memoryOffset, memoryLength uint64) error {
-	// Skip if no gas consumer available
-	if it.env == nil || it.env.GasConsumer == nil {
-		return nil
-	}
-	
-	// Calculate the new memory size required
-	var newMemSize uint64
-	if memoryLength > 0 {
-		// Ensure no overflow
-		if memoryOffset > ^uint64(0)-memoryLength {
-			return errors.New("memory offset overflow")
-		}
-		newMemSize = memoryOffset + memoryLength
-	} else {
-		newMemSize = memoryOffset
-	}
-	
-	// Calculate memory expansion gas
-	dynamicGas, err := it.calculateMemoryGasCost(newMemSize)
-	if err != nil {
-		return err
-	}
-	
-	// Charge the dynamic gas
-	if dynamicGas > 0 {
-		if !it.useGas(dynamicGas) {
-			return errors.New("out of gas")
-		}
-	}
-	
-	return nil
-}
-
-// chargeDynamicCopyGas calculates and charges dynamic gas for memory copy operations
-// This includes memory expansion gas + data copying gas (3 gas per word)
-// Used by: CALLDATACOPY, CODECOPY, RETURNDATACOPY, EXTCODECOPY, MCOPY
-func (it *MIRInterpreter) chargeDynamicCopyGas(memoryOffset, dataOffset, dataLength uint64) error {
-	// Skip if no gas consumer available
-	if it.env == nil || it.env.GasConsumer == nil {
-		return nil
-	}
-	
-	// Calculate memory expansion gas
-	if err := it.chargeDynamicMemoryGas(memoryOffset, dataLength); err != nil {
-		return err
-	}
-	
-	// Calculate and charge data copy gas: 3 gas per word
-	const CopyGas = uint64(3)
-	words := toWordSize(dataLength)
-	copyGas := words * CopyGas
-	
-	if copyGas > 0 {
-		if !it.useGas(copyGas) {
-			return errors.New("out of gas")
-		}
-	}
-	
-	return nil
-}
-
-// chargeDynamicHashGas calculates and charges dynamic gas for KECCAK256
-// This includes memory expansion gas + hashing gas (6 gas per word)
-func (it *MIRInterpreter) chargeDynamicHashGas(memoryOffset, dataLength uint64) error {
-	// Skip if no gas consumer available
-	if it.env == nil || it.env.GasConsumer == nil {
-		return nil
-	}
-	
-	// Calculate memory expansion gas
-	if err := it.chargeDynamicMemoryGas(memoryOffset, dataLength); err != nil {
-		return err
-	}
-	
-	// Calculate and charge hashing gas: 6 gas per word
-	const Keccak256WordGas = uint64(6)
-	words := toWordSize(dataLength)
-	hashGas := words * Keccak256WordGas
-	
-	if hashGas > 0 {
-		if !it.useGas(hashGas) {
-			return errors.New("out of gas")
-		}
-	}
-	
-	return nil
-}

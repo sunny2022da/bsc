@@ -74,6 +74,63 @@ func (c *contractGasConsumer) GetGas() uint64 {
 	return c.contract.Gas
 }
 
+// stateDBAccessor implements compiler.StateDBAccessor interface
+// It wraps StateDB for warm/cold tracking, refunds, and state access
+type stateDBAccessor struct {
+	stateDB StateDB
+}
+
+// IsAddressInAccessList checks if an address is in the access list
+func (s *stateDBAccessor) IsAddressInAccessList(addr common.Address) bool {
+	return s.stateDB.AddressInAccessList(addr)
+}
+
+// AddAddressToAccessList adds an address to the access list
+func (s *stateDBAccessor) AddAddressToAccessList(addr common.Address) {
+	s.stateDB.AddAddressToAccessList(addr)
+}
+
+// IsSlotInAccessList checks if a storage slot is in the access list
+func (s *stateDBAccessor) IsSlotInAccessList(addr common.Address, slot common.Hash) bool {
+	_, slotPresent := s.stateDB.SlotInAccessList(addr, slot)
+	return slotPresent
+}
+
+// AddSlotToAccessList adds a storage slot to the access list
+func (s *stateDBAccessor) AddSlotToAccessList(addr common.Address, slot common.Hash) {
+	s.stateDB.AddSlotToAccessList(addr, slot)
+}
+
+// GetState returns the current state of a storage slot
+func (s *stateDBAccessor) GetState(addr common.Address, slot common.Hash) common.Hash {
+	return s.stateDB.GetState(addr, slot)
+}
+
+// GetCommittedState returns the committed state of a storage slot (at transaction start)
+func (s *stateDBAccessor) GetCommittedState(addr common.Address, slot common.Hash) common.Hash {
+	return s.stateDB.GetCommittedState(addr, slot)
+}
+
+// AddRefund adds gas to the refund counter
+func (s *stateDBAccessor) AddRefund(gas uint64) {
+	s.stateDB.AddRefund(gas)
+}
+
+// SubRefund subtracts gas from the refund counter
+func (s *stateDBAccessor) SubRefund(gas uint64) {
+	s.stateDB.SubRefund(gas)
+}
+
+// IsAccountEmpty checks if an account is empty (no code, nonce, balance)
+func (s *stateDBAccessor) IsAccountEmpty(addr common.Address) bool {
+	return s.stateDB.Empty(addr)
+}
+
+// HasSelfDestructed checks if an account has been self-destructed in this transaction
+func (s *stateDBAccessor) HasSelfDestructed(addr common.Address) bool {
+	return s.stateDB.HasSelfDestructed(addr)
+}
+
 // MIRInterpreterAdapter adapts MIRInterpreter to work with EVM's interpreter interface
 type MIRInterpreterAdapter struct {
 	evm            *EVM
@@ -345,6 +402,15 @@ func (adapter *MIRInterpreterAdapter) setupExecutionEnvironment(contract *Contra
 	env.GasConsumer = &contractGasConsumer{
 		contract: contract,
 	}
+	
+	// Set up StateDBAccessor for warm/cold gas, refunds, and state access
+	env.StateDBAccessor = &stateDBAccessor{
+		stateDB: adapter.evm.StateDB,
+	}
+	
+	// Set contract context for gas calculations
+	env.ContractAddress = contract.Address()
+	env.SelfBalance = adapter.evm.StateDB.GetBalance(contract.Address()).Uint64()
 }
 
 // CanRun checks if this adapter can run the given contract
