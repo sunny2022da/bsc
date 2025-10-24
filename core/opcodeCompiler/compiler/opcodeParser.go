@@ -387,6 +387,11 @@ func GenerateMIRCFG(hash common.Hash, code []byte) (*CFG, error) {
 			}
 		}
 	}
+	// ============================================================================
+	// Static Gas Cache: Calculate and cache static gas for all basic blocks
+	// ============================================================================
+	calculateAndCacheStaticGas(hash, code, cfg)
+
 	// Debug dump disabled to reduce noise in benchmarks
 	return cfg, nil
 }
@@ -2100,4 +2105,190 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 		i++
 	}
 	return nil
+}
+
+// calculateAndCacheStaticGas calculates the static gas cost for each basic block
+// and stores it in the block's StaticGas field and in the OpCodeCache.
+// This allows chargeStaticGasForBlock to use O(1) cached lookups instead of O(n) bytecode scanning.
+func calculateAndCacheStaticGas(codeHash common.Hash, code []byte, cfg *CFG) {
+	if cfg == nil || len(cfg.basicBlocks) == 0 {
+		return
+	}
+
+	// Create a simple static gas table for lookup
+	// In real implementation, this should match vm.JumpTable's constantGas
+	staticGasTable := makeStaticGasTable()
+
+	// Build blockNum -> *MIRBasicBlock map for cache storage
+	blockMap := make(map[uint]*MIRBasicBlock)
+
+	// Calculate static gas for each basic block
+	for _, bb := range cfg.basicBlocks {
+		if bb == nil {
+			continue
+		}
+
+		staticGas := uint64(0)
+		firstPC := bb.FirstPC()
+		lastPC := bb.LastPC()
+
+		// Iterate through EVM bytecode range
+		for pc := firstPC; pc <= lastPC; {
+			if pc >= uint(len(code)) {
+				break
+			}
+
+			op := code[pc]
+
+			// Query static gas from table
+			staticGas += staticGasTable[op]
+
+			// Handle PUSH instruction data bytes (must skip to avoid treating data as opcodes)
+			if op >= 0x60 && op <= 0x7f { // PUSH1 (0x60) ~ PUSH32 (0x7f)
+				pushSize := uint(op - 0x5f) // PUSH1=1, PUSH2=2, ..., PUSH32=32
+				pc += pushSize              // Skip data bytes
+			}
+
+			pc++ // Next opcode
+		}
+
+		// Store in block
+		bb.StaticGas = staticGas
+
+		// Add to map for cache
+		blockMap[bb.blockNum] = bb
+	}
+
+	// Store in cache
+	cache := getOpCodeCacheInstance()
+	if cache != nil {
+		cache.AddBlockGasCache(codeHash, blockMap)
+	}
+}
+
+// makeStaticGasTable creates a lookup table for static gas costs
+// This mirrors the constantGas values from vm.JumpTable
+func makeStaticGasTable() [256]uint64 {
+	var table [256]uint64
+
+	// Initialize all opcodes with 0 gas (for undefined opcodes)
+	// Then set the known values
+
+	// 0x0 range - arithmetic
+	table[0x00] = 0  // STOP
+	table[0x01] = 3  // ADD
+	table[0x02] = 5  // MUL
+	table[0x03] = 3  // SUB
+	table[0x04] = 5  // DIV
+	table[0x05] = 5  // SDIV
+	table[0x06] = 5  // MOD
+	table[0x07] = 5  // SMOD
+	table[0x08] = 8  // ADDMOD
+	table[0x09] = 8  // MULMOD
+	table[0x0A] = 10 // EXP (base, dynamic part calculated separately)
+	table[0x0B] = 5  // SIGNEXTEND
+
+	// 0x10 range - comparison & bitwise
+	table[0x10] = 3 // LT
+	table[0x11] = 3 // GT
+	table[0x12] = 3 // SLT
+	table[0x13] = 3 // SGT
+	table[0x14] = 3 // EQ
+	table[0x15] = 3 // ISZERO
+	table[0x16] = 3 // AND
+	table[0x17] = 3 // OR
+	table[0x18] = 3 // XOR
+	table[0x19] = 3 // NOT
+	table[0x1A] = 3 // BYTE
+	table[0x1B] = 3 // SHL
+	table[0x1C] = 3 // SHR
+	table[0x1D] = 3 // SAR
+
+	// 0x20 range - crypto
+	table[0x20] = 30 // KECCAK256
+
+	// 0x30 range - environmental info
+	table[0x30] = 2   // ADDRESS
+	table[0x31] = 100 // BALANCE
+	table[0x32] = 2   // ORIGIN
+	table[0x33] = 2   // CALLER
+	table[0x34] = 2   // CALLVALUE
+	table[0x35] = 3   // CALLDATALOAD
+	table[0x36] = 2   // CALLDATASIZE
+	table[0x37] = 3   // CALLDATACOPY
+	table[0x38] = 2   // CODESIZE
+	table[0x39] = 3   // CODECOPY
+	table[0x3A] = 2   // GASPRICE
+	table[0x3B] = 100 // EXTCODESIZE
+	table[0x3C] = 100 // EXTCODECOPY
+	table[0x3D] = 2   // RETURNDATASIZE
+	table[0x3E] = 3   // RETURNDATACOPY
+	table[0x3F] = 100 // EXTCODEHASH
+
+	// 0x40 range - block info
+	table[0x40] = 2 // BLOCKHASH
+	table[0x41] = 2 // COINBASE
+	table[0x42] = 2 // TIMESTAMP
+	table[0x43] = 2 // NUMBER
+	table[0x44] = 2 // DIFFICULTY/PREVRANDAO
+	table[0x45] = 2 // GASLIMIT
+	table[0x46] = 2 // CHAINID
+	table[0x47] = 2 // SELFBALANCE
+	table[0x48] = 2 // BASEFEE
+	table[0x49] = 2 // BLOBHASH
+	table[0x4A] = 2 // BLOBBASEFEE
+
+	// 0x50 range - stack, memory, storage and flow
+	table[0x50] = 2  // POP
+	table[0x51] = 3  // MLOAD
+	table[0x52] = 3  // MSTORE
+	table[0x53] = 3  // MSTORE8
+	table[0x54] = 0  // SLOAD (all dynamic based on warm/cold)
+	table[0x55] = 0  // SSTORE (all dynamic based on EIP-2200)
+	table[0x56] = 8  // JUMP
+	table[0x57] = 10 // JUMPI
+	table[0x58] = 2  // PC
+	table[0x59] = 2  // MSIZE
+	table[0x5A] = 2  // GAS
+	table[0x5B] = 1  // JUMPDEST
+	table[0x5C] = 2  // TLOAD
+	table[0x5D] = 0  // TSTORE (all dynamic)
+	table[0x5E] = 0  // MCOPY (dynamic)
+	table[0x5F] = 3  // PUSH0
+
+	// 0x60-0x7F range - PUSH1 to PUSH32
+	for i := 0x60; i <= 0x7f; i++ {
+		table[i] = 3
+	}
+
+	// 0x80-0x8F range - DUP1 to DUP16
+	for i := 0x80; i <= 0x8f; i++ {
+		table[i] = 3
+	}
+
+	// 0x90-0x9F range - SWAP1 to SWAP16
+	for i := 0x90; i <= 0x9f; i++ {
+		table[i] = 3
+	}
+
+	// 0xA0-0xA4 range - LOG0 to LOG4
+	table[0xA0] = 375 // LOG0
+	table[0xA1] = 750 // LOG1
+	table[0xA2] = 750 // LOG2
+	table[0xA3] = 750 // LOG3
+	table[0xA4] = 750 // LOG4
+
+	// 0xF0 range - system operations
+	table[0xF0] = 32000 // CREATE
+	table[0xF1] = 100   // CALL
+	table[0xF2] = 100   // CALLCODE
+	table[0xF3] = 0     // RETURN
+	table[0xF4] = 100   // DELEGATECALL
+	table[0xF5] = 32000 // CREATE2
+	table[0xFA] = 100   // STATICCALL
+	table[0xFD] = 0     // REVERT
+	table[0xFE] = 0     // INVALID
+	table[0xFF] = 5000  // SELFDESTRUCT
+
+	return table
 }

@@ -55,6 +55,8 @@ type MIRBasicBlock struct {
 	exitStack      []Value
 	incomingStacks map[*MIRBasicBlock][]Value
 	// Precomputed live-outs: definitions (MIR) whose values are live at block exit
+	// Static gas cache: pre-calculated static gas cost for this block
+	StaticGas   uint64
 	liveOutDefs []*MIR
 	// Build bookkeeping
 	built  bool // set true after first successful build

@@ -125,6 +125,13 @@ func makeMirGasLog(n uint64) mirDynamicGasFunc {
 			return 0, errors.New("gas uint overflow")
 		}
 
+		// Topic gas: 375 gas per topic
+		// LOG0=0 topics, LOG1=1 topic, ..., LOG4=4 topics
+		topicGas := n * params.LogTopicGas
+		if gas, overflow = math.SafeAdd(gas, topicGas); overflow {
+			return 0, errors.New("gas uint overflow")
+		}
+
 		return gas, nil
 	}
 }

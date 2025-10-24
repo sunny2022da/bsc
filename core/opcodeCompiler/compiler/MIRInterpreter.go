@@ -436,15 +436,40 @@ func (it *MIRInterpreter) updateLastMemoryGasCost(m *MIR) {
 // chargeStaticGasForBlock charges static gas for an entire BasicBlock
 // by iterating through the original EVM bytecode (firstPC to lastPC)
 // This ensures PUSH instructions' gas is correctly accounted for
+//
+// Performance optimization: If the block has pre-calculated StaticGas (from GenerateMIRCFG),
+// use it directly. Otherwise, fall back to per-opcode calculation.
 func (it *MIRInterpreter) chargeStaticGasForBlock(block *MIRBasicBlock) error {
 	if it.env == nil {
 		return nil // No environment, skip
 	}
-	if it.env.GasLookup == nil {
-		return nil // No gas lookup available, skip
-	}
 	if it.env.GasConsumer == nil {
 		return nil // No gas consumer available, skip
+	}
+
+	// ============================================================================
+	// Fast Path: Use cached StaticGas if available
+	// ============================================================================
+	if block.StaticGas > 0 {
+		// Check if we have enough gas for the entire block
+		// If not, use fallback path for precise OOG location (critical for block sync)
+		availableGas := it.env.GasConsumer.GetGas()
+		if availableGas >= block.StaticGas {
+			// Cached static gas is available - use O(1) lookup
+			if !it.useGas(block.StaticGas) {
+				return errors.New("out of gas")
+			}
+			return nil
+		}
+		// Gas insufficient for entire block - use fallback for precise OOG
+		// This ensures gas is deducted per-opcode until actual OOG occurs
+	}
+
+	// ============================================================================
+	// Fallback Path: Calculate per-opcode (cache miss or zero gas block)
+	// ============================================================================
+	if it.env.GasLookup == nil {
+		return nil // No gas lookup available, skip
 	}
 	if it.env.Code == nil || len(it.env.Code) == 0 {
 		return nil // No code available, skip
