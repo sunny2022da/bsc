@@ -137,6 +137,8 @@ type MIRPreOpContext struct {
 	EvmOp      byte
 	Operands   []*uint256.Int
 	MemorySize uint64
+	// Length is the region length for memory ops when known (e.g., KECCAK256)
+	Length uint64
 	// IsBlockEntry is true for the first MIR instruction of the current basic block
 	IsBlockEntry bool
 	// Block is the current MIR basic block when IsBlockEntry is true

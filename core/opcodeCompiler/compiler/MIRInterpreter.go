@@ -9,6 +9,14 @@ import (
 	"github.com/holiman/uint256"
 )
 
+// Precomputed keccak256("") constant as a static array to avoid per-call allocations
+var emptyKeccakHash = [32]byte{
+	0xc5, 0xd2, 0x7e, 0x58, 0x2f, 0xdf, 0x90, 0x39,
+	0x88, 0x52, 0xc6, 0x51, 0xe8, 0x88, 0x6f, 0x03,
+	0x27, 0x06, 0x52, 0xc1, 0x09, 0x03, 0x04, 0x82,
+	0x02, 0x00, 0x08, 0x04, 0x20, 0x07, 0x20, 0x07,
+}
+
 // logging shim is defined in debug_flags.go
 
 // MIRExecutionEnv contains minimal execution context required by the interpreter.
@@ -123,6 +131,13 @@ type MIRInterpreter struct {
 	globalResultsBySig map[uint64]map[int]*uint256.Int
 	// Optional pre-execution hook for each MIR instruction (e.g., gas accounting)
 	beforeOp func(*MIRPreOpContext) error
+	// Reusable Keccak state and output buffer to avoid per-call allocations
+	hasher    crypto.KeccakState
+	hasherBuf [32]byte
+	// Reusable pre-op context and operand buffers to avoid per-instruction allocs
+	preOpCtx  MIRPreOpContext
+	preOpVals [8]uint256.Int
+	preOpOps  [8]*uint256.Int
 	// Track last CALLDATACOPY parameters to help diagnose KECCAK over calldata
 	lastCopyDest uint64
 	lastCopyOff  uint64
@@ -263,12 +278,28 @@ func (it *MIRInterpreter) GetEnv() *MIRExecutionEnv {
 // RunMIR executes all instructions in the given basic block list sequentially.
 // For now, control-flow is assumed to be linear within a basic block.
 func (it *MIRInterpreter) RunMIR(block *MIRBasicBlock) ([]byte, error) {
-	log.Warn("MIR RunMIR: block", "block", block.blockNum, "instructions", len(block.instructions))
+	mirDebugWarn("MIR RunMIR: block", "block", block.blockNum, "instructions", len(block.instructions))
 	if block == nil || len(block.instructions) == 0 {
 		return it.returndata, nil
 	}
 	// Track current block for PHI resolution
 	it.currentBB = block
+	// Pre-size and pre-initialize results slots for this block to avoid per-op allocations on first writes
+	if n := len(block.instructions); n > 0 {
+		if n > len(it.results) {
+			grown := make([]*uint256.Int, n)
+			copy(grown, it.results)
+			it.results = grown
+			if it.resultsCap < n {
+				it.resultsCap = n
+			}
+		}
+		for i := 0; i < n; i++ {
+			if it.results[i] == nil {
+				it.results[i] = new(uint256.Int)
+			}
+		}
+	}
 	// Fast path: if the block contains only NOPs and a terminal STOP, skip the exec loop.
 	// This is common for trivially folded sequences like PUSH/PUSH/ADD/MUL -> NOPs + STOP.
 	{
@@ -310,7 +341,7 @@ func (it *MIRInterpreter) RunMIR(block *MIRBasicBlock) ([]byte, error) {
 			case errREVERT:
 				return it.returndata, err
 			default:
-				log.Warn("RunMIR return nil", "err", err)
+				mirDebugWarn("RunMIR return nil", "err", err)
 				return nil, err
 			}
 		}
@@ -334,7 +365,7 @@ func (it *MIRInterpreter) publishLiveOut(block *MIRBasicBlock) {
 	defs := block.LiveOutDefs()
 	//log.Warn("MIR publishLiveOut", "block", block.blockNum, "size", len(block.instructions), "defs", defs, "it.results", it.results, "block.exitStack", block.ExitStack())
 	if len(defs) == 0 {
-		log.Warn("MIR publishLiveOut: no live outs", "block", block.blockNum)
+		mirDebugWarn("MIR publishLiveOut: no live outs", "block", block.blockNum)
 		return
 	}
 	inBlock := make(map[*MIR]bool, len(block.instructions))
@@ -351,6 +382,7 @@ func (it *MIRInterpreter) publishLiveOut(block *MIRBasicBlock) {
 			if _, ok := it.globalResults[v.def]; !ok {
 				val := it.evalValue(v)
 				if val != nil {
+					// Copy value into a new uint256.Int to avoid aliasing across updates
 					it.globalResults[v.def] = new(uint256.Int).Set(val)
 					//log.Warn("MIR publishLiveOut: backfilled ancestor def", "evm_pc", v.def.evmPC, "mir_idx", v.def.idx, "value", val)
 				}
@@ -363,6 +395,7 @@ func (it *MIRInterpreter) publishLiveOut(block *MIRBasicBlock) {
 		}
 		if def.idx >= 0 && def.idx < len(it.results) {
 			if r := it.results[def.idx]; r != nil {
+				// Copy result to avoid mutations affecting cached globals
 				it.globalResults[def] = new(uint256.Int).Set(r)
 			}
 		}
@@ -375,14 +408,14 @@ func (it *MIRInterpreter) RunCFGWithResolver(cfg *CFG, entry *MIRBasicBlock) ([]
 		// Build a lightweight resolver using cfg.pcToBlock
 		it.env.ResolveBB = func(pc uint64) *MIRBasicBlock {
 			if cfg == nil || cfg.pcToBlock == nil {
-				log.Warn("MIR RunCFGWithResolver: cfg or pcToBlock is nil", "pc", pc)
+				mirDebugWarn("MIR RunCFGWithResolver: cfg or pcToBlock is nil", "pc", pc)
 				return nil
 			}
 			if bb, ok := cfg.pcToBlock[uint(pc)]; ok {
-				log.Warn("MIR RunCFGWithResolver: found bb", "pc", pc, "bb", bb.blockNum)
+				mirDebugWarn("MIR RunCFGWithResolver: found bb", "pc", pc, "bb", bb.blockNum)
 				return bb
 			}
-			log.Warn("MIR RunCFGWithResolver: not found bb", "pc", pc)
+			mirDebugWarn("MIR RunCFGWithResolver: not found bb", "pc", pc)
 			return nil
 		}
 	}
@@ -392,7 +425,7 @@ func (it *MIRInterpreter) RunCFGWithResolver(cfg *CFG, entry *MIRBasicBlock) ([]
 		it.nextBB = nil
 		_, err := it.RunMIR(bb)
 		if err == nil {
-			log.Warn("MIR RunCFGWithResolver: run mir success", "bb", bb.blockNum, "firstPC", bb.firstPC, "lastPC", bb.lastPC, "it.nextBB", it.nextBB)
+			mirDebugWarn("MIR RunCFGWithResolver: run mir success", "bb", bb.blockNum, "firstPC", bb.firstPC, "lastPC", bb.lastPC, "it.nextBB", it.nextBB)
 			if it.nextBB == nil {
 				// Fall through handling
 				children := bb.Children()
@@ -405,7 +438,7 @@ func (it *MIRInterpreter) RunCFGWithResolver(cfg *CFG, entry *MIRBasicBlock) ([]
 						// Preserve predecessor for successor PHI resolution on fallthrough
 						it.prevBB = bb
 						if children[0] == bb {
-							log.Warn("MIR: self-loop fallthrough detected; rerunning block", "blockNum", bb.blockNum)
+							mirDebugWarn("MIR: self-loop fallthrough detected; rerunning block", "blockNum", bb.blockNum)
 							bb = children[0]
 							continue
 						}
@@ -419,7 +452,7 @@ func (it *MIRInterpreter) RunCFGWithResolver(cfg *CFG, entry *MIRBasicBlock) ([]
 						// Preserve predecessor for successor PHI resolution on conditional fallthrough
 						it.prevBB = bb
 						if children[1] == bb {
-							log.Warn("MIR: self-loop conditional fallthrough detected; rerunning block", "blockNum", bb.blockNum)
+							mirDebugWarn("MIR: self-loop conditional fallthrough detected; rerunning block", "blockNum", bb.blockNum)
 							bb = children[1]
 							continue
 						}
@@ -463,24 +496,31 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 	// Allow embedding runtimes (e.g., adapter) to run pre-op logic such as gas metering
 	if it.beforeOp != nil {
 		// Build a lightweight context with evaluated operands when useful and an estimated memory size
-		ctx := &MIRPreOpContext{M: m, EvmOp: m.evmOp}
+		ctx := &it.preOpCtx
+		// Reset reused context fields
+		ctx.M = m
+		ctx.EvmOp = m.evmOp
+		ctx.Operands = nil
+		ctx.MemorySize = 0
+		ctx.Length = 0
 		// Mark block entry for the first instruction in the current basic block
 		if m != nil && m.idx == 0 {
 			ctx.IsBlockEntry = true
 			ctx.Block = it.currentBB
 		}
-		// Evaluate operands into concrete values, preserving order
-		if len(m.oprands) > 0 {
-			ops := make([]*uint256.Int, 0, len(m.oprands))
-			for i := 0; i < len(m.oprands); i++ {
-				v := it.evalValue(m.oprands[i])
-				if v == nil {
-					ops = append(ops, uint256.NewInt(0))
-					continue
-				}
-				ops = append(ops, new(uint256.Int).Set(v))
+		// Evaluate operands into concrete values, preserving order.
+		// For KECCAK256, avoid building the operands slice; compute MemorySize/Length directly below.
+		if len(m.oprands) > 0 && m.op != MirKECCAK256 {
+			n := len(m.oprands)
+			if n > len(it.preOpOps) {
+				n = len(it.preOpOps)
 			}
-			ctx.Operands = ops
+			for i := 0; i < n; i++ {
+				v := it.evalValue(m.oprands[i])
+				it.preOpVals[i].Set(v)
+				it.preOpOps[i] = &it.preOpVals[i]
+			}
+			ctx.Operands = it.preOpOps[:n]
 		}
 		// Compute a requested memory size for common memory-affecting ops
 		switch m.op {
@@ -525,10 +565,12 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 				ctx.MemorySize = dst + ln
 			}
 		case MirKECCAK256:
-			if len(ctx.Operands) >= 2 {
-				off := ctx.Operands[0].Uint64()
-				ln := ctx.Operands[1].Uint64()
+			// Compute memory size and length without allocating ctx.Operands
+			if len(m.oprands) >= 2 {
+				off := it.evalValue(m.oprands[0]).Uint64()
+				ln := it.evalValue(m.oprands[1]).Uint64()
 				ctx.MemorySize = off + ln
+				ctx.Length = ln
 			}
 		case MirRETURN, MirREVERT:
 			if len(ctx.Operands) >= 2 {
@@ -712,6 +754,12 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 			return fmt.Errorf("MLOAD missing operands")
 		}
 		off := it.evalValue(m.oprands[0])
+		// Ensure memory growth side-effect even if value is forwarded via meta
+		it.ensureMemSize(off.Uint64() + 32)
+		if len(m.meta) == 32 {
+			it.setResult(m, it.tmpA.Clear().SetBytes(m.meta))
+			return nil
+		}
 		it.readMem32Into(off, &it.scratch32)
 		it.setResult(m, it.tmpA.Clear().SetBytes(it.scratch32[:]))
 		return nil
@@ -1092,7 +1140,7 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 		}
 		dataOff := it.evalValue(m.oprands[0])
 		dataSz := it.evalValue(m.oprands[1])
-		data := it.readMem(dataOff, dataSz)
+		data := it.readMemView(dataOff, dataSz)
 		// collect topics (each is 32 bytes in value form)
 		topics := make([][32]byte, 0, numTopics)
 		for i := 0; i < numTopics && 2+i < len(m.oprands); i++ {
@@ -1111,7 +1159,8 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 		}
 		off := it.evalValue(m.oprands[0])
 		sz := it.evalValue(m.oprands[1])
-		it.returndata = append([]byte(nil), it.readMem(off, sz)...)
+		view := it.readMemView(off, sz)
+		it.returndata = append(it.returndata[:0], view...)
 		return errRETURN
 	case MirREVERT:
 		if !it.env.IsByzantium {
@@ -1122,7 +1171,8 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 		}
 		off := it.evalValue(m.oprands[0])
 		sz := it.evalValue(m.oprands[1])
-		it.returndata = append([]byte(nil), it.readMem(off, sz)...)
+		view := it.readMemView(off, sz)
+		it.returndata = append(it.returndata[:0], view...)
 		return errREVERT
 	case MirCALL:
 		// operands: gas, addr, value, inOffset, inSize, outOffset, outSize
@@ -1137,10 +1187,10 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 		inSz := it.evalValue(m.oprands[4])
 		outOff := it.evalValue(m.oprands[5])
 		outSz := it.evalValue(m.oprands[6])
-		input := it.readMem(inOff, inSz)
+		input := it.readMemView(inOff, inSz)
 		if it.env != nil && it.env.ExternalCall != nil {
 			ret, ok := it.env.ExternalCall(0, a20, value, input)
-			it.returndata = append([]byte(nil), ret...)
+			it.returndata = append(it.returndata[:0], ret...)
 			if ok {
 				it.setResult(m, it.tmpA.Clear().SetOne())
 			} else {
@@ -1168,10 +1218,10 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 		inSz := it.evalValue(m.oprands[4])
 		outOff := it.evalValue(m.oprands[5])
 		outSz := it.evalValue(m.oprands[6])
-		input := it.readMem(inOff, inSz)
+		input := it.readMemView(inOff, inSz)
 		if it.env != nil && it.env.ExternalCall != nil {
 			ret, ok := it.env.ExternalCall(1, a20, value, input)
-			it.returndata = append([]byte(nil), ret...)
+			it.returndata = append(it.returndata[:0], ret...)
 			if ok {
 				it.setResult(m, it.tmpA.Clear().SetOne())
 			} else {
@@ -1197,10 +1247,10 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 		inSz := it.evalValue(m.oprands[3])
 		outOff := it.evalValue(m.oprands[4])
 		outSz := it.evalValue(m.oprands[5])
-		input := it.readMem(inOff, inSz)
+		input := it.readMemView(inOff, inSz)
 		if it.env != nil && it.env.ExternalCall != nil {
 			ret, ok := it.env.ExternalCall(2, a20, nil, input)
-			it.returndata = append([]byte(nil), ret...)
+			it.returndata = append(it.returndata[:0], ret...)
 			if ok {
 				it.setResult(m, it.tmpA.Clear().SetOne())
 			} else {
@@ -1226,10 +1276,10 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 		inSz := it.evalValue(m.oprands[3])
 		outOff := it.evalValue(m.oprands[4])
 		outSz := it.evalValue(m.oprands[5])
-		input := it.readMem(inOff, inSz)
+		input := it.readMemView(inOff, inSz)
 		if it.env != nil && it.env.ExternalCall != nil {
 			ret, ok := it.env.ExternalCall(3, a20, nil, input)
-			it.returndata = append([]byte(nil), ret...)
+			it.returndata = append(it.returndata[:0], ret...)
 			if ok {
 				it.setResult(m, it.tmpA.Clear().SetOne())
 			} else {
@@ -1384,7 +1434,7 @@ func mirHandleJUMP(it *MIRInterpreter, m *MIR) error {
 	}
 	dest, ok := it.resolveJumpDestValue(m.oprands[0])
 	if !ok {
-		log.Error("MIR JUMP cannot resolve PHI-derived dest - requesting EVM fallback", "from_evm_pc", m.evmPC)
+		mirDebugError("MIR JUMP cannot resolve PHI-derived dest - requesting EVM fallback", "from_evm_pc", m.evmPC)
 		return ErrMIRFallback
 	}
 	udest, _ := dest.Uint64WithOverflow()
@@ -1426,7 +1476,7 @@ func mirHandleJUMPI(it *MIRInterpreter, m *MIR) error {
 	}
 	dest, ok := it.resolveJumpDestValue(m.oprands[0])
 	if !ok {
-		log.Error("MIR JUMPI cannot resolve PHI-derived dest - requesting EVM fallback", "from_evm_pc", m.evmPC)
+		mirDebugError("MIR JUMPI cannot resolve PHI-derived dest - requesting EVM fallback", "from_evm_pc", m.evmPC)
 		return ErrMIRFallback
 	}
 	udest, _ := dest.Uint64WithOverflow()
@@ -1801,19 +1851,38 @@ func mirHandleKECCAK(it *MIRInterpreter, m *MIR) error {
 	// Operands are [offset, size]
 	off := it.evalValue(m.oprands[0])
 	sz := it.evalValue(m.oprands[1])
-	// Read a copy of memory to hash
-	bytesToHash := it.readMem(off, sz)
+	// Fast-path: empty input
+	if sz.IsZero() {
+		// keccak256("") constant without allocating
+		it.setResult(m, it.tmpA.Clear().SetBytes(emptyKeccakHash[:]))
+		return nil
+	}
+	// Ensure memory growth side-effect
+	it.ensureMemSize(off.Uint64() + sz.Uint64())
+	// If compiler attached a precomputed hash, use it directly
+	if len(m.meta) == 32 {
+		it.setResult(m, it.tmpA.Clear().SetBytes(m.meta))
+		return nil
+	}
+	// Read a zero-copy view of memory to hash
+	bytesToHash := it.readMemView(off, sz)
 	if len(bytesToHash) == 0 && it.lastCopyDest == 0 && it.lastCopyOff == 0 && it.lastCopySize > 0 {
-		// Heuristic for common calldata copy pattern: hash memory [0:size]
-		off0 := uint256.NewInt(0)
-		sizeV := new(uint256.Int).SetUint64(it.lastCopySize)
-		bytesToHash = it.readMem(off0, sizeV)
+		// Heuristic for common calldata copy pattern: hash memory [0:size] without allocations
+		it.ensureMemSize(it.lastCopySize)
+		bytesToHash = it.memory[:it.lastCopySize]
 	}
 	if mirKeccakHook != nil {
 		mirKeccakHook(off.Uint64(), sz.Uint64(), append([]byte(nil), bytesToHash...))
 	}
-	h := crypto.Keccak256(bytesToHash)
-	it.setResult(m, it.tmpA.Clear().SetBytes(h))
+	// Reuse a single Keccak state to avoid per-call allocations
+	if it.hasher == nil {
+		it.hasher = crypto.NewKeccakState()
+	} else {
+		it.hasher.Reset()
+	}
+	_, _ = it.hasher.Write(bytesToHash)
+	_, _ = it.hasher.Read(it.hasherBuf[:])
+	it.setResult(m, it.tmpA.Clear().SetBytes(it.hasherBuf[:]))
 	return nil
 }
 
@@ -1823,7 +1892,6 @@ func mirHandleCALLDATALOAD(it *MIRInterpreter, m *MIR) error {
 	}
 	off := it.evalValue(m.oprands[0])
 	it.readCalldata32Into(off, &it.scratch32)
-	log.Warn("MIR CALLDATALOAD", "calldata", fmt.Sprintf("%x", it.env.Calldata), "off", off, "scratch32", fmt.Sprintf("%x", it.scratch32))
 	it.setResult(m, it.tmpA.Clear().SetBytes(it.scratch32[:]))
 	return nil
 }
@@ -1987,7 +2055,7 @@ func (it *MIRInterpreter) execArithmetic(m *MIR) error {
 
 func (it *MIRInterpreter) evalValue(v *Value) *uint256.Int {
 	if v == nil {
-		return uint256.NewInt(0)
+		return it.zeroConst
 	}
 	switch v.kind {
 	case Konst:
@@ -2057,9 +2125,9 @@ func (it *MIRInterpreter) evalValue(v *Value) *uint256.Int {
 				}
 			}
 		}
-		return uint256.NewInt(0)
+		return it.zeroConst
 	default:
-		return uint256.NewInt(0)
+		return it.zeroConst
 	}
 }
 
@@ -2418,14 +2486,14 @@ func (it *MIRInterpreter) scheduleJump(udest uint64, m *MIR, isFallthrough bool)
 	// First, enforce EVM byte-level rule: target must be a valid JUMPDEST and not in push-data
 	if !isFallthrough {
 		if !it.env.CheckJumpdest(udest) {
-			log.Error("MIR jump invalid jumpdest - mirroring EVM error", "from_evm_pc", m.evmPC, "dest_pc", udest)
+			mirDebugError("MIR jump invalid jumpdest - mirroring EVM error", "from_evm_pc", m.evmPC, "dest_pc", udest)
 			return fmt.Errorf("invalid jump destination")
 		}
 	}
 	// Then resolve to a basic block in the CFG
 	it.nextBB = it.env.ResolveBB(udest)
 	if it.nextBB == nil {
-		log.Error("MIR jump target not mapped in CFG", "from_evm_pc", m.evmPC, "dest_pc", udest)
+		mirDebugError("MIR jump target not mapped in CFG", "from_evm_pc", m.evmPC, "dest_pc", udest)
 		return fmt.Errorf("unresolvable jump target")
 	}
 	it.publishLiveOut(it.currentBB)

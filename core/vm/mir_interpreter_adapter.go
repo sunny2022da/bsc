@@ -14,6 +14,12 @@ import (
 	"github.com/holiman/uint256"
 )
 
+// warmSlotKey identifies a warmed storage slot for the current contract address
+type warmSlotKey struct {
+	addr [20]byte
+	slot [32]byte
+}
+
 // mirGasProbe is an optional test hook to observe MIR gas after each instruction
 var mirGasProbe func(pc uint64, op byte, gasLeft uint64)
 
@@ -24,11 +30,17 @@ func SetMIRGasProbe(cb func(pc uint64, op byte, gasLeft uint64)) {
 
 // MIRInterpreterAdapter adapts MIRInterpreter to work with EVM's interpreter interface
 type MIRInterpreterAdapter struct {
-	evm            *EVM
-	mirInterpreter *compiler.MIRInterpreter
-	currentSelf    common.Address
-	table          *JumpTable
-	memShadow      *Memory
+	evm             *EVM
+	mirInterpreter  *compiler.MIRInterpreter
+	currentSelf     common.Address
+	currentContract *Contract
+	table           *JumpTable
+	memShadow       *Memory
+	// Warm caches to avoid repeated EIP-2929 checks within a single Run
+	warmAccounts map[[20]byte]struct{}
+	warmSlots    map[warmSlotKey]struct{}
+	// storageCache caches SLOAD values within a single Run (key is 32-byte slot)
+	storageCache map[[32]byte][32]byte
 }
 
 // NewMIRInterpreterAdapter creates a new MIR interpreter adapter for EVM
@@ -56,7 +68,10 @@ func NewMIRInterpreterAdapter(evm *EVM) *MIRInterpreterAdapter {
 	// Install runtime linkage hooks once; they read dynamic data from env/evm
 	env.SLoadFunc = func(key [32]byte) [32]byte {
 		// Use cached currentSelf to avoid per-access address conversions
-		return evm.StateDB.GetState(adapter.currentSelf, common.BytesToHash(key[:]))
+		val := evm.StateDB.GetState(adapter.currentSelf, common.BytesToHash(key[:]))
+		var out [32]byte
+		copy(out[:], val[:])
+		return out
 	}
 	env.SStoreFunc = func(key [32]byte, value [32]byte) {
 		evm.StateDB.SetState(adapter.currentSelf, common.BytesToHash(key[:]), common.BytesToHash(value[:]))
@@ -71,152 +86,74 @@ func NewMIRInterpreterAdapter(evm *EVM) *MIRInterpreterAdapter {
 	}
 
 	adapter.mirInterpreter = compiler.NewMIRInterpreter(env)
-	// Build a jump table matching current chain rules for gas accounting
-	switch {
-	case evm.chainRules.IsVerkle:
-		adapter.table = &verkleInstructionSet
-	case evm.chainRules.IsPrague:
-		adapter.table = &pragueInstructionSet
-	case evm.chainRules.IsCancun:
-		adapter.table = &cancunInstructionSet
-	case evm.chainRules.IsShanghai:
-		adapter.table = &shanghaiInstructionSet
-	case evm.chainRules.IsMerge:
-		adapter.table = &mergeInstructionSet
-	case evm.chainRules.IsLondon:
-		adapter.table = &londonInstructionSet
-	case evm.chainRules.IsBerlin:
-		adapter.table = &berlinInstructionSet
-	case evm.chainRules.IsIstanbul:
-		adapter.table = &istanbulInstructionSet
-	case evm.chainRules.IsConstantinople:
-		adapter.table = &constantinopleInstructionSet
-	case evm.chainRules.IsByzantium:
-		adapter.table = &byzantiumInstructionSet
-	case evm.chainRules.IsEIP158:
-		adapter.table = &spuriousDragonInstructionSet
-	case evm.chainRules.IsEIP150:
-		adapter.table = &tangerineWhistleInstructionSet
-	case evm.chainRules.IsHomestead:
-		adapter.table = &homesteadInstructionSet
-	default:
-		adapter.table = &frontierInstructionSet
-	}
-	// Initialize a shadow memory for dynamic memory gas accounting
-	adapter.memShadow = NewMemory()
-	return adapter
-}
-
-// Run executes the contract using MIR interpreter
-// This method should match the signature of EVMInterpreter.Run
-func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, readOnly bool) (ret []byte, err error) {
-	// Check if we have MIR-optimized code
-	if !contract.HasMIRCode() {
-		// Fallback to regular EVM interpreter
-		return adapter.evm.Interpreter().Run(contract, input, readOnly)
-	}
-
-	// Pre-flight fork gating: if the bytecode contains opcodes not enabled at the current fork,
-	// mirror EVM behavior by returning invalid opcode errors instead of running MIR.
-	rules := adapter.evm.chainRules
-	code := contract.Code
-	if !rules.IsConstantinople {
-		if bytes.IndexByte(code, byte(SHR)) >= 0 || bytes.IndexByte(code, byte(SHL)) >= 0 || bytes.IndexByte(code, byte(SAR)) >= 0 {
-			return nil, fmt.Errorf("invalid opcode: SHR")
-		}
-	}
-
-	// Get the MIR CFG from the contract (type assertion)
-	cfgInterface := contract.GetMIRCFG()
-	cfg, ok := cfgInterface.(*compiler.CFG)
-	if !ok || cfg == nil {
-		// Fallback if no valid MIR CFG available
-		log.Error("MIR fallback: invalid CFG, using EVM interpreter", "addr", contract.Address(), "codehash", contract.CodeHash)
-		return adapter.evm.Interpreter().Run(contract, input, readOnly)
-	}
-
-	// Set up MIR execution environment with contract-specific data
-	adapter.setupExecutionEnvironment(contract, input)
-
-	// Wire gas left getter so MirGAS can read it if needed
-	if adapter.mirInterpreter != nil && adapter.mirInterpreter.GetEnv() != nil {
-		env := adapter.mirInterpreter.GetEnv()
-		env.GasLeft = func() uint64 { return contract.Gas }
-	}
-
-	// Install a pre-op hook to charge constant gas per opcode and any eliminated-op constants per block entry
-	innerHook := func(ctx *compiler.MIRPreOpContext) error {
-		if ctx == nil || ctx.M == nil {
+	// Install pre-op hook once; it will read the current contract from adapter.currentContract
+	adapter.mirInterpreter.SetBeforeOpHook(func(ctx *compiler.MIRPreOpContext) error {
+		contract := adapter.currentContract
+		if ctx == nil || ctx.M == nil || contract == nil {
 			return nil
 		}
-		// Removed block-entry eliminated-op precharge; per-op accounting will be done via emitted MIR (including NOPs for PUSH)
-		// Charge constant gas for this emitted opcode
-		// Determine originating EVM opcode for this MIR
+		// The following body mirrors the per-run innerHook logic
 		evmOp := OpCode(ctx.EvmOp)
-		// Emit tracer OnOpcode before charging to maintain step-count parity
 		if adapter.evm != nil && adapter.evm.Config.Tracer != nil && adapter.evm.Config.Tracer.OnOpcode != nil {
 			scope := &ScopeContext{Memory: adapter.memShadow, Stack: nil, Contract: contract}
 			adapter.evm.Config.Tracer.OnOpcode(uint64(ctx.M.EvmPC()), byte(evmOp), contract.Gas, 0, scope, nil, adapter.evm.depth, nil)
 		}
-		// Charge per-op constant gas for the originating EVM opcode, but skip PHI (compiler artifact)
 		if ctx.M.Op() != compiler.MirPHI {
-			if adapter.table != nil && (*adapter.table)[evmOp] != nil {
-				constGas := (*adapter.table)[evmOp].constantGas
-				if constGas > 0 {
-					if contract.Gas < constGas {
-						return ErrOutOfGas
-					}
-					contract.Gas -= constGas
+			jt := (*adapter.table)[evmOp]
+			if jt != nil && jt.constantGas > 0 {
+				if contract.Gas < jt.constantGas {
+					return ErrOutOfGas
 				}
+				contract.Gas -= jt.constantGas
 			}
 		}
-		// Dynamic gas metering
-		// Ensure shadow memory reflects prior expansions
 		if adapter.memShadow == nil {
 			adapter.memShadow = NewMemory()
 		}
-		// Helper: resize shadow memory after charging
 		resizeShadow := func(sz uint64) {
 			if sz > 0 {
 				adapter.memShadow.Resize(sz)
 			}
 		}
-		// Helper: toWordSize
 		toWord := func(x uint64) uint64 { return (x + 31) / 32 }
 		switch evmOp {
 		case SLOAD:
-			// EIP-2929 SLOAD dynamic gas
 			if adapter.evm.chainRules.IsBerlin {
 				if len(ctx.Operands) >= 1 {
 					st := newstack()
-					st.push(new(uint256.Int).Set(ctx.Operands[0])) // peek -> slot
+					defer returnStack(st)
+					st.push(ctx.Operands[0])
 					gas, err := gasSLoadEIP2929(adapter.evm, contract, st, adapter.memShadow, 0)
 					if err != nil {
 						if errors.Is(err, ErrGasUintOverflow) {
-							// Mirror base interpreter behavior: do not surface overflow from dynamic calc here
-							// Leave callGasTemp as-is; the call execution path will handle effective gas
 							err = nil
 						}
-						return err
+						if err != nil {
+							return err
+						}
 					}
-					if contract.Gas < gas {
-						return ErrOutOfGas
+					if gas > 0 {
+						if contract.Gas < gas {
+							return ErrOutOfGas
+						}
+						contract.Gas -= gas
 					}
-					contract.Gas -= gas
 				}
 			}
 		case BALANCE, EXTCODESIZE, EXTCODEHASH:
-			// EIP-2929 account warm/cold surcharge
 			if adapter.evm.chainRules.IsBerlin {
 				if len(ctx.Operands) >= 1 {
 					st := newstack()
-					st.push(new(uint256.Int).Set(ctx.Operands[0])) // peek -> address
+					defer returnStack(st)
+					st.push(ctx.Operands[0])
 					gas, err := gasEip2929AccountCheck(adapter.evm, contract, st, adapter.memShadow, 0)
 					if err != nil {
 						if errors.Is(err, ErrGasUintOverflow) {
 							err = nil
 						}
-						return err
+						if err != nil {
+							return err
+						}
 					}
 					if gas > 0 {
 						if contract.Gas < gas {
@@ -227,7 +164,6 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 				}
 			}
 		case EXP:
-			// Dynamic gas based on exponent byte length
 			if len(ctx.Operands) >= 2 {
 				exp := ctx.Operands[1]
 				expBytes := uint64((exp.BitLen() + 7) / 8)
@@ -248,15 +184,15 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 					if errors.Is(err, ErrGasUintOverflow) {
 						err = nil
 					}
-					return err
+					if err != nil {
+						return err
+					}
 				}
 				if contract.Gas < gas {
 					return ErrOutOfGas
 				}
 				contract.Gas -= gas
-				// EIP-3860 initcode per-word gas for CREATE/CREATE2
 				if evmOp == CREATE || evmOp == CREATE2 {
-					// operands: value, offset, size, (salt)
 					if len(ctx.Operands) >= 3 {
 						size := ctx.Operands[2].Uint64()
 						if size > params.MaxInitCodeSize {
@@ -281,7 +217,6 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 						return err
 					}
 				}
-				// copy gas per word: size is operand[2]
 				var size uint64
 				if len(ctx.Operands) >= 3 {
 					size = ctx.Operands[2].Uint64()
@@ -316,24 +251,31 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 				contract.Gas -= add
 				resizeShadow(ctx.MemorySize)
 			}
-			// EIP-2929 cold-warm surcharge for EXTCODECOPY
 			if adapter.evm.chainRules.IsBerlin {
 				if len(ctx.Operands) >= 1 {
-					st := newstack()
-					st.push(new(uint256.Int).Set(ctx.Operands[0])) // address
-					gas, err := gasEip2929AccountCheck(adapter.evm, contract, st, adapter.memShadow, 0)
-					if err != nil {
-						if errors.Is(err, ErrGasUintOverflow) {
-							err = nil
-						} else {
-							return err
+					var a [20]byte
+					b := ctx.Operands[0].Bytes20()
+					copy(a[:], b[:])
+					if _, ok := adapter.warmAccounts[a]; !ok {
+						st := newstack()
+						defer returnStack(st)
+						st.push(ctx.Operands[0])
+						gas, err := gasEip2929AccountCheck(adapter.evm, contract, st, adapter.memShadow, 0)
+						if err != nil {
+							if errors.Is(err, ErrGasUintOverflow) {
+								err = nil
+							}
+							if err != nil {
+								return err
+							}
 						}
-					}
-					if gas > 0 {
-						if contract.Gas < gas {
-							return ErrOutOfGas
+						if gas > 0 {
+							if contract.Gas < gas {
+								return ErrOutOfGas
+							}
+							contract.Gas -= gas
+							adapter.warmAccounts[a] = struct{}{}
 						}
-						contract.Gas -= gas
 					}
 				}
 			}
@@ -364,13 +306,13 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 				gas, err := memoryGasCost(adapter.memShadow, ctx.MemorySize)
 				if err != nil {
 					if errors.Is(err, ErrGasUintOverflow) {
-						// align with base interpreter: don't surface overflow from call gas calc here
+						// align with base interpreter: don't surface overflow here
 					} else {
 						return err
 					}
 				}
-				var size uint64
-				if len(ctx.Operands) >= 2 {
+				size := ctx.Length
+				if size == 0 && len(ctx.Operands) >= 2 {
 					size = ctx.Operands[1].Uint64()
 				}
 				wordGas := toWord(size) * params.Keccak256WordGas
@@ -379,7 +321,6 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 					return ErrOutOfGas
 				}
 				contract.Gas -= add
-				resizeShadow(ctx.MemorySize)
 			}
 		case LOG0, LOG1, LOG2, LOG3, LOG4:
 			if ctx.MemorySize > 0 {
@@ -390,14 +331,12 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 						return err
 					}
 				}
-				// Topics and data costs
 				n := int(evmOp - LOG0)
 				add := gas + uint64(n)*params.LogTopicGas
 				var size uint64
 				if len(ctx.Operands) >= 2 {
 					size = ctx.Operands[1].Uint64()
 				}
-				// LogDataGas is per byte
 				add += size * params.LogDataGas
 				if contract.Gas < add {
 					return ErrOutOfGas
@@ -406,13 +345,16 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 				resizeShadow(ctx.MemorySize)
 			}
 		case SELFDESTRUCT:
-			// Charge dynamic gas according to fork rules
 			var gas uint64
 			var err error
 			if adapter.evm.chainRules.IsLondon {
-				gas, err = gasSelfdestructEIP3529(adapter.evm, contract, newstack(), adapter.memShadow, 0)
+				st := newstack()
+				defer returnStack(st)
+				gas, err = gasSelfdestructEIP3529(adapter.evm, contract, st, adapter.memShadow, 0)
 			} else if adapter.evm.chainRules.IsBerlin {
-				gas, err = gasSelfdestructEIP2929(adapter.evm, contract, newstack(), adapter.memShadow, 0)
+				st := newstack()
+				defer returnStack(st)
+				gas, err = gasSelfdestructEIP2929(adapter.evm, contract, st, adapter.memShadow, 0)
 			}
 			if err != nil {
 				return err
@@ -424,12 +366,11 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 				contract.Gas -= gas
 			}
 		case SSTORE:
-			// Build a tiny stack where Back(0)=key, Back(1)=value per gasSStore contract
 			if len(ctx.Operands) >= 2 {
 				st := newstack()
-				// push value then key so Back(0)=key, Back(1)=value
-				st.push(new(uint256.Int).Set(ctx.Operands[1]))
-				st.push(new(uint256.Int).Set(ctx.Operands[0]))
+				defer returnStack(st)
+				st.push(ctx.Operands[1])
+				st.push(ctx.Operands[0])
 				gas, err := gasSStore(adapter.evm, contract, st, adapter.memShadow, 0)
 				if err != nil {
 					if errors.Is(err, ErrGasUintOverflow) {
@@ -443,23 +384,16 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 				contract.Gas -= gas
 			}
 		case CALL, CALLCODE, DELEGATECALL, STATICCALL:
-			// Use vm gas calculators to set evm.callGasTemp and deduct dynamic gas
-			// Build stack so Back(0)=requestedGas, Back(1)=addr, Back(2)=value (if present)
 			st := newstack()
-			// Ensure ctx.Operands length checks per variant
+			defer returnStack(st)
 			switch evmOp {
 			case CALL, CALLCODE:
 				if len(ctx.Operands) < 7 {
 					return nil
 				}
-				reqGas := new(uint256.Int).Set(ctx.Operands[0])
-				addr := new(uint256.Int)
-				// address at operands[1]
-				addr.Set(ctx.Operands[1])
-				val := new(uint256.Int).Set(ctx.Operands[2])
-				st.push(val)    // Back(2)
-				st.push(addr)   // Back(1)
-				st.push(reqGas) // Back(0)
+				st.push(ctx.Operands[2])
+				st.push(ctx.Operands[1])
+				st.push(ctx.Operands[0])
 				var dyn uint64
 				var err error
 				if adapter.evm.chainRules.IsBerlin {
@@ -488,8 +422,8 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 					return nil
 				}
 				st := newstack()
-				reqGas := new(uint256.Int).Set(ctx.Operands[0])
-				st.push(reqGas) // Back(0)
+				defer returnStack(st)
+				st.push(ctx.Operands[0])
 				var dyn uint64
 				var err error
 				if adapter.evm.chainRules.IsBerlin {
@@ -515,19 +449,93 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 				resizeShadow(ctx.MemorySize)
 			}
 		}
-		// Test probe: allow tests to observe gas left after each MIR step
 		if mirGasProbe != nil {
 			mirGasProbe(uint64(ctx.M.EvmPC()), ctx.EvmOp, contract.Gas)
 		}
 		return nil
-	}
-	adapter.mirInterpreter.SetBeforeOpHook(func(ctx *compiler.MIRPreOpContext) error {
-		err := innerHook(ctx)
-		if err != nil && errors.Is(err, ErrGasUintOverflow) {
-			return nil
-		}
-		return err
 	})
+	// Build a jump table matching current chain rules for gas accounting
+	switch {
+	case evm.chainRules.IsVerkle:
+		adapter.table = &verkleInstructionSet
+	case evm.chainRules.IsPrague:
+		adapter.table = &pragueInstructionSet
+	case evm.chainRules.IsCancun:
+		adapter.table = &cancunInstructionSet
+	case evm.chainRules.IsShanghai:
+		adapter.table = &shanghaiInstructionSet
+	case evm.chainRules.IsMerge:
+		adapter.table = &mergeInstructionSet
+	case evm.chainRules.IsLondon:
+		adapter.table = &londonInstructionSet
+	case evm.chainRules.IsBerlin:
+		adapter.table = &berlinInstructionSet
+	case evm.chainRules.IsIstanbul:
+		adapter.table = &istanbulInstructionSet
+	case evm.chainRules.IsConstantinople:
+		adapter.table = &constantinopleInstructionSet
+	case evm.chainRules.IsByzantium:
+		adapter.table = &byzantiumInstructionSet
+	case evm.chainRules.IsEIP158:
+		adapter.table = &spuriousDragonInstructionSet
+	case evm.chainRules.IsEIP150:
+		adapter.table = &tangerineWhistleInstructionSet
+	case evm.chainRules.IsHomestead:
+		adapter.table = &homesteadInstructionSet
+	default:
+		adapter.table = &frontierInstructionSet
+	}
+	// Initialize a shadow memory for dynamic memory gas accounting
+	adapter.memShadow = NewMemory()
+	adapter.warmAccounts = make(map[[20]byte]struct{})
+	adapter.warmSlots = make(map[warmSlotKey]struct{})
+	adapter.storageCache = make(map[[32]byte][32]byte)
+	return adapter
+}
+
+// Run executes the contract using MIR interpreter
+// This method should match the signature of EVMInterpreter.Run
+func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, readOnly bool) (ret []byte, err error) {
+	// Check if we have MIR-optimized code
+	if !contract.HasMIRCode() {
+		// Fallback to regular EVM interpreter
+		return adapter.evm.Interpreter().Run(contract, input, readOnly)
+	}
+
+	// Pre-flight fork gating: if the bytecode contains opcodes not enabled at the current fork,
+	// mirror EVM behavior by returning invalid opcode errors instead of running MIR.
+	rules := adapter.evm.chainRules
+	code := contract.Code
+	if !rules.IsConstantinople {
+		if bytes.IndexByte(code, byte(SHR)) >= 0 || bytes.IndexByte(code, byte(SHL)) >= 0 || bytes.IndexByte(code, byte(SAR)) >= 0 {
+			return nil, fmt.Errorf("invalid opcode: SHR")
+		}
+	}
+
+	// Get the MIR CFG from the contract (type assertion)
+	cfgInterface := contract.GetMIRCFG()
+	cfg, ok := cfgInterface.(*compiler.CFG)
+	if !ok || cfg == nil {
+		// Fallback if no valid MIR CFG available
+		log.Error("MIR fallback: invalid CFG, using EVM interpreter", "addr", contract.Address(), "codehash", contract.CodeHash)
+		return adapter.evm.Interpreter().Run(contract, input, readOnly)
+	}
+
+	// Set current contract for the pre-installed hook
+	adapter.currentContract = contract
+	// Set up MIR execution environment with contract-specific data
+	adapter.setupExecutionEnvironment(contract, input)
+
+	// Wire gas left getter so MirGAS can read it if needed
+	if adapter.mirInterpreter != nil && adapter.mirInterpreter.GetEnv() != nil {
+		env := adapter.mirInterpreter.GetEnv()
+		env.GasLeft = func() uint64 {
+			if adapter.currentContract != nil {
+				return adapter.currentContract.Gas
+			}
+			return 0
+		}
+	}
 
 	// Selector-based direct dispatch is disabled; always fall back to default entry.
 
@@ -578,6 +586,30 @@ func (adapter *MIRInterpreterAdapter) setupExecutionEnvironment(contract *Contra
 		adapter.mirInterpreter.ResetReturnData()
 	}
 
+	// Reset warm caches per top-level Run
+	if adapter.warmAccounts == nil {
+		adapter.warmAccounts = make(map[[20]byte]struct{})
+	} else {
+		for k := range adapter.warmAccounts {
+			delete(adapter.warmAccounts, k)
+		}
+	}
+	// Reset storage cache per run
+	if adapter.storageCache == nil {
+		adapter.storageCache = make(map[[32]byte][32]byte)
+	} else {
+		for k := range adapter.storageCache {
+			delete(adapter.storageCache, k)
+		}
+	}
+	if adapter.warmSlots == nil {
+		adapter.warmSlots = make(map[warmSlotKey]struct{})
+	} else {
+		for k := range adapter.warmSlots {
+			delete(adapter.warmSlots, k)
+		}
+	}
+
 	// Set address context
 	{
 		addr := contract.Address()
@@ -606,44 +638,39 @@ func (adapter *MIRInterpreterAdapter) setupExecutionEnvironment(contract *Contra
 	env.Code = contract.Code
 
 	// External code accessors
-	env.ExtCodeSize = func(addr [20]byte) uint64 {
-		a := common.BytesToAddress(addr[:])
-		// Best-effort: return bytecode length from state
-		code := adapter.evm.StateDB.GetCode(a)
-		if code == nil {
-			return 0
-		}
-		return uint64(len(code))
-	}
-	env.ExtCodeCopy = func(addr [20]byte, codeOffset uint64, dest []byte) {
-		a := common.BytesToAddress(addr[:])
-		code := adapter.evm.StateDB.GetCode(a)
-		if code == nil {
-			for i := range dest {
-				dest[i] = 0
+	if env.ExtCodeSize == nil {
+		env.ExtCodeSize = func(addr [20]byte) uint64 {
+			a := common.BytesToAddress(addr[:])
+			code := adapter.evm.StateDB.GetCode(a)
+			if code == nil {
+				return 0
 			}
-			return
+			return uint64(len(code))
 		}
-		for i := uint64(0); i < uint64(len(dest)); i++ {
-			idx := codeOffset + i
-			if idx < uint64(len(code)) {
-				dest[i] = code[idx]
-			} else {
-				dest[i] = 0
+	}
+	if env.ExtCodeCopy == nil {
+		env.ExtCodeCopy = func(addr [20]byte, codeOffset uint64, dest []byte) {
+			a := common.BytesToAddress(addr[:])
+			code := adapter.evm.StateDB.GetCode(a)
+			if code == nil {
+				for i := range dest {
+					dest[i] = 0
+				}
+				return
+			}
+			for i := uint64(0); i < uint64(len(dest)); i++ {
+				idx := codeOffset + i
+				if idx < uint64(len(code)) {
+					dest[i] = code[idx]
+				} else {
+					dest[i] = 0
+				}
 			}
 		}
 	}
 
-	// Log function to route logs back into EVM
-	env.LogFunc = func(addr [20]byte, topics [][32]byte, data []byte) {
-		a := common.BytesToAddress(addr[:])
-		// Convert topics to common.Hash slice
-		hashes := make([]common.Hash, len(topics))
-		for i := range topics {
-			hashes[i] = common.BytesToHash(topics[i][:])
-		}
-
-		// EXTCODEHASH via StateDB
+	// EXTCODEHASH via StateDB (installed once)
+	if env.ExtCodeHash == nil {
 		env.ExtCodeHash = func(addr [20]byte) [32]byte {
 			a := common.BytesToAddress(addr[:])
 			h := adapter.evm.StateDB.GetCodeHash(a)
@@ -651,28 +678,34 @@ func (adapter *MIRInterpreterAdapter) setupExecutionEnvironment(contract *Contra
 			copy(out[:], h[:])
 			return out
 		}
-
-		// GAS left is not directly exposed here; leave nil to signal unavailability
-
-		// Blob fields (EIP-4844): base fee and blob hashes
-		if adapter.evm.Context.BlobBaseFee != nil {
-			env.BlobBaseFee = adapter.evm.Context.BlobBaseFee.Uint64()
-		}
-		env.BlobHashFunc = func(index uint64) [32]byte {
-			if index < uint64(len(adapter.evm.TxContext.BlobHashes)) {
-				h := adapter.evm.TxContext.BlobHashes[index]
-				var out [32]byte
-				copy(out[:], h[:])
-				return out
+	}
+	// Log function to route logs back into EVM (installed once)
+	if env.LogFunc == nil {
+		env.LogFunc = func(addr [20]byte, topics [][32]byte, data []byte) {
+			a := common.BytesToAddress(addr[:])
+			hashes := make([]common.Hash, len(topics))
+			for i := range topics {
+				hashes[i] = common.BytesToHash(topics[i][:])
 			}
-			return [32]byte{}
+			if adapter.evm.Context.BlobBaseFee != nil {
+				env.BlobBaseFee = adapter.evm.Context.BlobBaseFee.Uint64()
+			}
+			env.BlobHashFunc = func(index uint64) [32]byte {
+				if index < uint64(len(adapter.evm.TxContext.BlobHashes)) {
+					h := adapter.evm.TxContext.BlobHashes[index]
+					var out [32]byte
+					copy(out[:], h[:])
+					return out
+				}
+				return [32]byte{}
+			}
+			adapter.evm.StateDB.AddLog(&coretypes.Log{
+				Address:     a,
+				Topics:      hashes,
+				Data:        append([]byte(nil), data...),
+				BlockNumber: adapter.evm.Context.BlockNumber.Uint64(),
+			})
 		}
-		adapter.evm.StateDB.AddLog(&coretypes.Log{
-			Address:     a,
-			Topics:      hashes,
-			Data:        append([]byte(nil), data...),
-			BlockNumber: adapter.evm.Context.BlockNumber.Uint64(),
-		})
 	}
 
 	// Wire external execution to stock EVM for CALL-family ops

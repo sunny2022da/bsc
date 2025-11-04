@@ -1,6 +1,7 @@
 package compiler
 
 import (
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/holiman/uint256"
 )
@@ -295,6 +296,16 @@ func (b *MIRBasicBlock) CreateBinOpMIRWithMA(op MirOperation, stack *ValueStack,
 	if op == MirKECCAK256 {
 		// operands: [offset, size] -> (opnd2, opnd1)
 		mir := newBinaryOpMIR(op, &opnd2, &opnd1, stack)
+		// If the memory accessor knows the exact slice content (constant), precompute hash
+		if accessor != nil && opnd2.kind == Konst && opnd1.kind == Konst {
+			offU := uint256.NewInt(0).SetBytes(opnd2.payload)
+			szU := uint256.NewInt(0).SetBytes(opnd1.payload)
+			if val := accessor.getValueWithOffset(offU, szU); val.kind == Konst && len(val.payload) > 0 {
+				h := crypto.Keccak256(val.payload)
+				// Attach precomputed 32-byte hash; interpreter will use it while still charging gas
+				mir.meta = h
+			}
+		}
 		opnd2.use = append(opnd2.use, mir)
 		opnd1.use = append(opnd1.use, mir)
 		stack.push(mir.Result())
@@ -561,6 +572,19 @@ func (b *MIRBasicBlock) CreateMemoryOpMIR(op MirOperation, stack *ValueStack, ac
 		// pops: offset
 		offset := stack.pop()
 		if accessor != nil {
+			// Attempt simple forwarding: if a prior MSTORE wrote this exact 32-byte range with a constant
+			// record, attach it to MIR meta for runtime to use, but still emit MLOAD for gas parity/mem growth.
+			if offset.kind == Konst {
+				offU := uint256.NewInt(0).SetBytes(offset.payload)
+				szU := uint256.NewInt(0).SetUint64(32)
+				if v := accessor.getValueWithOffset(offU, szU); v.kind == Konst {
+					padded := make([]byte, 32)
+					if len(v.payload) > 0 {
+						copy(padded[32-len(v.payload):], v.payload)
+					}
+					mir.meta = padded
+				}
+			}
 			accessor.recordLoad(offset, *size32)
 		}
 		mir.oprands = []*Value{&offset, size32}
@@ -622,9 +646,11 @@ func (b *MIRBasicBlock) CreateStorageOpMIR(op MirOperation, stack *ValueStack, a
 	switch op {
 	case MirSLOAD:
 		key := stack.pop()
+		// Record load and produce generic result (forwarding disabled for parity)
 		if accessor != nil {
 			accessor.recordStateLoad(key)
 		}
+		stack.push(mir.Result())
 		mir.oprands = []*Value{&key}
 	case MirSSTORE:
 		// EVM pops key (top) then value
@@ -651,7 +677,10 @@ func (b *MIRBasicBlock) CreateStorageOpMIR(op MirOperation, stack *ValueStack, a
 		// no-op
 	}
 
-	stack.push(mir.Result())
+	// Push generic result for all except handled separately above
+	if op != MirSLOAD {
+		stack.push(mir.Result())
+	}
 	mir = b.appendMIR(mir)
 	mir.genStackDepth = stack.size()
 	// noisy generation logging removed
