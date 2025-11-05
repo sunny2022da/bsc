@@ -3,6 +3,7 @@ package compiler
 import (
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/log"
@@ -254,6 +255,14 @@ func SetGlobalMIRTracerExtended(cb func(*MIR)) {
 		}
 		cb(m)
 	}
+}
+
+// mirExecTimingHook is an optional test hook to observe MIR handler execution time
+var mirExecTimingHook func(op MirOperation, evmPC uint64, dur time.Duration)
+
+// SetMIRExecTimingHook installs a callback to observe MIR handler execution time (testing only)
+func SetMIRExecTimingHook(cb func(op MirOperation, evmPC uint64, dur time.Duration)) {
+	mirExecTimingHook = cb
 }
 
 // Debug hook: called on KECCAK256 with the exact memory slice being hashed
@@ -511,16 +520,32 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 		// Evaluate operands into concrete values, preserving order.
 		// For KECCAK256, avoid building the operands slice; compute MemorySize/Length directly below.
 		if len(m.oprands) > 0 && m.op != MirKECCAK256 {
-			n := len(m.oprands)
-			if n > len(it.preOpOps) {
-				n = len(it.preOpOps)
+			// By default, precompute all operands up to preOpOps capacity.
+			// For MSTORE/MSTORE8, precompute offset (idx 0) for gas and also value into slot 1 for handler reuse,
+			// but expose only offset to ctx.Operands to avoid affecting gas accounting.
+			nWanted := len(m.oprands)
+			if nWanted > len(it.preOpOps) {
+				nWanted = len(it.preOpOps)
 			}
-			for i := 0; i < n; i++ {
+			// Special handling for MSTORE/MSTORE8: ensure we compute offset (idx 0) and also precompute value into slot 2
+			// for handler reuse, without exposing it to ctx.Operands.
+			for i := 0; i < nWanted; i++ {
 				v := it.evalValue(m.oprands[i])
 				it.preOpVals[i].Set(v)
 				it.preOpOps[i] = &it.preOpVals[i]
 			}
-			ctx.Operands = it.preOpOps[:n]
+			if (m.op == MirMSTORE || m.op == MirMSTORE8) && len(m.oprands) >= 3 && len(it.preOpOps) > 2 {
+				v := it.evalValue(m.oprands[2])
+				it.preOpVals[2].Set(v)
+				it.preOpOps[2] = &it.preOpVals[2]
+			}
+			// Expose only what's required for gas calculation
+			if m.op == MirMSTORE || m.op == MirMSTORE8 {
+				// Only offset is needed for gas/memory size
+				ctx.Operands = it.preOpOps[:1]
+			} else {
+				ctx.Operands = it.preOpOps[:nWanted]
+			}
 		}
 		// Compute a requested memory size for common memory-affecting ops
 		switch m.op {
@@ -565,10 +590,16 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 				ctx.MemorySize = dst + ln
 			}
 		case MirKECCAK256:
-			// Compute memory size and length without allocating ctx.Operands
+			// Compute memory size and length and stash operands for handler reuse
 			if len(m.oprands) >= 2 {
-				off := it.evalValue(m.oprands[0]).Uint64()
-				ln := it.evalValue(m.oprands[1]).Uint64()
+				voff := it.evalValue(m.oprands[0])
+				vln := it.evalValue(m.oprands[1])
+				it.preOpVals[0].Set(voff)
+				it.preOpOps[0] = &it.preOpVals[0]
+				it.preOpVals[1].Set(vln)
+				it.preOpOps[1] = &it.preOpVals[1]
+				off := voff.Uint64()
+				ln := vln.Uint64()
 				ctx.MemorySize = off + ln
 				ctx.Length = ln
 			}
@@ -650,7 +681,15 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 		} else if it.tracer != nil {
 			it.tracer(m.op)
 		}
-		return h(it, m)
+		var start time.Time
+		if mirExecTimingHook != nil {
+			start = time.Now()
+		}
+		err := h(it, m)
+		if mirExecTimingHook != nil {
+			mirExecTimingHook(m.op, uint64(m.EvmPC()), time.Since(start))
+		}
+		return err
 	}
 	// Ensure tracer is invoked for every MIR op even when no fast handler exists
 	if it.tracerEx != nil {
@@ -839,9 +878,18 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 		if len(m.oprands) < 3 {
 			return fmt.Errorf("CODECOPY missing operands")
 		}
-		dest := it.evalValue(m.oprands[0])
-		off := it.evalValue(m.oprands[1])
-		sz := it.evalValue(m.oprands[2])
+		dest := it.preOpOps[0]
+		if dest == nil {
+			dest = it.evalValue(m.oprands[0])
+		}
+		off := it.preOpOps[1]
+		if off == nil {
+			off = it.evalValue(m.oprands[1])
+		}
+		sz := it.preOpOps[2]
+		if sz == nil {
+			sz = it.evalValue(m.oprands[2])
+		}
 		// Copy from env.Code if present; else zero-fill
 		if it.env != nil && it.env.Code != nil {
 			d := dest.Uint64()
@@ -884,24 +932,37 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 		if len(m.oprands) < 4 {
 			return fmt.Errorf("EXTCODECOPY missing operands")
 		}
-		addrVal := it.evalValue(m.oprands[0]).Bytes32()
+		var av *uint256.Int
+		if it.preOpOps[0] != nil {
+			av = it.preOpOps[0]
+		} else {
+			av = it.evalValue(m.oprands[0])
+		}
+		addrVal := av.Bytes32()
 		var a20 [20]byte
 		copy(a20[:], addrVal[12:])
-		dest := it.evalValue(m.oprands[1])
-		off := it.evalValue(m.oprands[2])
-		sz := it.evalValue(m.oprands[3])
+		dest := it.preOpOps[1]
+		if dest == nil {
+			dest = it.evalValue(m.oprands[1])
+		}
+		off := it.preOpOps[2]
+		if off == nil {
+			off = it.evalValue(m.oprands[2])
+		}
+		sz := it.preOpOps[3]
+		if sz == nil {
+			sz = it.evalValue(m.oprands[3])
+		}
 		d := dest.Uint64()
 		s := sz.Uint64()
 		it.ensureMemSize(d + s)
-		buf := make([]byte, s)
 		if it.env != nil && it.env.ExtCodeCopy != nil {
-			it.env.ExtCodeCopy(a20, off.Uint64(), buf)
+			it.env.ExtCodeCopy(a20, off.Uint64(), it.memory[d:d+s])
 		} else {
-			for i := range buf {
-				buf[i] = 0
+			for i := uint64(0); i < s; i++ {
+				it.memory[d+i] = 0
 			}
 		}
-		copy(it.memory[d:d+s], buf)
 		return nil
 	case MirBLOCKHASH:
 		if len(m.oprands) < 1 {
@@ -1036,9 +1097,18 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 		if len(m.oprands) < 3 {
 			return fmt.Errorf("CALLDATACOPY missing operands")
 		}
-		dest := it.evalValue(m.oprands[0])
-		off := it.evalValue(m.oprands[1])
-		sz := it.evalValue(m.oprands[2])
+		dest := it.preOpOps[0]
+		if dest == nil {
+			dest = it.evalValue(m.oprands[0])
+		}
+		off := it.preOpOps[1]
+		if off == nil {
+			off = it.evalValue(m.oprands[1])
+		}
+		sz := it.preOpOps[2]
+		if sz == nil {
+			sz = it.evalValue(m.oprands[2])
+		}
 		it.calldataCopy(dest, off, sz)
 		return nil
 	case MirRETURNDATASIZE:
@@ -1065,9 +1135,18 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 		if len(m.oprands) < 3 {
 			return fmt.Errorf("RETURNDATACOPY missing operands")
 		}
-		dest := it.evalValue(m.oprands[0])
-		off := it.evalValue(m.oprands[1])
-		sz := it.evalValue(m.oprands[2])
+		dest := it.preOpOps[0]
+		if dest == nil {
+			dest = it.evalValue(m.oprands[0])
+		}
+		off := it.preOpOps[1]
+		if off == nil {
+			off = it.evalValue(m.oprands[1])
+		}
+		sz := it.preOpOps[2]
+		if sz == nil {
+			sz = it.evalValue(m.oprands[2])
+		}
 		it.returnDataCopy(dest, off, sz)
 		return nil
 	case MirTLOAD:
@@ -1157,10 +1236,18 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 		if len(m.oprands) < 2 {
 			return fmt.Errorf("RETURN missing operands")
 		}
-		off := it.evalValue(m.oprands[0])
-		sz := it.evalValue(m.oprands[1])
-		view := it.readMemView(off, sz)
-		it.returndata = append(it.returndata[:0], view...)
+		var off, sz *uint256.Int
+		if it.preOpOps[0] != nil {
+			off = it.preOpOps[0]
+		} else {
+			off = it.evalValue(m.oprands[0])
+		}
+		if it.preOpOps[1] != nil {
+			sz = it.preOpOps[1]
+		} else {
+			sz = it.evalValue(m.oprands[1])
+		}
+		it.returndata = it.readMemCopy(off, sz)
 		return errRETURN
 	case MirREVERT:
 		if !it.env.IsByzantium {
@@ -1169,9 +1256,18 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 		if len(m.oprands) < 2 {
 			return fmt.Errorf("REVERT missing operands")
 		}
-		off := it.evalValue(m.oprands[0])
-		sz := it.evalValue(m.oprands[1])
-		view := it.readMemView(off, sz)
+		var off2, sz2 *uint256.Int
+		if it.preOpOps[0] != nil {
+			off2 = it.preOpOps[0]
+		} else {
+			off2 = it.evalValue(m.oprands[0])
+		}
+		if it.preOpOps[1] != nil {
+			sz2 = it.preOpOps[1]
+		} else {
+			sz2 = it.evalValue(m.oprands[1])
+		}
+		view := it.readMemView(off2, sz2)
 		it.returndata = append(it.returndata[:0], view...)
 		return errREVERT
 	case MirCALL:
@@ -1179,14 +1275,41 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 		if len(m.oprands) < 7 {
 			return fmt.Errorf("CALL missing operands")
 		}
-		addrV := it.evalValue(m.oprands[1]).Bytes32()
+		var addrInt *uint256.Int
+		if it.preOpOps[1] != nil {
+			addrInt = it.preOpOps[1]
+		} else {
+			addrInt = it.evalValue(m.oprands[1])
+		}
+		addrV := addrInt.Bytes32()
 		var a20 [20]byte
 		copy(a20[:], addrV[12:])
-		value := it.evalValue(m.oprands[2])
-		inOff := it.evalValue(m.oprands[3])
-		inSz := it.evalValue(m.oprands[4])
-		outOff := it.evalValue(m.oprands[5])
-		outSz := it.evalValue(m.oprands[6])
+		var value, inOff, inSz, outOff, outSz *uint256.Int
+		if it.preOpOps[2] != nil {
+			value = it.preOpOps[2]
+		} else {
+			value = it.evalValue(m.oprands[2])
+		}
+		if it.preOpOps[3] != nil {
+			inOff = it.preOpOps[3]
+		} else {
+			inOff = it.evalValue(m.oprands[3])
+		}
+		if it.preOpOps[4] != nil {
+			inSz = it.preOpOps[4]
+		} else {
+			inSz = it.evalValue(m.oprands[4])
+		}
+		if it.preOpOps[5] != nil {
+			outOff = it.preOpOps[5]
+		} else {
+			outOff = it.evalValue(m.oprands[5])
+		}
+		if it.preOpOps[6] != nil {
+			outSz = it.preOpOps[6]
+		} else {
+			outSz = it.evalValue(m.oprands[6])
+		}
 		input := it.readMemView(inOff, inSz)
 		if it.env != nil && it.env.ExternalCall != nil {
 			ret, ok := it.env.ExternalCall(0, a20, value, input)
@@ -1210,14 +1333,41 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 		if len(m.oprands) < 7 {
 			return fmt.Errorf("CALLCODE missing operands")
 		}
-		addrV := it.evalValue(m.oprands[1]).Bytes32()
+		var addrInt2 *uint256.Int
+		if it.preOpOps[1] != nil {
+			addrInt2 = it.preOpOps[1]
+		} else {
+			addrInt2 = it.evalValue(m.oprands[1])
+		}
+		addrV := addrInt2.Bytes32()
 		var a20 [20]byte
 		copy(a20[:], addrV[12:])
-		value := it.evalValue(m.oprands[2])
-		inOff := it.evalValue(m.oprands[3])
-		inSz := it.evalValue(m.oprands[4])
-		outOff := it.evalValue(m.oprands[5])
-		outSz := it.evalValue(m.oprands[6])
+		var value, inOff, inSz, outOff, outSz *uint256.Int
+		if it.preOpOps[2] != nil {
+			value = it.preOpOps[2]
+		} else {
+			value = it.evalValue(m.oprands[2])
+		}
+		if it.preOpOps[3] != nil {
+			inOff = it.preOpOps[3]
+		} else {
+			inOff = it.evalValue(m.oprands[3])
+		}
+		if it.preOpOps[4] != nil {
+			inSz = it.preOpOps[4]
+		} else {
+			inSz = it.evalValue(m.oprands[4])
+		}
+		if it.preOpOps[5] != nil {
+			outOff = it.preOpOps[5]
+		} else {
+			outOff = it.evalValue(m.oprands[5])
+		}
+		if it.preOpOps[6] != nil {
+			outSz = it.preOpOps[6]
+		} else {
+			outSz = it.evalValue(m.oprands[6])
+		}
 		input := it.readMemView(inOff, inSz)
 		if it.env != nil && it.env.ExternalCall != nil {
 			ret, ok := it.env.ExternalCall(1, a20, value, input)
@@ -1240,13 +1390,36 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 		if len(m.oprands) < 6 {
 			return fmt.Errorf("DELEGATECALL missing operands")
 		}
-		addrV := it.evalValue(m.oprands[1]).Bytes32()
+		var addrInt3 *uint256.Int
+		if it.preOpOps[1] != nil {
+			addrInt3 = it.preOpOps[1]
+		} else {
+			addrInt3 = it.evalValue(m.oprands[1])
+		}
+		addrV := addrInt3.Bytes32()
 		var a20 [20]byte
 		copy(a20[:], addrV[12:])
-		inOff := it.evalValue(m.oprands[2])
-		inSz := it.evalValue(m.oprands[3])
-		outOff := it.evalValue(m.oprands[4])
-		outSz := it.evalValue(m.oprands[5])
+		var inOff, inSz, outOff, outSz *uint256.Int
+		if it.preOpOps[2] != nil {
+			inOff = it.preOpOps[2]
+		} else {
+			inOff = it.evalValue(m.oprands[2])
+		}
+		if it.preOpOps[3] != nil {
+			inSz = it.preOpOps[3]
+		} else {
+			inSz = it.evalValue(m.oprands[3])
+		}
+		if it.preOpOps[4] != nil {
+			outOff = it.preOpOps[4]
+		} else {
+			outOff = it.evalValue(m.oprands[4])
+		}
+		if it.preOpOps[5] != nil {
+			outSz = it.preOpOps[5]
+		} else {
+			outSz = it.evalValue(m.oprands[5])
+		}
 		input := it.readMemView(inOff, inSz)
 		if it.env != nil && it.env.ExternalCall != nil {
 			ret, ok := it.env.ExternalCall(2, a20, nil, input)
@@ -1269,13 +1442,36 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 		if len(m.oprands) < 6 {
 			return fmt.Errorf("STATICCALL missing operands")
 		}
-		addrV := it.evalValue(m.oprands[1]).Bytes32()
+		var addrInt4 *uint256.Int
+		if it.preOpOps[1] != nil {
+			addrInt4 = it.preOpOps[1]
+		} else {
+			addrInt4 = it.evalValue(m.oprands[1])
+		}
+		addrV := addrInt4.Bytes32()
 		var a20 [20]byte
 		copy(a20[:], addrV[12:])
-		inOff := it.evalValue(m.oprands[2])
-		inSz := it.evalValue(m.oprands[3])
-		outOff := it.evalValue(m.oprands[4])
-		outSz := it.evalValue(m.oprands[5])
+		var inOff, inSz, outOff, outSz *uint256.Int
+		if it.preOpOps[2] != nil {
+			inOff = it.preOpOps[2]
+		} else {
+			inOff = it.evalValue(m.oprands[2])
+		}
+		if it.preOpOps[3] != nil {
+			inSz = it.preOpOps[3]
+		} else {
+			inSz = it.evalValue(m.oprands[3])
+		}
+		if it.preOpOps[4] != nil {
+			outOff = it.preOpOps[4]
+		} else {
+			outOff = it.evalValue(m.oprands[4])
+		}
+		if it.preOpOps[5] != nil {
+			outSz = it.preOpOps[5]
+		} else {
+			outSz = it.evalValue(m.oprands[5])
+		}
 		input := it.readMemView(inOff, inSz)
 		if it.env != nil && it.env.ExternalCall != nil {
 			ret, ok := it.env.ExternalCall(3, a20, nil, input)
@@ -1298,9 +1494,18 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 		if len(m.oprands) < 3 {
 			return fmt.Errorf("CREATE missing operands")
 		}
-		value := it.evalValue(m.oprands[0])
-		off := it.evalValue(m.oprands[1])
-		sz := it.evalValue(m.oprands[2])
+		value := it.preOpOps[0]
+		if value == nil {
+			value = it.evalValue(m.oprands[0])
+		}
+		off := it.preOpOps[1]
+		if off == nil {
+			off = it.evalValue(m.oprands[1])
+		}
+		sz := it.preOpOps[2]
+		if sz == nil {
+			sz = it.evalValue(m.oprands[2])
+		}
 		initCode := it.readMem(off, sz)
 		if it.env != nil && it.env.CreateContract != nil {
 			addr, ok, ret := it.env.CreateContract(4, value, initCode, nil)
@@ -1366,10 +1571,25 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 		if len(m.oprands) < 4 {
 			return fmt.Errorf("CREATE2 missing operands")
 		}
-		value := it.evalValue(m.oprands[0])
-		off := it.evalValue(m.oprands[1])
-		sz := it.evalValue(m.oprands[2])
-		saltVal := it.evalValue(m.oprands[3]).Bytes32()
+		value := it.preOpOps[0]
+		if value == nil {
+			value = it.evalValue(m.oprands[0])
+		}
+		off := it.preOpOps[1]
+		if off == nil {
+			off = it.evalValue(m.oprands[1])
+		}
+		sz := it.preOpOps[2]
+		if sz == nil {
+			sz = it.evalValue(m.oprands[2])
+		}
+		var saltInt *uint256.Int
+		if it.preOpOps[3] != nil {
+			saltInt = it.preOpOps[3]
+		} else {
+			saltInt = it.evalValue(m.oprands[3])
+		}
+		saltVal := saltInt.Bytes32()
 		var salt [32]byte
 		copy(salt[:], saltVal[:])
 		initCode := it.readMem(off, sz)
@@ -1418,8 +1638,17 @@ func mirHandleRETURN(it *MIRInterpreter, m *MIR) error {
 	if len(m.oprands) < 2 {
 		return fmt.Errorf("RETURN missing operands")
 	}
-	off := it.evalValue(m.oprands[0])
-	sz := it.evalValue(m.oprands[1])
+	var off, sz *uint256.Int
+	if it.preOpOps[0] != nil {
+		off = it.preOpOps[0]
+	} else {
+		off = it.evalValue(m.oprands[0])
+	}
+	if len(it.preOpOps) > 1 && it.preOpOps[1] != nil {
+		sz = it.preOpOps[1]
+	} else {
+		sz = it.evalValue(m.oprands[1])
+	}
 	// Avoid two allocations by using a single copy into a fresh buffer
 	it.returndata = it.readMemCopy(off, sz)
 	return errRETURN
@@ -1572,7 +1801,10 @@ func mirHandleMLOAD(it *MIRInterpreter, m *MIR) error {
 	if len(m.oprands) < 2 {
 		return fmt.Errorf("MLOAD missing operands")
 	}
-	off := it.evalValue(m.oprands[0])
+	off := it.preOpOps[0]
+	if off == nil {
+		off = it.evalValue(m.oprands[0])
+	}
 	it.readMem32Into(off, &it.scratch32)
 	it.setResult(m, it.tmpA.Clear().SetBytes(it.scratch32[:]))
 	return nil
@@ -1582,6 +1814,10 @@ func mirHandleMLOAD(it *MIRInterpreter, m *MIR) error {
 func mirLoadAB(it *MIRInterpreter, m *MIR) (a, b *uint256.Int, err error) {
 	if len(m.oprands) < 2 {
 		return nil, nil, fmt.Errorf("missing operands")
+	}
+	// Fast path: reuse pre-op evaluated operands when available
+	if it.preOpOps[0] != nil && it.preOpOps[1] != nil {
+		return it.preOpOps[0], it.preOpOps[1], nil
 	}
 	if m.evmPC == 5810 {
 		log.Warn("MIR MLOAD", "oprands1", m.oprands[0], "oprands2", m.oprands[1],
@@ -1763,8 +1999,18 @@ func mirHandleMSTORE(it *MIRInterpreter, m *MIR) error {
 	if len(m.oprands) < 3 {
 		return fmt.Errorf("MSTORE missing operands")
 	}
-	off := it.evalValue(m.oprands[0])
-	val := it.evalValue(m.oprands[2])
+	// Reuse pre-op evaluated operands when available to avoid duplicate eval work
+	var off, val *uint256.Int
+	if it.preOpOps[0] != nil {
+		off = it.preOpOps[0]
+	} else {
+		off = it.evalValue(m.oprands[0])
+	}
+	if len(it.preOpOps) > 2 && it.preOpOps[2] != nil {
+		val = it.preOpOps[2]
+	} else {
+		val = it.evalValue(m.oprands[2])
+	}
 	it.writeMem32(off, val)
 	return nil
 }
@@ -1773,8 +2019,17 @@ func mirHandleMSTORE8(it *MIRInterpreter, m *MIR) error {
 	if len(m.oprands) < 3 {
 		return fmt.Errorf("MSTORE8 missing operands")
 	}
-	off := it.evalValue(m.oprands[0])
-	val := it.evalValue(m.oprands[2])
+	var off, val *uint256.Int
+	if it.preOpOps[0] != nil {
+		off = it.preOpOps[0]
+	} else {
+		off = it.evalValue(m.oprands[0])
+	}
+	if len(it.preOpOps) > 2 && it.preOpOps[2] != nil {
+		val = it.preOpOps[2]
+	} else {
+		val = it.evalValue(m.oprands[2])
+	}
 	it.writeMem8(off, val)
 	return nil
 }
@@ -1849,8 +2104,17 @@ func mirHandleKECCAK(it *MIRInterpreter, m *MIR) error {
 		return fmt.Errorf("KECCAK256 missing operands")
 	}
 	// Operands are [offset, size]
-	off := it.evalValue(m.oprands[0])
-	sz := it.evalValue(m.oprands[1])
+	var off, sz *uint256.Int
+	if it.preOpOps[0] != nil {
+		off = it.preOpOps[0]
+	} else {
+		off = it.evalValue(m.oprands[0])
+	}
+	if it.preOpOps[1] != nil {
+		sz = it.preOpOps[1]
+	} else {
+		sz = it.evalValue(m.oprands[1])
+	}
 	// Fast-path: empty input
 	if sz.IsZero() {
 		// keccak256("") constant without allocating
@@ -1890,7 +2154,10 @@ func mirHandleCALLDATALOAD(it *MIRInterpreter, m *MIR) error {
 	if len(m.oprands) < 1 {
 		return fmt.Errorf("CALLDATALOAD missing offset")
 	}
-	off := it.evalValue(m.oprands[0])
+	off := it.preOpOps[0]
+	if off == nil {
+		off = it.evalValue(m.oprands[0])
+	}
 	it.readCalldata32Into(off, &it.scratch32)
 	it.setResult(m, it.tmpA.Clear().SetBytes(it.scratch32[:]))
 	return nil
@@ -2176,19 +2443,35 @@ func (it *MIRInterpreter) ResetReturnData() {
 }
 
 func (it *MIRInterpreter) ensureMemSize(size uint64) {
-	if uint64(len(it.memory)) < size {
-		// Grow geometrically to reduce reallocations
-		newCap := uint64(64)
-		if newCap < uint64(len(it.memory)) {
-			newCap = uint64(len(it.memory))
-		}
-		for newCap < size {
-			newCap *= 2
-		}
-		newMem := make([]byte, newCap)
-		copy(newMem, it.memory)
-		it.memory = newMem
+	curLen := uint64(len(it.memory))
+	if curLen >= size {
+		return
 	}
+	// If capacity is sufficient, extend length in-place (zero-initialized growth)
+	curCap := uint64(cap(it.memory))
+	if curCap >= size {
+		need := size - curLen
+		it.memory = append(it.memory, make([]byte, need)...)
+		return
+	}
+	// Otherwise grow geometrically to reduce reallocations
+	newCap := uint64(64)
+	if newCap < curCap {
+		newCap = curCap
+	}
+	for newCap < size {
+		newCap *= 2
+	}
+	newMem := make([]byte, curLen, newCap)
+	copy(newMem, it.memory)
+	// Extend length to requested size (zero-filled tail)
+	newMem = append(newMem, make([]byte, size-curLen)...)
+	it.memory = newMem
+}
+
+// EnsureMemorySize grows interpreter memory to at least size bytes (testing/adapter use).
+func (it *MIRInterpreter) EnsureMemorySize(size uint64) {
+	it.ensureMemSize(size)
 }
 
 func (it *MIRInterpreter) readMem(off, sz *uint256.Int) []byte {
@@ -2220,13 +2503,8 @@ func (it *MIRInterpreter) readMem32Into(off *uint256.Int, dst *[32]byte) {
 func (it *MIRInterpreter) writeMem32(off, val *uint256.Int) {
 	o := off.Uint64()
 	it.ensureMemSize(o + 32)
-	// Right-align as EVM MSTORE semantics
-	bytes := val.Bytes()
-	// zero the full 32-byte region first
-	for i := uint64(0); i < 32; i++ {
-		it.memory[o+i] = 0
-	}
-	copy(it.memory[o+32-uint64(len(bytes)):o+32], bytes)
+	// Directly encode 32-byte big-endian representation without extra zeroing/allocations
+	val.PutUint256(it.memory[o:])
 }
 
 func (it *MIRInterpreter) writeMem8(off, val *uint256.Int) {

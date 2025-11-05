@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/opcodeCompiler/compiler"
@@ -22,6 +23,13 @@ type warmSlotKey struct {
 
 // mirGasProbe is an optional test hook to observe MIR gas after each instruction
 var mirGasProbe func(pc uint64, op byte, gasLeft uint64)
+
+// mirGasTimingHook, when set (testing only), receives time spent inside the
+// adapter's pre-op hook (i.e., gas accounting for the originating EVM opcode).
+var mirGasTimingHook func(pc uint64, op byte, dur time.Duration)
+
+// SetMIRGasTimingHook installs a callback to observe MIR gas calculation time per-op (testing only).
+func SetMIRGasTimingHook(cb func(pc uint64, op byte, dur time.Duration)) { mirGasTimingHook = cb }
 
 // SetMIRGasProbe installs a callback to observe MIR gas after each instruction (testing only)
 func SetMIRGasProbe(cb func(pc uint64, op byte, gasLeft uint64)) {
@@ -92,9 +100,13 @@ func NewMIRInterpreterAdapter(evm *EVM) *MIRInterpreterAdapter {
 		if ctx == nil || ctx.M == nil || contract == nil {
 			return nil
 		}
+		var timingStart time.Time
+		if mirGasTimingHook != nil {
+			timingStart = time.Now()
+		}
 		// The following body mirrors the per-run innerHook logic
 		evmOp := OpCode(ctx.EvmOp)
-		if adapter.evm != nil && adapter.evm.Config.Tracer != nil && adapter.evm.Config.Tracer.OnOpcode != nil {
+		if adapter.evm != nil && adapter.evm.Config.Tracer != nil && adapter.evm.Config.Tracer.OnOpcode != nil && ctx.IsBlockEntry {
 			scope := &ScopeContext{Memory: adapter.memShadow, Stack: nil, Contract: contract}
 			adapter.evm.Config.Tracer.OnOpcode(uint64(ctx.M.EvmPC()), byte(evmOp), contract.Gas, 0, scope, nil, adapter.evm.depth, nil)
 		}
@@ -178,7 +190,7 @@ func NewMIRInterpreterAdapter(evm *EVM) *MIRInterpreterAdapter {
 				contract.Gas -= add
 			}
 		case MLOAD, MSTORE, MSTORE8, RETURN, REVERT, CREATE, CREATE2:
-			if ctx.MemorySize > 0 {
+			if ctx.MemorySize > uint64(adapter.memShadow.Len()) {
 				gas, err := memoryGasCost(adapter.memShadow, ctx.MemorySize)
 				if err != nil {
 					if errors.Is(err, ErrGasUintOverflow) {
@@ -206,9 +218,11 @@ func NewMIRInterpreterAdapter(evm *EVM) *MIRInterpreterAdapter {
 					}
 				}
 				resizeShadow(ctx.MemorySize)
+				// Pre-size MIR interpreter memory to move resize cost out of handler
+				adapter.mirInterpreter.EnsureMemorySize(ctx.MemorySize)
 			}
 		case CALLDATACOPY, CODECOPY, RETURNDATACOPY:
-			if ctx.MemorySize > 0 {
+			if ctx.MemorySize > uint64(adapter.memShadow.Len()) {
 				gas, err := memoryGasCost(adapter.memShadow, ctx.MemorySize)
 				if err != nil {
 					if errors.Is(err, ErrGasUintOverflow) {
@@ -228,9 +242,10 @@ func NewMIRInterpreterAdapter(evm *EVM) *MIRInterpreterAdapter {
 				}
 				contract.Gas -= add
 				resizeShadow(ctx.MemorySize)
+				adapter.mirInterpreter.EnsureMemorySize(ctx.MemorySize)
 			}
 		case EXTCODECOPY:
-			if ctx.MemorySize > 0 {
+			if ctx.MemorySize > uint64(adapter.memShadow.Len()) {
 				gas, err := memoryGasCost(adapter.memShadow, ctx.MemorySize)
 				if err != nil {
 					if errors.Is(err, ErrGasUintOverflow) {
@@ -250,6 +265,7 @@ func NewMIRInterpreterAdapter(evm *EVM) *MIRInterpreterAdapter {
 				}
 				contract.Gas -= add
 				resizeShadow(ctx.MemorySize)
+				adapter.mirInterpreter.EnsureMemorySize(ctx.MemorySize)
 			}
 			if adapter.evm.chainRules.IsBerlin {
 				if len(ctx.Operands) >= 1 {
@@ -280,7 +296,7 @@ func NewMIRInterpreterAdapter(evm *EVM) *MIRInterpreterAdapter {
 				}
 			}
 		case MCOPY:
-			if ctx.MemorySize > 0 {
+			if ctx.MemorySize > uint64(adapter.memShadow.Len()) {
 				gas, err := memoryGasCost(adapter.memShadow, ctx.MemorySize)
 				if err != nil {
 					if errors.Is(err, ErrGasUintOverflow) {
@@ -300,9 +316,10 @@ func NewMIRInterpreterAdapter(evm *EVM) *MIRInterpreterAdapter {
 				}
 				contract.Gas -= add
 				resizeShadow(ctx.MemorySize)
+				adapter.mirInterpreter.EnsureMemorySize(ctx.MemorySize)
 			}
 		case KECCAK256:
-			if ctx.MemorySize > 0 {
+			if ctx.MemorySize > uint64(adapter.memShadow.Len()) {
 				gas, err := memoryGasCost(adapter.memShadow, ctx.MemorySize)
 				if err != nil {
 					if errors.Is(err, ErrGasUintOverflow) {
@@ -321,6 +338,19 @@ func NewMIRInterpreterAdapter(evm *EVM) *MIRInterpreterAdapter {
 					return ErrOutOfGas
 				}
 				contract.Gas -= add
+				resizeShadow(ctx.MemorySize)
+				adapter.mirInterpreter.EnsureMemorySize(ctx.MemorySize)
+			} else {
+				// No growth: only charge per-word keccak cost
+				size := ctx.Length
+				if size == 0 && len(ctx.Operands) >= 2 {
+					size = ctx.Operands[1].Uint64()
+				}
+				wordGas := toWord(size) * params.Keccak256WordGas
+				if contract.Gas < wordGas {
+					return ErrOutOfGas
+				}
+				contract.Gas -= wordGas
 			}
 		case LOG0, LOG1, LOG2, LOG3, LOG4:
 			if ctx.MemorySize > 0 {
@@ -343,6 +373,7 @@ func NewMIRInterpreterAdapter(evm *EVM) *MIRInterpreterAdapter {
 				}
 				contract.Gas -= add
 				resizeShadow(ctx.MemorySize)
+				adapter.mirInterpreter.EnsureMemorySize(ctx.MemorySize)
 			}
 		case SELFDESTRUCT:
 			var gas uint64
@@ -396,6 +427,7 @@ func NewMIRInterpreterAdapter(evm *EVM) *MIRInterpreterAdapter {
 				st.push(ctx.Operands[0])
 				var dyn uint64
 				var err error
+				hadOverflow := false
 				if adapter.evm.chainRules.IsBerlin {
 					if evmOp == CALL {
 						dyn, err = gasCallEIP2929(adapter.evm, contract, st, adapter.memShadow, ctx.MemorySize)
@@ -410,13 +442,23 @@ func NewMIRInterpreterAdapter(evm *EVM) *MIRInterpreterAdapter {
 					}
 				}
 				if err != nil {
-					return err
+					if errors.Is(err, ErrGasUintOverflow) {
+						// Match stock interpreter: do not surface overflow from call gas calculation here
+						// Effective call stipend/cap handling happens later in the call path
+						hadOverflow = true
+						err = nil
+					}
+					if err != nil {
+						return err
+					}
 				}
 				if contract.Gas < dyn {
 					return ErrOutOfGas
 				}
 				contract.Gas -= dyn
-				resizeShadow(ctx.MemorySize)
+				if !hadOverflow {
+					resizeShadow(ctx.MemorySize)
+				}
 			case DELEGATECALL, STATICCALL:
 				if len(ctx.Operands) < 6 {
 					return nil
@@ -426,6 +468,7 @@ func NewMIRInterpreterAdapter(evm *EVM) *MIRInterpreterAdapter {
 				st.push(ctx.Operands[0])
 				var dyn uint64
 				var err error
+				hadOverflow := false
 				if adapter.evm.chainRules.IsBerlin {
 					if evmOp == DELEGATECALL {
 						dyn, err = gasDelegateCallEIP2929(adapter.evm, contract, st, adapter.memShadow, ctx.MemorySize)
@@ -440,17 +483,28 @@ func NewMIRInterpreterAdapter(evm *EVM) *MIRInterpreterAdapter {
 					}
 				}
 				if err != nil {
-					return err
+					if errors.Is(err, ErrGasUintOverflow) {
+						hadOverflow = true
+						err = nil
+					}
+					if err != nil {
+						return err
+					}
 				}
 				if contract.Gas < dyn {
 					return ErrOutOfGas
 				}
 				contract.Gas -= dyn
-				resizeShadow(ctx.MemorySize)
+				if !hadOverflow {
+					resizeShadow(ctx.MemorySize)
+				}
 			}
 		}
 		if mirGasProbe != nil {
 			mirGasProbe(uint64(ctx.M.EvmPC()), ctx.EvmOp, contract.Gas)
+		}
+		if mirGasTimingHook != nil {
+			mirGasTimingHook(uint64(ctx.M.EvmPC()), ctx.EvmOp, time.Since(timingStart))
 		}
 		return nil
 	})

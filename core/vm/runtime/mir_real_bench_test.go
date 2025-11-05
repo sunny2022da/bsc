@@ -860,10 +860,15 @@ func TestUSDT_MIR_Strict_Debug_Allowance(t *testing.T) {
 	input = append(input, zero...)
 	input = append(input, zero...)
 
-	// Tracers: log JUMP/JUMPI destinations and early dispatch
+	// Tracers: log early dispatch; also capture terminal-only exit PCs for parity
+	evmExitPC := int64(-1)
+	mirExitPC := int64(-1)
+	var evmLastPC int64 = -1
+	var mirLastPC int64 = -1
 	evmTracer := &tracing.Hooks{
 		OnOpcode: func(pc uint64, opcode byte, gas, cost uint64, scope tracing.OpContext, rData []byte, depth int, err error) {
 			op := vm.OpCode(opcode)
+			evmLastPC = int64(pc)
 			if op == vm.JUMP || op == vm.JUMPI || pc < 900 { // capture early dispatch region
 				stack := append([]uint256.Int(nil), scope.StackData()...)
 				t.Logf("EVM pc=%d op=%s stackTop=%v depth=%d", pc, op.String(), func() interface{} {
@@ -873,11 +878,25 @@ func TestUSDT_MIR_Strict_Debug_Allowance(t *testing.T) {
 					return nil
 				}(), depth)
 			}
+			// Capture terminal-only exit PC
+			if op == vm.STOP || op == vm.RETURN || op == vm.REVERT || op == vm.INVALID {
+				evmExitPC = int64(pc)
+			}
+		},
+		OnFault: func(pc uint64, opcode byte, gas, cost uint64, scope tracing.OpContext, depth int, vmerr error) {
+			// Record the pc where the fault occurred (e.g., invalid jump)
+			evmExitPC = int64(pc)
 		},
 	}
 	compiler.SetGlobalMIRTracerExtended(func(m *compiler.MIR) {
 		if m != nil {
 			t.Logf("MIR exec: %s evm_pc=%d evm_op=0x%02x ops=%v", m.Op().String(), m.EvmPC(), m.EvmOp(), m.OperandDebugStrings())
+			mirLastPC = int64(m.EvmPC())
+			// Capture terminal-only exit PC for MIR
+			switch m.Op() {
+			case compiler.MirSTOP, compiler.MirRETURN, compiler.MirREVERT:
+				mirExitPC = int64(m.EvmPC())
+			}
 		}
 	})
 	defer compiler.SetGlobalMIRTracerExtended(nil)
@@ -903,6 +922,16 @@ func TestUSDT_MIR_Strict_Debug_Allowance(t *testing.T) {
 	t.Logf("EVM ret: %x err: %v", rb, errB)
 	rm, errM := run(mir, "usdt_allow_m", evmTracer)
 	t.Logf("MIR ret: %x err: %v", rm, errM)
+	// If terminal opcode not seen, fall back to last seen pc (fault path)
+	effEVM := evmExitPC
+	if effEVM < 0 {
+		effEVM = evmLastPC
+	}
+	effMIR := mirExitPC
+	if effMIR < 0 {
+		effMIR = mirLastPC
+	}
+	t.Logf("Terminal/last PC: EVM=%d MIR=%d", effEVM, effMIR)
 }
 
 // TestUSDT_MIR_Strict_Debug_Approve: run approve under strict mode with rich tracing.
