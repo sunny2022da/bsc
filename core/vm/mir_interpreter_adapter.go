@@ -49,6 +49,8 @@ type MIRInterpreterAdapter struct {
 	warmSlots    map[warmSlotKey]struct{}
 	// storageCache caches SLOAD values within a single Run (key is 32-byte slot)
 	storageCache map[[32]byte][32]byte
+	// blockConstGasCache caches aggregated constant gas per MIR basic block for this Run
+	blockConstGasCache map[*compiler.MIRBasicBlock]uint64
 }
 
 // NewMIRInterpreterAdapter creates a new MIR interpreter adapter for EVM
@@ -106,17 +108,43 @@ func NewMIRInterpreterAdapter(evm *EVM) *MIRInterpreterAdapter {
 		}
 		// The following body mirrors the per-run innerHook logic
 		evmOp := OpCode(ctx.EvmOp)
-		if adapter.evm != nil && adapter.evm.Config.Tracer != nil && adapter.evm.Config.Tracer.OnOpcode != nil && ctx.IsBlockEntry {
+		if adapter.evm != nil && adapter.evm.Config.Tracer != nil && adapter.evm.Config.Tracer.OnOpcode != nil && (ctx.IsBlockEntry || ctx.M.Op() == compiler.MirRETURN || ctx.M.Op() == compiler.MirSTOP) {
 			scope := &ScopeContext{Memory: adapter.memShadow, Stack: nil, Contract: contract}
 			adapter.evm.Config.Tracer.OnOpcode(uint64(ctx.M.EvmPC()), byte(evmOp), contract.Gas, 0, scope, nil, adapter.evm.depth, nil)
 		}
-		if ctx.M.Op() != compiler.MirPHI {
-			jt := (*adapter.table)[evmOp]
-			if jt != nil && jt.constantGas > 0 {
-				if contract.Gas < jt.constantGas {
-					return ErrOutOfGas
+		// Aggregated constant gas: on basic-block entry, pre-charge the sum of
+		// constant gas for all original EVM opcodes in this block.
+		if ctx.IsBlockEntry && ctx.Block != nil {
+			if adapter.blockConstGasCache != nil {
+				if cached, ok := adapter.blockConstGasCache[ctx.Block]; ok {
+					if cached > 0 {
+						if contract.Gas < cached {
+							return ErrOutOfGas
+						}
+						contract.Gas -= cached
+					}
+				} else {
+					// Sum up constant gas based on original EVM opcode counts in this block.
+					var total uint64 = 0
+					if counts := ctx.Block.EVMOpCounts(); counts != nil {
+						for opb, cnt := range counts {
+							if cnt == 0 {
+								continue
+							}
+							jt := (*adapter.table)[OpCode(opb)]
+							if jt != nil && jt.constantGas > 0 {
+								total += jt.constantGas * uint64(cnt)
+							}
+						}
+					}
+					adapter.blockConstGasCache[ctx.Block] = total
+					if total > 0 {
+						if contract.Gas < total {
+							return ErrOutOfGas
+						}
+						contract.Gas -= total
+					}
 				}
-				contract.Gas -= jt.constantGas
 			}
 		}
 		if adapter.memShadow == nil {
@@ -577,6 +605,8 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 
 	// Set current contract for the pre-installed hook
 	adapter.currentContract = contract
+	// Reset per-run caches
+	adapter.blockConstGasCache = make(map[*compiler.MIRBasicBlock]uint64)
 	// Set up MIR execution environment with contract-specific data
 	adapter.setupExecutionEnvironment(contract, input)
 

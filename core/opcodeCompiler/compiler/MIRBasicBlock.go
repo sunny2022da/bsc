@@ -56,6 +56,12 @@ type MIRBasicBlock struct {
 	// emittedOpCounts counts only those opcodes for which a MIR instruction was emitted
 	evmOpCounts     map[byte]uint32
 	emittedOpCounts map[byte]uint32
+	// Fast path: fixed-size emitted counts array avoids map iteration/copies at runtime
+	emittedCountsArr [256]uint32
+	// Per-originating-PC emission counter to tag first MIR for constant gas charge
+	emitCountByPC map[uint]uint16
+	// Precomputed list of MIRs that should charge constant gas for their EVM opcode
+	constChargePoints []*MIR
 	// SSA-like stack modeling
 	entryStack     []Value
 	exitStack      []Value
@@ -99,6 +105,13 @@ func (b *MIRBasicBlock) EmittedOpCounts() map[byte]uint32 {
 	}
 	return out
 }
+
+// EmittedCountsArray returns a pointer to the fixed-size array of emitted counts per opcode.
+func (b *MIRBasicBlock) EmittedCountsArray() *[256]uint32 { return &b.emittedCountsArr }
+
+// ConstChargePoints returns the list of MIRs designated to charge constant gas
+// for their originating EVM opcode within this basic block.
+func (b *MIRBasicBlock) ConstChargePoints() []*MIR { return b.constChargePoints }
 
 func (b *MIRBasicBlock) FirstPC() uint {
 	return b.firstPC
@@ -166,10 +179,19 @@ func (b *MIRBasicBlock) appendMIR(mir *MIR) *MIR {
 	// Attach EVM mapping captured by the CFG builder
 	mir.evmPC = currentEVMBuildPC
 	mir.evmOp = currentEVMBuildOp
+	// Mark the first MIR emitted for this originating EVM PC as the constant-gas charge point
+	if b.emitCountByPC != nil {
+		if b.emitCountByPC[mir.evmPC] == 0 {
+			mir.chargeConstGas = true
+			b.constChargePoints = append(b.constChargePoints, mir)
+		}
+		b.emitCountByPC[mir.evmPC] = b.emitCountByPC[mir.evmPC] + 1
+	}
 	// Record that we emitted a MIR for this originating EVM opcode
 	if b.emittedOpCounts != nil {
 		b.emittedOpCounts[currentEVMBuildOp]++
 	}
+	b.emittedCountsArr[int(currentEVMBuildOp)]++
 	// Pre-encode operand info to avoid runtime eval costs
 	if len(mir.oprands) > 0 {
 		mir.opKinds = make([]byte, len(mir.oprands))
@@ -233,14 +255,46 @@ func (b *MIRBasicBlock) CreateUnaryOpMIR(op MirOperation, stack *ValueStack) (mi
 func (b *MIRBasicBlock) CreateBinOpMIR(op MirOperation, stack *ValueStack) (mir *MIR) {
 	opnd1 := stack.pop()
 	opnd2 := stack.pop()
+
+	// Try to fuse MUL followed by ADD into MADD when the MUL is the last emitted instruction
+	if op == MirADD && len(b.instructions) > 0 {
+		last := b.instructions[len(b.instructions)-1]
+		var mulDef *MIR
+		var other *Value
+		if opnd1.kind == Variable && opnd1.def != nil && opnd1.def == last && last.op == MirMUL {
+			mulDef = last
+			other = &opnd2
+		} else if opnd2.kind == Variable && opnd2.def != nil && opnd2.def == last && last.op == MirMUL {
+			mulDef = last
+			other = &opnd1
+		}
+		if mulDef != nil && other != nil {
+			// Replace last MUL with a single MADD(a, b, other)
+			madd := new(MIR)
+			madd.op = MirMADD
+			// operands order: a, b, c
+			madd.oprands = []*Value{mulDef.oprands[0], mulDef.oprands[1], other}
+			// Preserve mapping to the current ADD's EVM mapping
+			madd.evmPC = currentEVMBuildPC
+			madd.evmOp = currentEVMBuildOp
+			// Replace last instruction
+			b.instructions[len(b.instructions)-1] = madd
+			// Result of ADD remains on stack
+			stack.push(madd.Result())
+			return madd
+		}
+	}
+
 	mir = newBinaryOpMIR(op, &opnd1, &opnd2, stack)
 
 	// Only push result if the operation wasn't optimized away (MirNOP)
 	if mir.op != MirNOP {
 		stack.push(mir.Result())
 	}
-	// If mir.op == MirNOP, doPeepHole already pushed the optimized constant to stack
-
+	// If MirNOP, skip emission entirely (peephole already adjusted the stack)
+	if mir.op == MirNOP {
+		return nil
+	}
 	mir = b.appendMIR(mir)
 	mir.genStackDepth = stack.size()
 	// noisy generation logging removed
@@ -355,6 +409,7 @@ func NewMIRBasicBlock(blockNum, pc uint, parent *MIRBasicBlock) *MIRBasicBlock {
 	bb.instructions = []*MIR{}
 	bb.evmOpCounts = make(map[byte]uint32)
 	bb.emittedOpCounts = make(map[byte]uint32)
+	bb.emitCountByPC = make(map[uint]uint16)
 	bb.entryStack = nil
 	bb.exitStack = nil
 	bb.incomingStacks = make(map[*MIRBasicBlock][]Value)
@@ -427,27 +482,19 @@ func (b *MIRBasicBlock) CreateDupMIR(n int, stack *ValueStack) *MIR {
 	// Get the value to duplicate (n-1 because stack is 0-indexed from top)
 	dupValue := stack.peek(n - 1)
 
-	// Check if we can optimize this DUP operation
+	// If the value to duplicate is a constant, duplicate by pushing same constant
 	if isOptimizable(MirOperation(0x80+byte(n-1))) && dupValue.kind == Konst {
-		// If the value to duplicate is a constant, duplicate by pushing same constant
 		optimizedValue := newValue(Konst, nil, nil, dupValue.payload)
 		stack.push(optimizedValue)
-		// Emit NOP to account for DUP base gas
-		mir := new(MIR)
-		mir.op = MirNOP
-		b.appendMIR(mir)
-		return mir
+		return nil
 	}
 
 	// For non-constant values, perform the actual duplication on the stack
 	duplicatedValue := *dupValue // Copy the value
 	stack.push(&duplicatedValue)
 
-	// Emit NOP to account for DUP base gas
-	mir := new(MIR)
-	mir.op = MirNOP
-	b.appendMIR(mir)
-	return mir
+	// No runtime MIR for DUP; gas handled via per-block opcode counts
+	return nil
 }
 
 func (b *MIRBasicBlock) CreateSwapMIR(n int, stack *ValueStack) *MIR {
@@ -470,21 +517,14 @@ func (b *MIRBasicBlock) CreateSwapMIR(n int, stack *ValueStack) *MIR {
 		topValue.kind == Konst && swapValue.kind == Konst {
 		// Both values are constants, just swap in stack
 		stack.swap(0, n)
-		// Emit NOP to account for SWAP base gas
-		mir := new(MIR)
-		mir.op = MirNOP
-		b.appendMIR(mir)
-		return mir
+		return nil
 	}
 
 	// For non-constant values, perform the actual swap on the stack
 	stack.swap(0, n)
 	// Diagnostics: after swap snapshot removed
-	// Emit NOP to account for SWAP base gas
-	mir := new(MIR)
-	mir.op = MirNOP
-	b.appendMIR(mir)
-	return mir
+	// No runtime MIR for SWAP; gas handled via per-block opcode counts
+	return nil
 }
 
 // CreatePhiMIR creates a PHI node merging incoming stack values.
@@ -961,13 +1001,8 @@ func (b *MIRBasicBlock) ResetForRebuild(preserveEntry bool) {
 
 func (b *MIRBasicBlock) CreatePushMIR(n int, value []byte, stack *ValueStack) *MIR {
 	stack.push(newValue(Konst, nil, nil, value))
-	// Emit a NOP to account for base gas of the PUSH opcode at runtime
-	mir := new(MIR)
-	mir.op = MirNOP
-	if mir != nil {
-		b.appendMIR(mir)
-	}
-	return mir
+	// No runtime MIR for PUSH; gas handled via per-block opcode counts
+	return nil
 }
 
 func (bb *MIRBasicBlock) GetNextOp() *MIR {

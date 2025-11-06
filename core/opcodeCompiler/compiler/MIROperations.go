@@ -17,6 +17,8 @@ const (
 	MirMULMOD  MirOperation = 0x9 // MULMOD	reg0, reg1, reg2, reg3
 	MirEXP     MirOperation = 0xa // EXP      reg0, reg1, reg2
 	MirSIGNEXT MirOperation = 0xb // SIGNEXTEND reg0, reg1, reg2
+	// Fused arithmetic: (a*b)+c
+	MirMADD MirOperation = 0xc // MADD    reg0, reg1, reg2
 
 	MirLT     MirOperation = 0x10 // LT reg0, reg1, reg2
 	MirGT     MirOperation = 0x11 // GT reg0, reg1, reg2
@@ -63,6 +65,8 @@ func (op MirOperation) String() string {
 		return "MirEXP"
 	case MirSIGNEXT:
 		return "MirSIGNEXT"
+	case MirMADD:
+		return "MirMADD"
 	case MirLT:
 		return "MirLT"
 	case MirGT:
