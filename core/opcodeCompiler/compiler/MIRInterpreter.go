@@ -512,39 +512,44 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 		ctx.Operands = nil
 		ctx.MemorySize = 0
 		ctx.Length = 0
+		ctx.IsBlockEntry = false
 		// Mark block entry for the first instruction in the current basic block
 		if m != nil && m.idx == 0 {
 			ctx.IsBlockEntry = true
 			ctx.Block = it.currentBB
 		}
-		// Evaluate operands into concrete values, preserving order.
-		// For KECCAK256, avoid building the operands slice; compute MemorySize/Length directly below.
-		if len(m.oprands) > 0 && m.op != MirKECCAK256 {
-			// By default, precompute all operands up to preOpOps capacity.
-			// For MSTORE/MSTORE8, precompute offset (idx 0) for gas and also value into slot 1 for handler reuse,
-			// but expose only offset to ctx.Operands to avoid affecting gas accounting.
-			nWanted := len(m.oprands)
-			if nWanted > len(it.preOpOps) {
-				nWanted = len(it.preOpOps)
-			}
-			// Special handling for MSTORE/MSTORE8: ensure we compute offset (idx 0) and also precompute value into slot 2
-			// for handler reuse, without exposing it to ctx.Operands.
-			for i := 0; i < nWanted; i++ {
-				v := it.evalValue(m.oprands[i])
-				it.preOpVals[i].Set(v)
-				it.preOpOps[i] = &it.preOpVals[i]
-			}
-			if (m.op == MirMSTORE || m.op == MirMSTORE8) && len(m.oprands) >= 3 && len(it.preOpOps) > 2 {
-				v := it.evalValue(m.oprands[2])
-				it.preOpVals[2].Set(v)
-				it.preOpOps[2] = &it.preOpVals[2]
-			}
-			// Expose only what's required for gas calculation
-			if m.op == MirMSTORE || m.op == MirMSTORE8 {
-				// Only offset is needed for gas/memory size
-				ctx.Operands = it.preOpOps[:1]
-			} else {
-				ctx.Operands = it.preOpOps[:nWanted]
+		// Evaluate operands only for ops where adapter needs them for gas/memory
+		switch m.op {
+		case MirMLOAD, MirMSTORE, MirMSTORE8, MirMCOPY,
+			MirCALLDATACOPY, MirCODECOPY, MirRETURNDATACOPY, MirEXTCODECOPY,
+			MirRETURN, MirREVERT,
+			MirCALL, MirCALLCODE, MirDELEGATECALL, MirSTATICCALL,
+			MirCREATE, MirCREATE2,
+			MirLOG0, MirLOG1, MirLOG2, MirLOG3, MirLOG4,
+			MirBALANCE, MirEXTCODESIZE, MirEXTCODEHASH,
+			MirSLOAD, MirSSTORE,
+			MirEXP:
+			if len(m.oprands) > 0 {
+				nWanted := len(m.oprands)
+				if nWanted > len(it.preOpOps) {
+					nWanted = len(it.preOpOps)
+				}
+				for i := 0; i < nWanted; i++ {
+					v := it.evalValue(m.oprands[i])
+					it.preOpVals[i].Set(v)
+					it.preOpOps[i] = &it.preOpVals[i]
+				}
+				if (m.op == MirMSTORE || m.op == MirMSTORE8) && len(m.oprands) >= 3 && len(it.preOpOps) > 2 {
+					v := it.evalValue(m.oprands[2])
+					it.preOpVals[2].Set(v)
+					it.preOpOps[2] = &it.preOpVals[2]
+				}
+				// Expose only what's required for gas calculation
+				if m.op == MirMSTORE || m.op == MirMSTORE8 {
+					ctx.Operands = it.preOpOps[:1]
+				} else {
+					ctx.Operands = it.preOpOps[:nWanted]
+				}
 			}
 		}
 		// Compute a requested memory size for common memory-affecting ops
@@ -675,6 +680,75 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 		}
 	}
 	// Try fast handler if available
+	// Inline hot micro-ops to avoid function call dispatch overhead
+	switch m.op {
+	case MirNOP:
+		if it.tracerEx != nil {
+			it.tracerEx(m)
+		} else if it.tracer != nil {
+			it.tracer(m.op)
+		}
+		return nil
+	case MirADD:
+		if it.tracerEx != nil {
+			it.tracerEx(m)
+		} else if it.tracer != nil {
+			it.tracer(m.op)
+		}
+		a, b, _ := mirLoadAB(it, m)
+		it.setResult(m, it.tmpA.Clear().Add(a, b))
+		return nil
+	case MirMUL:
+		if it.tracerEx != nil {
+			it.tracerEx(m)
+		} else if it.tracer != nil {
+			it.tracer(m.op)
+		}
+		a, b, _ := mirLoadAB(it, m)
+		it.setResult(m, it.tmpA.Clear().Mul(a, b))
+		return nil
+	case MirMSTORE:
+		if it.tracerEx != nil {
+			it.tracerEx(m)
+		} else if it.tracer != nil {
+			it.tracer(m.op)
+		}
+		if len(m.oprands) < 3 {
+			return fmt.Errorf("MSTORE missing operands")
+		}
+		off := it.preOpOps[0]
+		if off == nil {
+			off = it.evalValue(m.oprands[0])
+		}
+		val := it.preOpOps[2]
+		if val == nil {
+			val = it.evalValue(m.oprands[2])
+		}
+		it.writeMem32(off, val)
+		return nil
+	case MirRETURN:
+		if it.tracerEx != nil {
+			it.tracerEx(m)
+		} else if it.tracer != nil {
+			it.tracer(m.op)
+		}
+		if len(m.oprands) < 2 {
+			return fmt.Errorf("RETURN missing operands")
+		}
+		var off, sz *uint256.Int
+		if it.preOpOps[0] != nil {
+			off = it.preOpOps[0]
+		} else {
+			off = it.evalValue(m.oprands[0])
+		}
+		if it.preOpOps[1] != nil {
+			sz = it.preOpOps[1]
+		} else {
+			sz = it.evalValue(m.oprands[1])
+		}
+		it.returndata = it.readMemCopy(off, sz)
+		return errRETURN
+	}
 	if h := mirHandlers[byte(m.op)]; h != nil {
 		if it.tracerEx != nil {
 			it.tracerEx(m)
