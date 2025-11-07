@@ -392,7 +392,7 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 				}
 				// Topics and data costs
 				n := int(evmOp - LOG0)
-				add := gas + uint64(n)*params.LogTopicGas
+				add := gas + params.LogGas + uint64(n)*params.LogTopicGas
 				var size uint64
 				if len(ctx.Operands) >= 2 {
 					size = ctx.Operands[1].Uint64()
@@ -659,37 +659,35 @@ func (adapter *MIRInterpreterAdapter) setupExecutionEnvironment(contract *Contra
 		for i := range topics {
 			hashes[i] = common.BytesToHash(topics[i][:])
 		}
-
-		// EXTCODEHASH via StateDB
-		env.ExtCodeHash = func(addr [20]byte) [32]byte {
-			a := common.BytesToAddress(addr[:])
-			h := adapter.evm.StateDB.GetCodeHash(a)
-			var out [32]byte
-			copy(out[:], h[:])
-			return out
-		}
-
-		// GAS left is not directly exposed here; leave nil to signal unavailability
-
-		// Blob fields (EIP-4844): base fee and blob hashes
-		if adapter.evm.Context.BlobBaseFee != nil {
-			env.BlobBaseFee = adapter.evm.Context.BlobBaseFee.Uint64()
-		}
-		env.BlobHashFunc = func(index uint64) [32]byte {
-			if index < uint64(len(adapter.evm.TxContext.BlobHashes)) {
-				h := adapter.evm.TxContext.BlobHashes[index]
-				var out [32]byte
-				copy(out[:], h[:])
-				return out
-			}
-			return [32]byte{}
-		}
 		adapter.evm.StateDB.AddLog(&coretypes.Log{
 			Address:     a,
 			Topics:      hashes,
 			Data:        append([]byte(nil), data...),
 			BlockNumber: adapter.evm.Context.BlockNumber.Uint64(),
 		})
+	}
+
+	// EXTCODEHASH via StateDB
+	env.ExtCodeHash = func(addr [20]byte) [32]byte {
+		a := common.BytesToAddress(addr[:])
+		h := adapter.evm.StateDB.GetCodeHash(a)
+		var out [32]byte
+		copy(out[:], h[:])
+		return out
+	}
+
+	// Blob fields (EIP-4844): base fee and blob hashes
+	if adapter.evm.Context.BlobBaseFee != nil {
+		env.BlobBaseFee = adapter.evm.Context.BlobBaseFee.Uint64()
+	}
+	env.BlobHashFunc = func(index uint64) [32]byte {
+		if index < uint64(len(adapter.evm.TxContext.BlobHashes)) {
+			h := adapter.evm.TxContext.BlobHashes[index]
+			var out [32]byte
+			copy(out[:], h[:])
+			return out
+		}
+		return [32]byte{}
 	}
 
 	// Wire external execution to stock EVM for CALL-family ops

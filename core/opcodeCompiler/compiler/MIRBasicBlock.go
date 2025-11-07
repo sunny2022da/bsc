@@ -837,15 +837,32 @@ func (b *MIRBasicBlock) CreateSystemOpMIR(op MirOperation, stack *ValueStack) *M
 	return mir
 }
 
-func (b *MIRBasicBlock) CreateLogMIR(op MirOperation, stack *ValueStack) *MIR {
-	mir := new(MIR)
-	mir.op = op
-	stack.push(mir.Result())
-	mir = b.appendMIR(mir)
-	mir.genStackDepth = stack.size()
-	// noisy generation logging removed
-	return mir
-}
+	func (b *MIRBasicBlock) CreateLogMIR(op MirOperation, stack *ValueStack) *MIR {
+		mir := new(MIR)
+		mir.op = op
+		
+		// Calculate number of topics based on LOG operation
+		numTopics := int(op - MirLOG0)
+		
+		// EVM pops in order: dataOffset, dataSize, topic1, topic2, ..., topicN
+		// (stack top has dataOffset, then dataSize, then topics)
+		// Total operands: 2 (offset+size) + numTopics
+		totalOperands := 2 + numTopics
+		
+		// Pop all values - they come in the right order!
+		operands := make([]*Value, totalOperands)
+		for i := 0; i < totalOperands; i++ {
+			val := stack.pop()
+			operands[i] = &val
+		}
+		mir.oprands = operands
+		
+		stack.push(mir.Result())
+		mir = b.appendMIR(mir)
+		mir.genStackDepth = stack.size()
+		// noisy generation logging removed
+		return mir
+	}
 
 // stacksEqual reports whether two Value slices are equal element-wise using Value semantics.
 // Constants are compared by numeric value, variables by stable def identity (op, evmPC, phiSlot).
