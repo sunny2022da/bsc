@@ -436,7 +436,16 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 				// push value then key so Back(0)=key, Back(1)=value
 				st.push(new(uint256.Int).Set(ctx.Operands[1]))
 				st.push(new(uint256.Int).Set(ctx.Operands[0]))
-				gas, err := gasSStore(adapter.evm, contract, st, adapter.memShadow, 0)
+				// Use EIP-2929/3529 gas functions for Berlin/London
+				var gas uint64
+				var err error
+				if adapter.evm.chainRules.IsLondon {
+					gas, err = gasSStoreEIP3529(adapter.evm, contract, st, adapter.memShadow, 0)
+				} else if adapter.evm.chainRules.IsBerlin {
+					gas, err = gasSStoreEIP2929(adapter.evm, contract, st, adapter.memShadow, 0)
+				} else {
+					gas, err = gasSStore(adapter.evm, contract, st, adapter.memShadow, 0)
+				}
 				if err != nil {
 					if errors.Is(err, ErrGasUintOverflow) {
 					} else {
