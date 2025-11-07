@@ -1757,13 +1757,14 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 			return nil
 		case CALL:
 			// CALL takes 7 operands: gas, addr, value, inOffset, inSize, outOffset, outSize
-			outSize := valueStack.pop()
-			outOffset := valueStack.pop()
-			inSize := valueStack.pop()
-			inOffset := valueStack.pop()
-			value := valueStack.pop()
-			addr := valueStack.pop()
+			// Pop from stack top to bottom (LIFO): gas is on top
 			gas := valueStack.pop()
+			addr := valueStack.pop()
+			value := valueStack.pop()
+			inOffset := valueStack.pop()
+			inSize := valueStack.pop()
+			outOffset := valueStack.pop()
+			outSize := valueStack.pop()
 			mir = new(MIR)
 			mir.op = MirCALL
 			mir.oprands = []*Value{&gas, &addr, &value, &inOffset, &inSize, &outOffset, &outSize}
@@ -1789,13 +1790,14 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 			return nil
 		case CALLCODE:
 			// CALLCODE takes same operands as CALL
-			outSize := valueStack.pop()
-			outOffset := valueStack.pop()
-			inSize := valueStack.pop()
-			inOffset := valueStack.pop()
-			value := valueStack.pop()
-			addr := valueStack.pop()
+			// Pop from stack top to bottom (LIFO): gas is on top
 			gas := valueStack.pop()
+			addr := valueStack.pop()
+			value := valueStack.pop()
+			inOffset := valueStack.pop()
+			inSize := valueStack.pop()
+			outOffset := valueStack.pop()
+			outSize := valueStack.pop()
 			mir = new(MIR)
 			mir.op = MirCALLCODE
 			mir.oprands = []*Value{&gas, &addr, &value, &inOffset, &inSize, &outOffset, &outSize}
@@ -1838,12 +1840,13 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 			return nil
 		case DELEGATECALL:
 			// DELEGATECALL takes 6 operands: gas, addr, inOffset, inSize, outOffset, outSize
-			outSize := valueStack.pop()
-			outOffset := valueStack.pop()
-			inSize := valueStack.pop()
-			inOffset := valueStack.pop()
-			addr := valueStack.pop()
+			// Pop from stack top to bottom (LIFO): gas is on top
 			gas := valueStack.pop()
+			addr := valueStack.pop()
+			inOffset := valueStack.pop()
+			inSize := valueStack.pop()
+			outOffset := valueStack.pop()
+			outSize := valueStack.pop()
 			mir = new(MIR)
 			mir.op = MirDELEGATECALL
 			mir.oprands = []*Value{&gas, &addr, &inOffset, &inSize, &outOffset, &outSize}
@@ -1867,12 +1870,13 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 			return nil
 		case STATICCALL:
 			// STATICCALL takes 6 operands: gas, addr, inOffset, inSize, outOffset, outSize
-			outSize := valueStack.pop()
-			outOffset := valueStack.pop()
-			inSize := valueStack.pop()
-			inOffset := valueStack.pop()
-			addr := valueStack.pop()
+			// Pop from stack top to bottom (LIFO): gas is on top
 			gas := valueStack.pop()
+			addr := valueStack.pop()
+			inOffset := valueStack.pop()
+			inSize := valueStack.pop()
+			outOffset := valueStack.pop()
+			outSize := valueStack.pop()
 			mir = new(MIR)
 			mir.op = MirSTATICCALL
 			mir.oprands = []*Value{&gas, &addr, &inOffset, &inSize, &outOffset, &outSize}

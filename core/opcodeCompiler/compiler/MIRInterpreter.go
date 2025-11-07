@@ -3,7 +3,6 @@ package compiler
 import (
 	"errors"
 	"fmt"
-
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/holiman/uint256"
@@ -65,7 +64,7 @@ type MIRExecutionEnv struct {
 
 	// External execution hooks (optional). If nil, CALL/CREATE will request fallback.
 	// kind for ExternalCall: 0=CALL,1=CALLCODE,2=DELEGATECALL,3=STATICCALL
-	ExternalCall func(kind byte, addr [20]byte, value *uint256.Int, input []byte) (ret []byte, success bool)
+	ExternalCall func(kind byte, addr [20]byte, value *uint256.Int, input []byte, gas uint64) (ret []byte, success bool)
 	// kind for CreateContract: 4=CREATE,5=CREATE2. If salt is nil, treat as CREATE.
 	CreateContract func(kind byte, value *uint256.Int, init []byte, salt *[32]byte) (addr [20]byte, success bool, ret []byte)
 
@@ -217,6 +216,11 @@ func (it *MIRInterpreter) SetTracerExtended(cb func(*MIR)) {
 // and the error is propagated to the caller.
 func (it *MIRInterpreter) SetBeforeOpHook(cb func(*MIRPreOpContext) error) {
 	it.beforeOp = cb
+}
+
+// GetBeforeOpHook returns the current beforeOp hook
+func (it *MIRInterpreter) GetBeforeOpHook() func(*MIRPreOpContext) error {
+	return it.beforeOp
 }
 
 // SetGlobalMIRTracer sets a process-wide tracer that new MIR interpreters will inherit.
@@ -393,6 +397,16 @@ func (it *MIRInterpreter) RunCFGWithResolver(cfg *CFG, entry *MIRBasicBlock) ([]
 		_, err := it.RunMIR(bb)
 		if err == nil {
 			log.Warn("MIR RunCFGWithResolver: run mir success", "bb", bb.blockNum, "firstPC", bb.firstPC, "lastPC", bb.lastPC, "it.nextBB", it.nextBB)
+			// Safety check: if block ended with terminal instruction (RETURN/REVERT/STOP), don't fallthrough
+			if len(bb.instructions) > 0 {
+				lastInstr := bb.instructions[len(bb.instructions)-1]
+				if lastInstr != nil {
+					switch lastInstr.op {
+					case MirRETURN, MirREVERT, MirSTOP, MirSELFDESTRUCT:
+						return it.returndata, nil
+					}
+				}
+			}
 			if it.nextBB == nil {
 				// Fall through handling
 				children := bb.Children()
@@ -458,6 +472,11 @@ var (
 	// when MIR cannot safely continue (e.g., invalid jump destination resolution).
 	ErrMIRFallback = errors.New("MIR_FALLBACK")
 )
+
+// GetErrREVERT returns the errREVERT error for external packages to check
+func GetErrREVERT() error {
+	return errREVERT
+}
 
 func (it *MIRInterpreter) exec(m *MIR) error {
 	// Allow embedding runtimes (e.g., adapter) to run pre-op logic such as gas metering
@@ -1139,7 +1158,8 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 		outSz := it.evalValue(m.oprands[6])
 		input := it.readMem(inOff, inSz)
 		if it.env != nil && it.env.ExternalCall != nil {
-			ret, ok := it.env.ExternalCall(0, a20, value, input)
+			gasValue := it.evalValue(m.oprands[0]).Uint64()
+			ret, ok := it.env.ExternalCall(0, a20, value, input, gasValue)
 			it.returndata = append([]byte(nil), ret...)
 			if ok {
 				it.setResult(m, it.tmpA.Clear().SetOne())
@@ -1170,7 +1190,8 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 		outSz := it.evalValue(m.oprands[6])
 		input := it.readMem(inOff, inSz)
 		if it.env != nil && it.env.ExternalCall != nil {
-			ret, ok := it.env.ExternalCall(1, a20, value, input)
+			gasValue := it.evalValue(m.oprands[0]).Uint64()
+			ret, ok := it.env.ExternalCall(1, a20, value, input, gasValue)
 			it.returndata = append([]byte(nil), ret...)
 			if ok {
 				it.setResult(m, it.tmpA.Clear().SetOne())
@@ -1199,7 +1220,8 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 		outSz := it.evalValue(m.oprands[5])
 		input := it.readMem(inOff, inSz)
 		if it.env != nil && it.env.ExternalCall != nil {
-			ret, ok := it.env.ExternalCall(2, a20, nil, input)
+			gasValue := it.evalValue(m.oprands[0]).Uint64()
+			ret, ok := it.env.ExternalCall(2, a20, nil, input, gasValue)
 			it.returndata = append([]byte(nil), ret...)
 			if ok {
 				it.setResult(m, it.tmpA.Clear().SetOne())
@@ -1228,7 +1250,8 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 		outSz := it.evalValue(m.oprands[5])
 		input := it.readMem(inOff, inSz)
 		if it.env != nil && it.env.ExternalCall != nil {
-			ret, ok := it.env.ExternalCall(3, a20, nil, input)
+			gasValue := it.evalValue(m.oprands[0]).Uint64()
+			ret, ok := it.env.ExternalCall(3, a20, nil, input, gasValue)
 			it.returndata = append([]byte(nil), ret...)
 			if ok {
 				it.setResult(m, it.tmpA.Clear().SetOne())

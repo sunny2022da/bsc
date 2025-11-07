@@ -1170,7 +1170,7 @@ func _TestMIRvsEVM_CALL_UnitLevel(t *testing.T) {
 	mirEnv.CallValue = uint256.NewInt(0)
 
 	// Mock ExternalCall - 不实际调用，直接返回预设结果
-	mirEnv.ExternalCall = func(kind byte, addr [20]byte, value *uint256.Int, input []byte) ([]byte, bool) {
+	mirEnv.ExternalCall = func(kind byte, addr [20]byte, value *uint256.Int, input []byte, gas uint64) ([]byte, bool) {
 		t.Logf("  📞 Mock ExternalCall: kind=%d, addr=%x, value=%v, input=%x", kind, addr, value, input)
 		// 返回固定结果：0x42
 		result := make([]byte, 32)
@@ -1266,7 +1266,7 @@ func _TestMIRvsEVM_STATICCALL_UnitLevel(t *testing.T) {
 	copy(mirEnv.Caller[:], common.HexToAddress("0x1000").Bytes())
 	mirEnv.CallValue = uint256.NewInt(0)
 
-	mirEnv.ExternalCall = func(kind byte, addr [20]byte, value *uint256.Int, input []byte) ([]byte, bool) {
+	mirEnv.ExternalCall = func(kind byte, addr [20]byte, value *uint256.Int, input []byte, gas uint64) ([]byte, bool) {
 		t.Logf("  📞 Mock STATICCALL: kind=%d (3=STATICCALL), addr=%x", kind, addr)
 		if kind != 3 {
 			t.Errorf("❌ STATICCALL should have kind=3, got=%d", kind)
@@ -1336,7 +1336,7 @@ func _TestMIRvsEVM_DELEGATECALL_UnitLevel(t *testing.T) {
 	copy(mirEnv.Caller[:], common.HexToAddress("0x1000").Bytes())
 	mirEnv.CallValue = uint256.NewInt(0)
 
-	mirEnv.ExternalCall = func(kind byte, addr [20]byte, value *uint256.Int, input []byte) ([]byte, bool) {
+	mirEnv.ExternalCall = func(kind byte, addr [20]byte, value *uint256.Int, input []byte, gas uint64) ([]byte, bool) {
 		t.Logf("  📞 Mock DELEGATECALL: kind=%d (2=DELEGATECALL), addr=%x", kind, addr)
 		if kind != 2 {
 			t.Errorf("❌ DELEGATECALL should have kind=2, got=%d", kind)

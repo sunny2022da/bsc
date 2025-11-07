@@ -135,12 +135,40 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 		return adapter.evm.Interpreter().Run(contract, input, readOnly)
 	}
 
+	// Save current env state before modifying it (for nested calls)
+	env := adapter.mirInterpreter.GetEnv()
+	if env == nil {
+		return nil, fmt.Errorf("MIR interpreter env is nil")
+	}
+	oldSelf := env.Self
+	oldCaller := env.Caller
+	oldOrigin := env.Origin
+	oldCallValue := env.CallValue
+	oldCalldata := env.Calldata
+	oldCode := env.Code
+
+	// Restore env after execution
+	defer func() {
+		env.Self = oldSelf
+		env.Caller = oldCaller
+		env.Origin = oldOrigin
+		env.CallValue = oldCallValue
+		env.Calldata = oldCalldata
+		env.Code = oldCode
+	}()
+
+	// Save and restore memShadow to prevent pollution across nested calls
+	oldMemShadow := adapter.memShadow
+	adapter.memShadow = NewMemory() // Each contract gets its own memory shadow
+	defer func() {
+		adapter.memShadow = oldMemShadow
+	}()
+
 	// Set up MIR execution environment with contract-specific data
 	adapter.setupExecutionEnvironment(contract, input)
 
 	// Wire gas left getter so MirGAS can read it if needed
 	if adapter.mirInterpreter != nil && adapter.mirInterpreter.GetEnv() != nil {
-		env := adapter.mirInterpreter.GetEnv()
 		env.GasLeft = func() uint64 { return contract.Gas }
 	}
 
@@ -538,6 +566,15 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 		}
 		return nil
 	}
+	// Save current beforeOp hook to restore after this execution
+	oldHook := adapter.mirInterpreter.GetBeforeOpHook()
+	defer func() {
+		// Restore previous hook after execution
+		if oldHook != nil {
+			adapter.mirInterpreter.SetBeforeOpHook(oldHook)
+		}
+	}()
+
 	adapter.mirInterpreter.SetBeforeOpHook(func(ctx *compiler.MIRPreOpContext) error {
 		err := innerHook(ctx)
 		if err != nil && errors.Is(err, ErrGasUintOverflow) {
@@ -560,6 +597,10 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 				}
 				log.Error("MIR fallback requested by interpreter, using EVM interpreter", "addr", contract.Address(), "pc", 0)
 				return adapter.evm.baseInterpreter.Run(contract, input, readOnly)
+			}
+			// Map compiler.errREVERT to vm.ErrExecutionReverted to preserve gas
+			if errors.Is(err, compiler.GetErrREVERT()) {
+				return result, ErrExecutionReverted
 			}
 			// Preserve returndata on error (e.g., REVERT) to match EVM semantics
 			return result, err
@@ -659,6 +700,31 @@ func (adapter *MIRInterpreterAdapter) setupExecutionEnvironment(contract *Contra
 		for i := range topics {
 			hashes[i] = common.BytesToHash(topics[i][:])
 		}
+
+		// EXTCODEHASH via StateDB
+		env.ExtCodeHash = func(addr [20]byte) [32]byte {
+			a := common.BytesToAddress(addr[:])
+			h := adapter.evm.StateDB.GetCodeHash(a)
+			var out [32]byte
+			copy(out[:], h[:])
+			return out
+		}
+
+		// GAS left is not directly exposed here; leave nil to signal unavailability
+
+		// Blob fields (EIP-4844): base fee and blob hashes
+		if adapter.evm.Context.BlobBaseFee != nil {
+			env.BlobBaseFee = adapter.evm.Context.BlobBaseFee.Uint64()
+		}
+		env.BlobHashFunc = func(index uint64) [32]byte {
+			if index < uint64(len(adapter.evm.TxContext.BlobHashes)) {
+				h := adapter.evm.TxContext.BlobHashes[index]
+				var out [32]byte
+				copy(out[:], h[:])
+				return out
+			}
+			return [32]byte{}
+		}
 		adapter.evm.StateDB.AddLog(&coretypes.Log{
 			Address:     a,
 			Topics:      hashes,
@@ -667,33 +733,10 @@ func (adapter *MIRInterpreterAdapter) setupExecutionEnvironment(contract *Contra
 		})
 	}
 
-	// EXTCODEHASH via StateDB
-	env.ExtCodeHash = func(addr [20]byte) [32]byte {
-		a := common.BytesToAddress(addr[:])
-		h := adapter.evm.StateDB.GetCodeHash(a)
-		var out [32]byte
-		copy(out[:], h[:])
-		return out
-	}
-
-	// Blob fields (EIP-4844): base fee and blob hashes
-	if adapter.evm.Context.BlobBaseFee != nil {
-		env.BlobBaseFee = adapter.evm.Context.BlobBaseFee.Uint64()
-	}
-	env.BlobHashFunc = func(index uint64) [32]byte {
-		if index < uint64(len(adapter.evm.TxContext.BlobHashes)) {
-			h := adapter.evm.TxContext.BlobHashes[index]
-			var out [32]byte
-			copy(out[:], h[:])
-			return out
-		}
-		return [32]byte{}
-	}
-
 	// Wire external execution to stock EVM for CALL-family ops
-	env.ExternalCall = func(kind byte, addr20 [20]byte, value *uint256.Int, callInput []byte) (ret []byte, success bool) {
+	env.ExternalCall = func(kind byte, addr20 [20]byte, value *uint256.Int, callInput []byte, requestedGas uint64) (ret []byte, success bool) {
 		to := common.BytesToAddress(addr20[:])
-		// Use computed callGasTemp (set during pre-op hook) and apply stipend if value transferred
+		// Use callGasTemp set by beforeOp hook (gas calculation already done)
 		gas := adapter.evm.callGasTemp
 		if (kind == 0 || kind == 1) && value != nil && !value.IsZero() {
 			gas += params.CallStipend
