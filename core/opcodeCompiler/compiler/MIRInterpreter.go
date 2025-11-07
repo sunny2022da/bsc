@@ -518,38 +518,29 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 			ctx.IsBlockEntry = true
 			ctx.Block = it.currentBB
 		}
-		// Evaluate operands only for ops where adapter needs them for gas/memory
-		switch m.op {
-		case MirMLOAD, MirMSTORE, MirMSTORE8, MirMCOPY,
-			MirCALLDATACOPY, MirCODECOPY, MirRETURNDATACOPY, MirEXTCODECOPY,
-			MirRETURN, MirREVERT,
-			MirCALL, MirCALLCODE, MirDELEGATECALL, MirSTATICCALL,
-			MirCREATE, MirCREATE2,
-			MirLOG0, MirLOG1, MirLOG2, MirLOG3, MirLOG4,
-			MirBALANCE, MirEXTCODESIZE, MirEXTCODEHASH,
-			MirSLOAD, MirSSTORE,
-			MirEXP:
-			if len(m.oprands) > 0 {
-				nWanted := len(m.oprands)
-				if nWanted > len(it.preOpOps) {
-					nWanted = len(it.preOpOps)
-				}
-				for i := 0; i < nWanted; i++ {
-					v := it.evalValue(m.oprands[i])
-					it.preOpVals[i].Set(v)
-					it.preOpOps[i] = &it.preOpVals[i]
-				}
-				if (m.op == MirMSTORE || m.op == MirMSTORE8) && len(m.oprands) >= 3 && len(it.preOpOps) > 2 {
-					v := it.evalValue(m.oprands[2])
-					it.preOpVals[2].Set(v)
-					it.preOpOps[2] = &it.preOpVals[2]
-				}
-				// Expose only what's required for gas calculation
-				if m.op == MirMSTORE || m.op == MirMSTORE8 {
-					ctx.Operands = it.preOpOps[:1]
-				} else {
-					ctx.Operands = it.preOpOps[:nWanted]
-				}
+		// Evaluate operands into concrete values, preserving order, except for KECCAK256 (handled below)
+		if len(m.oprands) > 0 && m.op != MirKECCAK256 {
+			nWanted := len(m.oprands)
+			if nWanted > len(it.preOpOps) {
+				nWanted = len(it.preOpOps)
+			}
+			for i := 0; i < nWanted; i++ {
+				v := it.evalValue(m.oprands[i])
+				it.preOpVals[i].Set(v)
+				it.preOpOps[i] = &it.preOpVals[i]
+			}
+			// Special handling for MSTORE/MSTORE8: also precompute value into slot 2 for handler reuse
+			if (m.op == MirMSTORE || m.op == MirMSTORE8) && len(m.oprands) >= 3 && len(it.preOpOps) > 2 {
+				v := it.evalValue(m.oprands[2])
+				it.preOpVals[2].Set(v)
+				it.preOpOps[2] = &it.preOpVals[2]
+			}
+			// Expose only what's required for gas/memory calculation
+			if m.op == MirMSTORE || m.op == MirMSTORE8 {
+				// Only offset is needed for gas/memory size
+				ctx.Operands = it.preOpOps[:1]
+			} else {
+				ctx.Operands = it.preOpOps[:nWanted]
 			}
 		}
 		// Compute a requested memory size for common memory-affecting ops
@@ -707,47 +698,7 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 		a, b, _ := mirLoadAB(it, m)
 		it.setResult(m, it.tmpA.Clear().Mul(a, b))
 		return nil
-	case MirMSTORE:
-		if it.tracerEx != nil {
-			it.tracerEx(m)
-		} else if it.tracer != nil {
-			it.tracer(m.op)
-		}
-		if len(m.oprands) < 3 {
-			return fmt.Errorf("MSTORE missing operands")
-		}
-		off := it.preOpOps[0]
-		if off == nil {
-			off = it.evalValue(m.oprands[0])
-		}
-		val := it.preOpOps[2]
-		if val == nil {
-			val = it.evalValue(m.oprands[2])
-		}
-		it.writeMem32(off, val)
-		return nil
-	case MirRETURN:
-		if it.tracerEx != nil {
-			it.tracerEx(m)
-		} else if it.tracer != nil {
-			it.tracer(m.op)
-		}
-		if len(m.oprands) < 2 {
-			return fmt.Errorf("RETURN missing operands")
-		}
-		var off, sz *uint256.Int
-		if it.preOpOps[0] != nil {
-			off = it.preOpOps[0]
-		} else {
-			off = it.evalValue(m.oprands[0])
-		}
-		if it.preOpOps[1] != nil {
-			sz = it.preOpOps[1]
-		} else {
-			sz = it.evalValue(m.oprands[1])
-		}
-		it.returndata = it.readMemCopy(off, sz)
-		return errRETURN
+		// fast-path for MirMSTORE and MirRETURN removed to use general handlers
 	}
 	if h := mirHandlers[byte(m.op)]; h != nil {
 		if it.tracerEx != nil {
@@ -1774,7 +1725,6 @@ func mirHandleJUMPI(it *MIRInterpreter, m *MIR) error {
 		// fallthrough
 		dest := m.evmPC + 1
 		udest := uint64(dest)
-		log.Warn("mir exec JUMPI", "cond", cond, "dest", dest, "udest", udest)
 		return it.scheduleJump(udest, m, true)
 	}
 	dest, ok := it.resolveJumpDestValue(m.oprands[0])

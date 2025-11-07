@@ -813,6 +813,19 @@ func TestUSDT_Transfer_EVMvsMIR(t *testing.T) {
 	if string(rb) != string(rm) {
 		t.Fatalf("transfer: return mismatch base=%x mir=%x", rb, rm)
 	}
+
+	// Repeat with MIRStrictNoFallback enabled
+	mir.EVMConfig.MIRStrictNoFallback = true
+	rb2, errB2 := run(base, "usdt_transfer_b_strict", evmTracer, nil)
+	t.Logf("rb2: %x", rb2)
+	rm2, errM2 := run(mir, "usdt_transfer_m_strict", evmTracer, mirTracer)
+	t.Logf("rm2: %x", rm2)
+	if (errB2 != nil) != (errM2 != nil) {
+		t.Fatalf("transfer (strict): error mismatch base=%v mir=%v", errB2, errM2)
+	}
+	if string(rb2) != string(rm2) {
+		t.Fatalf("transfer (strict): return mismatch base=%x mir=%x", rb2, rm2)
+	}
 	/*
 	   // Print full EVM opcodes (including PUSH data) of the USDT contract
 	   fullCode, derr := hex.DecodeString(usdtHex[2:])
