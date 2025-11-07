@@ -220,6 +220,7 @@ func (b *MIRBasicBlock) CreateUnaryOpMIR(op MirOperation, stack *ValueStack) (mi
 		}
 	}
 	// If mir.op == MirNOP, doPeepHole already pushed the optimized constant to stack
+	// Still emit the NOP so that runtime gas accounting can charge for the original opcode
 	mir = b.appendMIR(mir)
 	mir.genStackDepth = stack.size()
 	return mir
@@ -697,11 +698,12 @@ func (b *MIRBasicBlock) CreateBlockInfoMIR(op MirOperation, stack *ValueStack) *
 		mir.oprands = []*Value{&addr}
 
 	case MirEXTCODECOPY:
-		// pops: address, dest, offset, size
-		size := stack.pop()
-		offset := stack.pop()
-		dest := stack.pop()
+		// EVM stack (top to bottom): address, destOffset, offset, size
+		// Pop order: address (first/top), dest, offset, size (last/bottom)
 		addr := stack.pop()
+		dest := stack.pop()
+		offset := stack.pop()
+		size := stack.pop()
 		mir.oprands = []*Value{&addr, &dest, &offset, &size}
 
 	case MirRETURNDATACOPY:
