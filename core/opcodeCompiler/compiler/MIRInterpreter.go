@@ -2117,7 +2117,7 @@ func (it *MIRInterpreter) ensureMemSize(size uint64) {
 		for newCap < size {
 			newCap *= 2
 		}
-		newMem := make([]byte, newCap)
+		newMem := make([]byte, size, newCap)
 		copy(newMem, it.memory)
 		it.memory = newMem
 	}

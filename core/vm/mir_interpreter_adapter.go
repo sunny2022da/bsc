@@ -409,10 +409,16 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 			// Charge dynamic gas according to fork rules
 			var gas uint64
 			var err error
+			if len(ctx.Operands) < 1 {
+				return fmt.Errorf("SELFDESTRUCT missing operand")
+			}
+			st := newstack()
+			beneficiaryAddr := new(uint256.Int).Set(ctx.Operands[0])
+			st.push(beneficiaryAddr) // Push beneficiary address onto stack for gas calculation
 			if adapter.evm.chainRules.IsLondon {
-				gas, err = gasSelfdestructEIP3529(adapter.evm, contract, newstack(), adapter.memShadow, 0)
+				gas, err = gasSelfdestructEIP3529(adapter.evm, contract, st, adapter.memShadow, 0)
 			} else if adapter.evm.chainRules.IsBerlin {
-				gas, err = gasSelfdestructEIP2929(adapter.evm, contract, newstack(), adapter.memShadow, 0)
+				gas, err = gasSelfdestructEIP2929(adapter.evm, contract, st, adapter.memShadow, 0)
 			}
 			if err != nil {
 				return err
@@ -489,7 +495,9 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 				}
 				st := newstack()
 				reqGas := new(uint256.Int).Set(ctx.Operands[0])
-				st.push(reqGas) // Back(0)
+				addr := new(uint256.Int).Set(ctx.Operands[1])
+				st.push(addr)   // Back(1) - address
+				st.push(reqGas) // Back(0) - requested gas
 				var dyn uint64
 				var err error
 				if adapter.evm.chainRules.IsBerlin {

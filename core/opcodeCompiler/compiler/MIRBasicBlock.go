@@ -220,10 +220,6 @@ func (b *MIRBasicBlock) CreateUnaryOpMIR(op MirOperation, stack *ValueStack) (mi
 		}
 	}
 	// If mir.op == MirNOP, doPeepHole already pushed the optimized constant to stack
-	if mir.op == MirNOP {
-		// Do not emit runtime MIR for NOP; gas is accounted via block aggregation
-		return nil
-	}
 	mir = b.appendMIR(mir)
 	mir.genStackDepth = stack.size()
 	return mir
