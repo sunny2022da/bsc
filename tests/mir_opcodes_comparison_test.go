@@ -133,6 +133,40 @@ func buildTernaryOpTest(name string, op byte, a, b, c []byte, desc string) Opcod
 	return OpcodeTestCase{Name: name, Bytecode: code, InitialGas: 100000, Description: desc}
 }
 
+// buildPushTest: Generate PUSH test for PUSHn opcode
+// PUSHn pushes n bytes onto stack, then MSTORE and RETURN
+func buildPushTest(n int) OpcodeTestCase {
+	if n < 1 || n > 32 {
+		panic("PUSH size must be between 1 and 32")
+	}
+	
+	// Generate n bytes of test data (0x01, 0x02, ..., 0x0n)
+	data := make([]byte, n)
+	for i := 0; i < n; i++ {
+		data[i] = byte((i + 1) % 256)
+	}
+	
+	// PUSHn opcode is 0x60 + (n-1)
+	pushOp := byte(0x60 + n - 1)
+	
+	// Construct bytecode: PUSHn <data>, PUSH1 0x00, MSTORE, PUSH1 0x20, PUSH1 0x00, RETURN
+	code := make([]byte, 0, n+10)
+	code = append(code, pushOp)
+	code = append(code, data...)
+	code = append(code, byte(vm.PUSH1), 0x00)
+	code = append(code, byte(vm.MSTORE))
+	code = append(code, byte(vm.PUSH1), 0x20)
+	code = append(code, byte(vm.PUSH1), 0x00)
+	code = append(code, byte(vm.RETURN))
+	
+	return OpcodeTestCase{
+		Name:        fmt.Sprintf("PUSH%d", n),
+		Bytecode:    code,
+		InitialGas:  100000,
+		Description: fmt.Sprintf("Push %d byte(s)", n),
+	}
+}
+
 // ============================================================================
 // EXECUTION FUNCTIONS
 // ============================================================================
@@ -567,49 +601,10 @@ func TestMIRvsEVM_Memory(t *testing.T) {
 }
 
 func TestMIRvsEVM_PushOperations(t *testing.T) {
-	tests := []OpcodeTestCase{
-		{
-			Name:        "PUSH1",
-			Bytecode:    []byte{0x60, 0x42, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3},
-			InitialGas:  100000,
-			Description: "Push 1 byte (0x42)",
-		},
-		{
-			Name:        "PUSH2",
-			Bytecode:    []byte{0x61, 0x01, 0x02, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3},
-			InitialGas:  100000,
-			Description: "Push 2 bytes",
-		},
-		{
-			Name:        "PUSH4",
-			Bytecode:    []byte{0x63, 0x01, 0x02, 0x03, 0x04, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3},
-			InitialGas:  100000,
-			Description: "Push 4 bytes",
-		},
-		{
-			Name:        "PUSH8",
-			Bytecode:    []byte{0x67, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3},
-			InitialGas:  100000,
-			Description: "Push 8 bytes",
-		},
-		{
-			Name:        "PUSH16",
-			Bytecode:    []byte{0x6f, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3},
-			InitialGas:  100000,
-			Description: "Push 16 bytes",
-		},
-		{
-			Name: "PUSH32",
-			Bytecode: []byte{
-				0x7f, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-				0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
-				0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
-				0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20,
-				0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3,
-			},
-			InitialGas:  100000,
-			Description: "Push 32 bytes",
-		},
+	// Generate tests for all PUSH1 through PUSH32
+	tests := make([]OpcodeTestCase, 0, 32)
+	for i := 1; i <= 32; i++ {
+		tests = append(tests, buildPushTest(i))
 	}
 	runOpcodeTests(t, "PushOperations", tests)
 }
@@ -829,16 +824,248 @@ func TestMIRvsEVM_MissingOpcodes(t *testing.T) {
 	runOpcodeTests(t, "MissingOpcodes", tests)
 }
 
+func TestMIRvsEVM_InvalidOpcode(t *testing.T) {
+	tests := []OpcodeTestCase{
+		{
+			Name:        "INVALID",
+			Bytecode:    []byte{0x60, 0x42, 0x60, 0x00, 0x52, 0xfe}, // PUSH1 0x42, PUSH1 0x00, MSTORE, INVALID
+			InitialGas:  100000,
+			Description: "INVALID opcode should consume all gas",
+		},
+	}
+	runOpcodeTests(t, "InvalidOpcode", tests)
+}
+
+func TestMIRvsEVM_JumpOperations(t *testing.T) {
+	tests := []OpcodeTestCase{
+		{
+			Name: "JUMP_Basic",
+			Bytecode: []byte{
+				byte(vm.PUSH1), 0x07, // PC=0: push jump target (PC=7)
+				byte(vm.JUMP),        // PC=2: JUMP to PC=7
+				byte(vm.PUSH1), 0x42, // PC=3: PUSH1 0x42 - SKIPPED
+				byte(vm.PUSH1), 0x00, // PC=5: PUSH1 0x00 - SKIPPED
+				byte(vm.JUMPDEST),    // PC=7: JUMPDEST - jump target
+				byte(vm.PUSH1), 0x99, // PC=8: push 0x99
+				byte(vm.PUSH1), 0x00, // PC=10: push 0
+				byte(vm.MSTORE),      // PC=12: MSTORE
+				byte(vm.PUSH1), 0x20, // PC=13: push 32
+				byte(vm.PUSH1), 0x00, // PC=15: push 0
+				byte(vm.RETURN),      // PC=17: RETURN
+			},
+			InitialGas:  100000,
+			Description: "Basic JUMP to JUMPDEST",
+		},
+		{
+			Name: "JUMP_Forward",
+			Bytecode: []byte{
+				byte(vm.PUSH1), 0x09, // PC=0: push jump target (PC=9)
+				byte(vm.JUMP),        // PC=2: JUMP forward
+				byte(vm.PUSH1), 0x11, // PC=3-8: SKIPPED instructions
+				byte(vm.PUSH1), 0x22,
+				byte(vm.PUSH1), 0x33,
+				byte(vm.JUMPDEST),    // PC=9: JUMPDEST
+				byte(vm.PUSH1), 0xaa, // PC=10: push 0xaa
+				byte(vm.PUSH1), 0x00, // PC=12: push 0
+				byte(vm.MSTORE),      // PC=14: MSTORE
+				byte(vm.PUSH1), 0x20, // PC=15: push 32
+				byte(vm.PUSH1), 0x00, // PC=17: push 0
+				byte(vm.RETURN),      // PC=19: RETURN
+			},
+			InitialGas:  100000,
+			Description: "JUMP forward skipping multiple instructions",
+		},
+		{
+			Name: "JUMP_Loop3",
+			Bytecode: []byte{
+				byte(vm.PUSH1), 0x03, // PC=0: push 3 (counter)
+				byte(vm.JUMPDEST),    // PC=2: JUMPDEST (loop start)
+				byte(vm.PUSH1), 0x01, // PC=3: push 1
+				byte(vm.SWAP1),       // PC=5: SWAP1
+				byte(vm.SUB),         // PC=6: SUB (counter - 1)
+				byte(vm.DUP1),        // PC=7: DUP1
+				byte(vm.ISZERO),      // PC=8: check if zero
+				byte(vm.PUSH1), 0x0f, // PC=9: push exit target (PC=15)
+				byte(vm.JUMPI),       // PC=11: JUMPI (exit if zero)
+				byte(vm.PUSH1), 0x02, // PC=12: push loop start (PC=2)
+				byte(vm.JUMP),        // PC=14: JUMP backward to loop
+				byte(vm.JUMPDEST),    // PC=15: JUMPDEST (exit)
+				byte(vm.PUSH1), 0x00, // PC=16: push 0
+				byte(vm.MSTORE),      // PC=18: MSTORE
+				byte(vm.PUSH1), 0x20, // PC=19: push 32
+				byte(vm.PUSH1), 0x00, // PC=21: push 0
+				byte(vm.RETURN),      // PC=23: RETURN
+			},
+			InitialGas:  100000,
+			Description: "JUMP backward loop (3 iterations)",
+		},
+		{
+			Name: "JUMP_Loop5",
+			Bytecode: []byte{
+				byte(vm.PUSH1), 0x05, // PC=0: push 5 (counter)
+				byte(vm.JUMPDEST),    // PC=2: JUMPDEST (loop start)
+				byte(vm.PUSH1), 0x01, // PC=3: push 1
+				byte(vm.SWAP1),       // PC=5: SWAP1
+				byte(vm.SUB),         // PC=6: SUB (counter - 1)
+				byte(vm.DUP1),        // PC=7: DUP1
+				byte(vm.ISZERO),      // PC=8: check if zero
+				byte(vm.PUSH1), 0x0f, // PC=9: push exit target (PC=15)
+				byte(vm.JUMPI),       // PC=11: JUMPI (exit if zero)
+				byte(vm.PUSH1), 0x02, // PC=12: push loop start (PC=2)
+				byte(vm.JUMP),        // PC=14: JUMP backward to loop
+				byte(vm.JUMPDEST),    // PC=15: JUMPDEST (exit)
+				byte(vm.PUSH1), 0x00, // PC=16: push 0
+				byte(vm.MSTORE),      // PC=18: MSTORE
+				byte(vm.PUSH1), 0x20, // PC=19: push 32
+				byte(vm.PUSH1), 0x00, // PC=21: push 0
+				byte(vm.RETURN),      // PC=23: RETURN
+			},
+			InitialGas:  100000,
+			Description: "JUMP backward loop (5 iterations)",
+		},
+	}
+	runOpcodeTests(t, "JumpOperations", tests)
+}
+
+func TestMIRvsEVM_ReturnOperations(t *testing.T) {
+	tests := []OpcodeTestCase{
+		{
+			Name: "RETURN_Empty",
+			Bytecode: []byte{
+				byte(vm.PUSH1), 0x00, // PC=0: push 0 (size)
+				byte(vm.PUSH1), 0x00, // PC=2: push 0 (offset)
+				byte(vm.RETURN),      // PC=4: RETURN (empty)
+			},
+			InitialGas:  100000,
+			Description: "RETURN with empty data",
+		},
+		{
+			Name: "RETURN_SingleByte",
+			Bytecode: []byte{
+				byte(vm.PUSH1), 0xff, // PC=0: push 0xff
+				byte(vm.PUSH1), 0x00, // PC=2: push 0
+				byte(vm.MSTORE),      // PC=4: MSTORE
+				byte(vm.PUSH1), 0x01, // PC=5: push 1 (size)
+				byte(vm.PUSH1), 0x1f, // PC=7: push 31 (offset, last byte of word)
+				byte(vm.RETURN),      // PC=9: RETURN
+			},
+			InitialGas:  100000,
+			Description: "RETURN single byte",
+		},
+		{
+			Name: "RETURN_LargeData",
+			Bytecode: []byte{
+				byte(vm.PUSH1), 0x11, // PC=0: push 0x11
+				byte(vm.PUSH1), 0x00, // PC=2: push 0
+				byte(vm.MSTORE),      // PC=4: MSTORE at offset 0
+				byte(vm.PUSH1), 0x22, // PC=5: push 0x22
+				byte(vm.PUSH1), 0x20, // PC=7: push 32
+				byte(vm.MSTORE),      // PC=9: MSTORE at offset 32
+				byte(vm.PUSH1), 0x33, // PC=10: push 0x33
+				byte(vm.PUSH1), 0x40, // PC=12: push 64
+				byte(vm.MSTORE),      // PC=14: MSTORE at offset 64
+				byte(vm.PUSH1), 0x60, // PC=15: push 96 (size)
+				byte(vm.PUSH1), 0x00, // PC=17: push 0 (offset)
+				byte(vm.RETURN),      // PC=19: RETURN 96 bytes
+			},
+			InitialGas:  100000,
+			Description: "RETURN large data (96 bytes)",
+		},
+		{
+			Name: "RETURN_AfterComputation",
+			Bytecode: []byte{
+				byte(vm.PUSH1), 0x05, // PC=0: push 5
+				byte(vm.PUSH1), 0x03, // PC=2: push 3
+				byte(vm.ADD),         // PC=4: ADD (5 + 3 = 8)
+				byte(vm.PUSH1), 0x02, // PC=5: push 2
+				byte(vm.MUL),         // PC=7: MUL (8 * 2 = 16)
+				byte(vm.PUSH1), 0x00, // PC=8: push 0
+				byte(vm.MSTORE),      // PC=10: MSTORE
+				byte(vm.PUSH1), 0x20, // PC=11: push 32
+				byte(vm.PUSH1), 0x00, // PC=13: push 0
+				byte(vm.RETURN),      // PC=15: RETURN
+			},
+			InitialGas:  100000,
+			Description: "RETURN after arithmetic computation",
+		},
+	}
+	runOpcodeTests(t, "ReturnOperations", tests)
+}
+
+func TestMIRvsEVM_RevertOperations(t *testing.T) {
+	tests := []OpcodeTestCase{
+		{
+			Name: "REVERT_Empty",
+			Bytecode: []byte{
+				byte(vm.PUSH1), 0x00, // PC=0: push 0 (size)
+				byte(vm.PUSH1), 0x00, // PC=2: push 0 (offset)
+				byte(vm.REVERT),      // PC=4: REVERT (empty)
+			},
+			InitialGas:  100000,
+			Description: "REVERT with empty data",
+		},
+		{
+			Name: "REVERT_WithReason",
+			Bytecode: []byte{
+				byte(vm.PUSH1), 0x42, // PC=0: push 0x42 (error reason)
+				byte(vm.PUSH1), 0x00, // PC=2: push 0
+				byte(vm.MSTORE),      // PC=4: MSTORE
+				byte(vm.PUSH1), 0x20, // PC=5: push 32 (size)
+				byte(vm.PUSH1), 0x00, // PC=7: push 0 (offset)
+				byte(vm.REVERT),      // PC=9: REVERT with reason
+			},
+			InitialGas:  100000,
+			Description: "REVERT with error reason",
+		},
+		{
+			Name: "REVERT_AfterStorage",
+			Bytecode: []byte{
+				byte(vm.PUSH1), 0x99, // PC=0: push 0x99
+				byte(vm.PUSH1), 0x00, // PC=2: push 0
+				byte(vm.SSTORE),      // PC=4: SSTORE (will be reverted)
+				byte(vm.PUSH1), 0xee, // PC=5: push 0xee
+				byte(vm.PUSH1), 0x00, // PC=7: push 0
+				byte(vm.MSTORE),      // PC=9: MSTORE
+				byte(vm.PUSH1), 0x20, // PC=10: push 32
+				byte(vm.PUSH1), 0x00, // PC=12: push 0
+				byte(vm.REVERT),      // PC=14: REVERT
+			},
+			InitialGas:  100000,
+			Description: "REVERT after storage modification",
+		},
+		{
+			Name: "REVERT_ConditionalRevert",
+			Bytecode: []byte{
+				byte(vm.PUSH1), 0x01, // PC=0: push 1 (condition)
+				byte(vm.PUSH1), 0x09, // PC=2: push revert target (PC=9)
+				byte(vm.JUMPI),       // PC=4: JUMPI (will jump)
+				byte(vm.PUSH1), 0x11, // PC=5: push 0x11 - SKIPPED
+				byte(vm.PUSH1), 0x00, // PC=7: push 0 - SKIPPED
+				byte(vm.JUMPDEST),    // PC=9: JUMPDEST
+				byte(vm.PUSH1), 0xff, // PC=10: push 0xff
+				byte(vm.PUSH1), 0x00, // PC=12: push 0
+				byte(vm.MSTORE),      // PC=14: MSTORE
+				byte(vm.PUSH1), 0x20, // PC=15: push 32
+				byte(vm.PUSH1), 0x00, // PC=17: push 0
+				byte(vm.REVERT),      // PC=19: REVERT
+			},
+			InitialGas:  100000,
+			Description: "REVERT after conditional jump",
+		},
+	}
+	runOpcodeTests(t, "RevertOperations", tests)
+}
+
 func TestMIRvsEVM_Summary(t *testing.T) {
 	separator := strings.Repeat("=", 80)
 	fmt.Println("\n" + separator)
 	fmt.Println("📊 MIR vs EVM Simple Opcodes Comparison (Builder Pattern)")
 	fmt.Println(separator)
-	fmt.Println("Covered: 83+ opcodes with builder pattern")
+	fmt.Println("Covered: 109 opcodes with builder pattern")
 	fmt.Println("Categories:")
 	fmt.Println("  - Arithmetic (11), Comparison (6), Bitwise (6)")
 	fmt.Println("  - Stack: POP, DUP1-DUP16 (16), SWAP1-SWAP16 (16)")
-	fmt.Println("  - Push: PUSH1-PUSH32 (6 samples)")
+	fmt.Println("  - Push: PUSH1-PUSH32 (32 complete)")
 	fmt.Println("  - Memory (3), Calldata (3), Crypto (1)")
 	fmt.Println("  - Environment (7), Block (6), ControlFlow (2)")
 	fmt.Println("  - Storage (2), TransientStorage (2)")

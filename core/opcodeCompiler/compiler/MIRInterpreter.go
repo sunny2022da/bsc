@@ -6,6 +6,7 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/holiman/uint256"
+	"os"
 )
 
 // logging shim is defined in debug_flags.go
@@ -128,6 +129,8 @@ type MIRInterpreter struct {
 	lastCopyDest uint64
 	lastCopyOff  uint64
 	lastCopySize uint64
+	// DEBUG: Track jump iterations to detect infinite loops
+	jumpCount map[uint]int
 }
 
 // mirGlobalTracer is an optional global tracer invoked for each MIR instruction.
@@ -332,12 +335,17 @@ func (it *MIRInterpreter) RunMIR(block *MIRBasicBlock) ([]byte, error) {
 }
 
 // publishLiveOut writes this block's live-out def values into the global map
+// and updates the block's exitStack with runtime values for loop scenarios
 func (it *MIRInterpreter) publishLiveOut(block *MIRBasicBlock) {
 	if it == nil || block == nil || it.globalResults == nil {
 		return
 	}
 
 	defs := block.LiveOutDefs()
+
+	// DEBUG: Log which block is publishing
+	fmt.Fprintf(os.Stderr, "🔖 publishLiveOut block=%d defs_count=%d\n", block.blockNum, len(defs))
+
 	//log.Warn("MIR publishLiveOut", "block", block.blockNum, "size", len(block.instructions), "defs", defs, "it.results", it.results, "block.exitStack", block.ExitStack())
 	if len(defs) == 0 {
 		log.Warn("MIR publishLiveOut: no live outs", "block", block.blockNum)
@@ -349,6 +357,35 @@ func (it *MIRInterpreter) publishLiveOut(block *MIRBasicBlock) {
 			inBlock[inst] = true
 		}
 	}
+
+	// **FIX**: Update globalResults for defs produced in this block
+	// This is critical for loops: ensure PHI nodes in the next iteration
+	// read the updated values from globalResults
+	// HYBRID APPROACH: Update both pointer-based (fast path) and evmPC-based (fallback) caches
+	for _, def := range defs {
+		if def == nil || !inBlock[def] {
+			continue
+		}
+		if def.idx >= 0 && def.idx < len(it.results) {
+			if r := it.results[def.idx]; r != nil {
+				// Update pointer-based cache (fast path)
+				it.globalResults[def] = new(uint256.Int).Set(r)
+				
+				// Update evmPC-based cache (fallback for pointer mismatches in loops)
+				if def.evmPC != 0 {
+					if it.globalResultsBySig[uint64(def.evmPC)] == nil {
+						it.globalResultsBySig[uint64(def.evmPC)] = make(map[int]*uint256.Int)
+					}
+					it.globalResultsBySig[uint64(def.evmPC)][def.idx] = new(uint256.Int).Set(r)
+					
+					// DEBUG: Log dual cache update
+					fmt.Fprintf(os.Stderr, "📝 Updated DUAL caches for block %d: def.evmPC=%d def.idx=%d value=%v\n",
+						block.blockNum, def.evmPC, def.idx, r)
+				}
+			}
+		}
+	}
+
 	// Backfill ancestor defs referenced at exit if missing in globals
 	exitVals := block.ExitStack()
 	for i := range exitVals {
@@ -358,18 +395,16 @@ func (it *MIRInterpreter) publishLiveOut(block *MIRBasicBlock) {
 				val := it.evalValue(v)
 				if val != nil {
 					it.globalResults[v.def] = new(uint256.Int).Set(val)
-					//log.Warn("MIR publishLiveOut: backfilled ancestor def", "evm_pc", v.def.evmPC, "mir_idx", v.def.idx, "value", val)
+					// DEBUG: Log backfill
+					fmt.Fprintf(os.Stderr, "🔙 Backfilled ancestor def in block %d: def.evmPC=%d def.idx=%d value=%v\n",
+						block.blockNum, v.def.evmPC, v.def.idx, val)
 				}
-			}
-		}
-	}
-	for _, def := range defs {
-		if def == nil || !inBlock[def] {
-			continue
-		}
-		if def.idx >= 0 && def.idx < len(it.results) {
-			if r := it.results[def.idx]; r != nil {
-				it.globalResults[def] = new(uint256.Int).Set(r)
+			} else {
+				// DEBUG: Log that backfill was skipped (already exists)
+				if v.def.evmPC == 6 {
+					fmt.Fprintf(os.Stderr, "✋ Backfill skipped (already exists) in block %d: def.evmPC=%d def.idx=%d current_value=%v\n",
+						block.blockNum, v.def.evmPC, v.def.idx, it.globalResults[v.def])
+				}
 			}
 		}
 	}
@@ -1426,6 +1461,7 @@ func mirHandleJUMP(it *MIRInterpreter, m *MIR) error {
 		return ErrMIRFallback
 	}
 	udest, _ := dest.Uint64WithOverflow()
+	fmt.Fprintf(os.Stderr, "⬅️  JUMP evmPC=%d dest_pc=%d currentBB=%d\n", m.evmPC, udest, it.currentBB.blockNum)
 	if m.evmPC == 5842 {
 		log.Warn("MIR JUMP", "oprands0", m.oprands[0], "dest", dest, "udest", udest, "it.globalResults", it.globalResults)
 		if m.oprands[0].def != nil {
@@ -1455,11 +1491,27 @@ func mirHandleJUMPI(it *MIRInterpreter, m *MIR) error {
 		return fmt.Errorf("JUMPI missing operands")
 	}
 	cond := it.evalValue(m.oprands[1])
+
+	// DEBUG: Log JUMPI execution details
+	prevBBNum := -1
+	if it.prevBB != nil {
+		prevBBNum = int(it.prevBB.blockNum)
+	}
+	// Track iterations to detect infinite loops
+	if it.jumpCount == nil {
+		it.jumpCount = make(map[uint]int)
+	}
+	it.jumpCount[m.evmPC]++
+	if it.jumpCount[m.evmPC] <= 50 {
+		fmt.Fprintf(os.Stderr, "🔁 JUMPI [iter=%d] evmPC=%d cond=%v cond.IsZero=%v currentBB=%d prevBB=%d\n",
+			it.jumpCount[m.evmPC], m.evmPC, cond, cond.IsZero(), it.currentBB.blockNum, prevBBNum)
+	}
+
 	if cond.IsZero() {
 		// fallthrough
 		dest := m.evmPC + 1
 		udest := uint64(dest)
-		log.Warn("mir exec JUMPI", "cond", cond, "dest", dest, "udest", udest)
+		fmt.Fprintf(os.Stderr, "🔁 JUMPI taking FALLTHROUGH (cond=0) dest_pc=%d\n", udest)
 		return it.scheduleJump(udest, m, true)
 	}
 	dest, ok := it.resolveJumpDestValue(m.oprands[0])
@@ -1468,6 +1520,7 @@ func mirHandleJUMPI(it *MIRInterpreter, m *MIR) error {
 		return ErrMIRFallback
 	}
 	udest, _ := dest.Uint64WithOverflow()
+	fmt.Fprintf(os.Stderr, "🔁 JUMPI taking JUMP (cond≠0) dest_pc=%d\n", udest)
 	return it.scheduleJump(udest, m, false)
 }
 
@@ -1483,12 +1536,14 @@ func mirHandlePHI(it *MIRInterpreter, m *MIR) error {
 				src := exit[len(exit)-1-idxFromTop]
 				// Mark as live-in to force evalValue to consult cross-BB results first
 				src.liveIn = true
-				if m.phiStackIndex == 1 {
-					log.Warn("<<<<<<<MIR PHI", "src", src, "kind", src.kind, "&src.def", &src.def,
-						"exitIndex", len(exit)-1-idxFromTop)
-					log.Warn("<<<<<<<MIR PHI", "it.globalResults", it.globalResults)
-				}
+
+				// DEBUG: Always log PHI resolution in loops
+				fmt.Fprintf(os.Stderr, "🔄 PHI evmPC=%d idx=%d phiStackIndex=%d prevBB=%d currentBB=%d exitStack_len=%d\n",
+					m.evmPC, m.idx, m.phiStackIndex, it.prevBB.blockNum, it.currentBB.blockNum, len(exit))
+
 				val := it.evalValue(&src)
+				fmt.Fprintf(os.Stderr, "🔄 PHI resolved value=%v\n", val)
+
 				it.setResult(m, val)
 				// Record PHI result with predecessor sensitivity for future uses
 				if m != nil {
@@ -1621,7 +1676,11 @@ func mirHandleMUL(it *MIRInterpreter, m *MIR) error {
 }
 func mirHandleSUB(it *MIRInterpreter, m *MIR) error {
 	a, b, err := mirLoadAB(it, m)
-	//log.Warn("MIR SUB", "a", a, "- b", b)
+	// DEBUG: Log SUB operations to track counter
+	if err == nil {
+		result := new(uint256.Int).Sub(a, b)
+		fmt.Fprintf(os.Stderr, "➖ SUB evmPC=%d a=%v b=%v result=%v\n", m.evmPC, a, b, result)
+	}
 	if err != nil {
 		return err
 	}
@@ -1881,11 +1940,18 @@ func mirHandleISZERO(it *MIRInterpreter, m *MIR) error {
 		return fmt.Errorf("ISZERO missing operand")
 	}
 	v := it.evalValue(m.oprands[0])
+
+	// DEBUG: Log ISZERO to track loop exit condition
+	var result uint64
 	if v.IsZero() {
+		result = 1
 		it.setResult(m, it.tmpA.Clear().SetOne())
 	} else {
+		result = 0
 		it.setResult(m, it.zeroConst)
 	}
+	fmt.Fprintf(os.Stderr, "❓ ISZERO evmPC=%d input=%v result=%d\n", m.evmPC, v, result)
+
 	return nil
 }
 
@@ -2075,13 +2141,53 @@ func (it *MIRInterpreter) evalValue(v *Value) *uint256.Int {
 					}
 				}
 			}
-			if v.liveIn {
-				if it.globalResults != nil {
-					if r, ok := it.globalResults[v.def]; ok && r != nil {
-						return r
+		if v.liveIn {
+			if it.globalResults != nil {
+				// HYBRID APPROACH: Check both caches and ensure consistency
+				pointerVal, hasPointer := it.globalResults[v.def]
+				var byEvmPCVal *uint256.Int
+				var hasByEvmPC bool
+				
+				// Check evmPC-based cache
+				if v.def.evmPC != 0 {
+					if byPC := it.globalResultsBySig[uint64(v.def.evmPC)]; byPC != nil {
+						byEvmPCVal, hasByEvmPC = byPC[v.def.idx]
 					}
 				}
+				
+				// Consistency check: if both exist and differ, byEvmPC wins (loop fix)
+				if hasPointer && hasByEvmPC && pointerVal != nil && byEvmPCVal != nil {
+					if pointerVal.Cmp(byEvmPCVal) != 0 {
+						// Pointer cache is stale, update it with byEvmPC value
+						it.globalResults[v.def] = new(uint256.Int).Set(byEvmPCVal)
+						if v.def.evmPC == 6 {
+							fmt.Fprintf(os.Stderr, "🔄 Synced pointer cache from byEvmPC: def.evmPC=%d def.idx=%d old=%v new=%v\n",
+								v.def.evmPC, v.def.idx, pointerVal, byEvmPCVal)
+						}
+						return byEvmPCVal
+					}
+				}
+				
+				// Fast path: pointer cache hit
+				if hasPointer && pointerVal != nil {
+					if v.def.evmPC == 6 {
+						fmt.Fprintf(os.Stderr, "📖 evalValue liveIn from globalResults (pointer): def.evmPC=%d def.idx=%d value=%v\n",
+							v.def.evmPC, v.def.idx, pointerVal)
+					}
+					return pointerVal
+				}
+				
+				// Fallback: byEvmPC cache hit, update pointer cache
+				if hasByEvmPC && byEvmPCVal != nil {
+					it.globalResults[v.def] = new(uint256.Int).Set(byEvmPCVal)
+					if v.def.evmPC == 6 {
+						fmt.Fprintf(os.Stderr, "📖 evalValue liveIn from globalResultsBySig (fallback + sync): def.evmPC=%d def.idx=%d value=%v\n",
+							v.def.evmPC, v.def.idx, byEvmPCVal)
+					}
+					return byEvmPCVal
+				}
 			}
+		}
 			// Then try local per-block result
 			if v.def.idx >= 0 && v.def.idx < len(it.results) {
 				if r := it.results[v.def.idx]; r != nil {
