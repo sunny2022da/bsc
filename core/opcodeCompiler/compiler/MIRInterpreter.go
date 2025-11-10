@@ -2490,7 +2490,8 @@ func (it *MIRInterpreter) returnDataCopy(dest, off, sz *uint256.Int) {
 func (it *MIRInterpreter) sload(key *uint256.Int) *uint256.Int {
 	// Prefer runtime hook if provided
 	var k [32]byte
-	copy(k[:], key.Bytes())
+	keyBytes := key.Bytes()
+	copy(k[32-len(keyBytes):], keyBytes) // Fix: right-align key bytes like sstore
 	if it.env.SLoadFunc != nil {
 		v := it.env.SLoadFunc(k)
 		return it.tmpB.Clear().SetBytes(v[:])

@@ -575,6 +575,29 @@ func TestMIRvsEVM_ContractCalls(t *testing.T) {
 			},
 			ContractAddr: common.HexToAddress("0xaaaa"),
 		},
+		{
+			Name:        "CALLCODE_ReturnSuccess",
+			Description: "CallCode and use return value",
+			MainContract: []byte{
+				byte(vm.PUSH1), 32,
+				byte(vm.PUSH1), 0,
+				byte(vm.PUSH1), 0,
+				byte(vm.PUSH1), 0,
+				byte(vm.PUSH1), 0,
+				byte(vm.PUSH1), 0xcc,
+				byte(vm.GAS),
+				byte(vm.CALLCODE),
+				byte(vm.PUSH1), 0,
+				byte(vm.MSTORE),
+				byte(vm.PUSH1), 32,
+				byte(vm.PUSH1), 0,
+				byte(vm.RETURN),
+			},
+			SetupContracts: map[common.Address][]byte{
+				common.HexToAddress("0xcc"): calleeCode,
+			},
+			ContractAddr: common.HexToAddress("0xaaaa"),
+		},
 	}
 
 	runRuntimeTests(t, tests, true)
