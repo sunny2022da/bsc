@@ -1702,9 +1702,10 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 			}
 		case CREATE:
 			// CREATE takes 3 operands: value, offset, size
-			size := valueStack.pop()
-			offset := valueStack.pop()
+			// EVM stack layout (top to bottom): value, offset, size
 			value := valueStack.pop()
+			offset := valueStack.pop()
+			size := valueStack.pop()
 			mir = new(MIR)
 			mir.op = MirCREATE
 			mir.oprands = []*Value{&value, &offset, &size}
@@ -1729,10 +1730,11 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 			return nil
 		case CREATE2:
 			// CREATE2 takes 4 operands: value, offset, size, salt
-			salt := valueStack.pop()
-			size := valueStack.pop()
-			offset := valueStack.pop()
+			// EVM stack layout (top to bottom): value, offset, size, salt
 			value := valueStack.pop()
+			offset := valueStack.pop()
+			size := valueStack.pop()
+			salt := valueStack.pop()
 			mir = new(MIR)
 			mir.op = MirCREATE2
 			mir.oprands = []*Value{&value, &offset, &size, &salt}

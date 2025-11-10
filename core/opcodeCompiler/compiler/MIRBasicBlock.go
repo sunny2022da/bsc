@@ -638,8 +638,9 @@ func (b *MIRBasicBlock) CreateStorageOpMIR(op MirOperation, stack *ValueStack, a
 		}
 		mir.oprands = []*Value{&key}
 	case MirTSTORE:
-		value := stack.pop()
+		// EVM pops key (top) then value, same as SSTORE
 		key := stack.pop()
+		value := stack.pop()
 		if accessor != nil {
 			accessor.recordStateStore(key, value)
 		}

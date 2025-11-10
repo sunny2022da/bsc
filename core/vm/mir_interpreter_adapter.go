@@ -61,6 +61,14 @@ func NewMIRInterpreterAdapter(evm *EVM) *MIRInterpreterAdapter {
 	env.SStoreFunc = func(key [32]byte, value [32]byte) {
 		evm.StateDB.SetState(adapter.currentSelf, common.BytesToHash(key[:]), common.BytesToHash(value[:]))
 	}
+	env.TLoadFunc = func(key [32]byte) [32]byte {
+		// Transient storage (EIP-1153)
+		return evm.StateDB.GetTransientState(adapter.currentSelf, common.BytesToHash(key[:]))
+	}
+	env.TStoreFunc = func(key [32]byte, value [32]byte) {
+		// Transient storage (EIP-1153)
+		evm.StateDB.SetTransientState(adapter.currentSelf, common.BytesToHash(key[:]), common.BytesToHash(value[:]))
+	}
 	env.GetBalanceFunc = func(addr20 [20]byte) *uint256.Int {
 		addr := common.BytesToAddress(addr20[:])
 		b := evm.StateDB.GetBalance(addr)
@@ -280,18 +288,30 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 					}
 					return err
 				}
-				if contract.Gas < gas {
-					return ErrOutOfGas
+			if contract.Gas < gas {
+				return ErrOutOfGas
+			}
+			contract.Gas -= gas
+				// CREATE2: Always charge Keccak256WordGas for salt hashing (Constantinople feature)
+				if evmOp == CREATE2 {
+					if len(ctx.Operands) >= 3 {
+						size := ctx.Operands[2].Uint64()
+						keccak256Gas := toWord(size) * params.Keccak256WordGas
+						if contract.Gas < keccak256Gas {
+							return ErrOutOfGas
+						}
+						contract.Gas -= keccak256Gas
+					}
 				}
-				contract.Gas -= gas
-				// EIP-3860 initcode per-word gas for CREATE/CREATE2
-				if evmOp == CREATE || evmOp == CREATE2 {
+				// EIP-3860 initcode per-word gas for CREATE/CREATE2 (only if Shanghai is active)
+				if (evmOp == CREATE || evmOp == CREATE2) && adapter.evm.chainRules.IsShanghai {
 					// operands: value, offset, size, (salt)
 					if len(ctx.Operands) >= 3 {
 						size := ctx.Operands[2].Uint64()
 						if size > params.MaxInitCodeSize {
 							return fmt.Errorf("%w: size %d", ErrMaxInitCodeSizeExceeded, size)
 						}
+						// EIP-3860: InitCodeWordGas for both CREATE and CREATE2
 						more := params.InitCodeWordGas * toWord(size)
 						if contract.Gas < more {
 							return ErrOutOfGas
@@ -772,7 +792,12 @@ func (adapter *MIRInterpreterAdapter) setupExecutionEnvironment(contract *Contra
 		// Apply EIP-150: parent gas reduction by 1/64 before passing to child
 		gas -= gas / 64
 		// Deduct from parent before call, matching opCreate/opCreate2
-		contract.UseGas(gas, adapter.evm.Config.Tracer, tracing.GasChangeCallContractCreation)
+		// Use correct tracing reason for CREATE vs CREATE2
+		tracingReason := tracing.GasChangeCallContractCreation
+		if kind == 5 { // CREATE2
+			tracingReason = tracing.GasChangeCallContractCreation2
+		}
+		contract.UseGas(gas, adapter.evm.Config.Tracer, tracingReason)
 		var (
 			out      []byte
 			newAddr  common.Address

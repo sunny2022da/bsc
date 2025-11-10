@@ -60,6 +60,8 @@ type MIRExecutionEnv struct {
 	// If these are nil, interpreter falls back to internal simulated state.
 	SLoadFunc      func(key [32]byte) [32]byte
 	SStoreFunc     func(key [32]byte, value [32]byte)
+	TLoadFunc      func(key [32]byte) [32]byte
+	TStoreFunc     func(key [32]byte, value [32]byte)
 	GetBalanceFunc func(addr [20]byte) *uint256.Int
 
 	// External execution hooks (optional). If nil, CALL/CREATE will request fallback.
@@ -1046,9 +1048,16 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 		if len(m.oprands) < 1 {
 			return fmt.Errorf("TLOAD missing key")
 		}
-		key := it.evalValue(m.oprands[0]).Bytes32()
+		key := it.evalValue(m.oprands[0])
 		var k [32]byte
-		copy(k[:], key[:])
+		keyBytes := key.Bytes()
+		copy(k[32-len(keyBytes):], keyBytes) // Fix: right-align key bytes like sload
+		if it.env.TLoadFunc != nil {
+			v := it.env.TLoadFunc(k)
+			it.setResult(m, it.tmpB.Clear().SetBytes(v[:]))
+			return nil
+		}
+		// Fallback to internal simulated transient storage
 		if it.transientStorage == nil {
 			it.transientStorage = make(map[[32]byte][32]byte)
 		}
@@ -1059,13 +1068,19 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 		if len(m.oprands) < 2 {
 			return fmt.Errorf("TSTORE missing operands")
 		}
-		key := it.evalValue(m.oprands[0]).Bytes32()
+		key := it.evalValue(m.oprands[0])
 		val := it.evalValue(m.oprands[1])
 		var k [32]byte
 		var v [32]byte
-		copy(k[:], key[:])
-		bytes := val.Bytes()
-		copy(v[32-len(bytes):], bytes)
+		keyBytes := key.Bytes()
+		copy(k[32-len(keyBytes):], keyBytes) // Fix: right-align key bytes
+		valBytes := val.Bytes()
+		copy(v[32-len(valBytes):], valBytes) // Fix: right-align value bytes
+		if it.env.TStoreFunc != nil {
+			it.env.TStoreFunc(k, v)
+			return nil
+		}
+		// Fallback to internal simulated transient storage
 		if it.transientStorage == nil {
 			it.transientStorage = make(map[[32]byte][32]byte)
 		}
