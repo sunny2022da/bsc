@@ -358,30 +358,30 @@ func (it *MIRInterpreter) publishLiveOut(block *MIRBasicBlock) {
 		}
 	}
 
-	// **FIX**: Update globalResults for defs produced in this block
+	// **FIX**: Update globalResultsBySig for defs produced in this block
 	// This is critical for loops: ensure PHI nodes in the next iteration
-	// read the updated values from globalResults
-	// HYBRID APPROACH: Update both pointer-based (fast path) and evmPC-based (fallback) caches
+	// read the updated values from globalResultsBySig
+	// PURE APPROACH 1: Only use signature-based cache (evmPC, idx)
 	for _, def := range defs {
 		if def == nil || !inBlock[def] {
 			continue
 		}
 		if def.idx >= 0 && def.idx < len(it.results) {
 			if r := it.results[def.idx]; r != nil {
-				// Update pointer-based cache (fast path)
-				it.globalResults[def] = new(uint256.Int).Set(r)
-				
-				// Update evmPC-based cache (fallback for pointer mismatches in loops)
+				// Update signature-based cache (uses evmPC+idx as key)
 				if def.evmPC != 0 {
 					if it.globalResultsBySig[uint64(def.evmPC)] == nil {
 						it.globalResultsBySig[uint64(def.evmPC)] = make(map[int]*uint256.Int)
 					}
 					it.globalResultsBySig[uint64(def.evmPC)][def.idx] = new(uint256.Int).Set(r)
 					
-					// DEBUG: Log dual cache update
-					fmt.Fprintf(os.Stderr, "📝 Updated DUAL caches for block %d: def.evmPC=%d def.idx=%d value=%v\n",
+					// DEBUG: Log cache update
+					fmt.Fprintf(os.Stderr, "📝 Updated globalResultsBySig for block %d: def.evmPC=%d def.idx=%d value=%v\n",
 						block.blockNum, def.evmPC, def.idx, r)
 				}
+				
+				// Also update pointer-based cache for mirHandleJUMP compatibility
+				it.globalResults[def] = new(uint256.Int).Set(r)
 			}
 		}
 	}
@@ -391,19 +391,26 @@ func (it *MIRInterpreter) publishLiveOut(block *MIRBasicBlock) {
 	for i := range exitVals {
 		v := &exitVals[i]
 		if v != nil && v.kind == Variable && v.def != nil && !inBlock[v.def] {
-			if _, ok := it.globalResults[v.def]; !ok {
+			// Check signature-based cache
+			var hasInSigCache bool
+			if v.def.evmPC != 0 {
+				if byPC := it.globalResultsBySig[uint64(v.def.evmPC)]; byPC != nil {
+					_, hasInSigCache = byPC[v.def.idx]
+				}
+			}
+			
+			if !hasInSigCache {
 				val := it.evalValue(v)
-				if val != nil {
+				if val != nil && v.def.evmPC != 0 {
+					if it.globalResultsBySig[uint64(v.def.evmPC)] == nil {
+						it.globalResultsBySig[uint64(v.def.evmPC)] = make(map[int]*uint256.Int)
+					}
+					it.globalResultsBySig[uint64(v.def.evmPC)][v.def.idx] = new(uint256.Int).Set(val)
+					// Also update pointer cache for compatibility
 					it.globalResults[v.def] = new(uint256.Int).Set(val)
 					// DEBUG: Log backfill
 					fmt.Fprintf(os.Stderr, "🔙 Backfilled ancestor def in block %d: def.evmPC=%d def.idx=%d value=%v\n",
 						block.blockNum, v.def.evmPC, v.def.idx, val)
-				}
-			} else {
-				// DEBUG: Log that backfill was skipped (already exists)
-				if v.def.evmPC == 6 {
-					fmt.Fprintf(os.Stderr, "✋ Backfill skipped (already exists) in block %d: def.evmPC=%d def.idx=%d current_value=%v\n",
-						block.blockNum, v.def.evmPC, v.def.idx, it.globalResults[v.def])
 				}
 			}
 		}
@@ -2142,49 +2149,29 @@ func (it *MIRInterpreter) evalValue(v *Value) *uint256.Int {
 				}
 			}
 		if v.liveIn {
-			if it.globalResults != nil {
-				// HYBRID APPROACH: Check both caches and ensure consistency
-				pointerVal, hasPointer := it.globalResults[v.def]
-				var byEvmPCVal *uint256.Int
-				var hasByEvmPC bool
-				
-				// Check evmPC-based cache
-				if v.def.evmPC != 0 {
-					if byPC := it.globalResultsBySig[uint64(v.def.evmPC)]; byPC != nil {
-						byEvmPCVal, hasByEvmPC = byPC[v.def.idx]
-					}
-				}
-				
-				// Consistency check: if both exist and differ, byEvmPC wins (loop fix)
-				if hasPointer && hasByEvmPC && pointerVal != nil && byEvmPCVal != nil {
-					if pointerVal.Cmp(byEvmPCVal) != 0 {
-						// Pointer cache is stale, update it with byEvmPC value
-						it.globalResults[v.def] = new(uint256.Int).Set(byEvmPCVal)
+			// PURE APPROACH 1: Always use signature-based cache (evmPC, idx)
+			// This is simpler, more maintainable, and absolutely correct for loops
+			if v.def.evmPC != 0 {
+				if byPC := it.globalResultsBySig[uint64(v.def.evmPC)]; byPC != nil {
+					if val, ok := byPC[v.def.idx]; ok && val != nil {
+						// DEBUG: Log read
 						if v.def.evmPC == 6 {
-							fmt.Fprintf(os.Stderr, "🔄 Synced pointer cache from byEvmPC: def.evmPC=%d def.idx=%d old=%v new=%v\n",
-								v.def.evmPC, v.def.idx, pointerVal, byEvmPCVal)
+							fmt.Fprintf(os.Stderr, "📖 evalValue liveIn from globalResultsBySig: def.evmPC=%d def.idx=%d value=%v\n",
+								v.def.evmPC, v.def.idx, val)
 						}
-						return byEvmPCVal
+						return val
 					}
 				}
-				
-				// Fast path: pointer cache hit
-				if hasPointer && pointerVal != nil {
+			}
+			
+			// Fallback to pointer-based cache for compatibility (mirHandleJUMP uses it)
+			if it.globalResults != nil {
+				if r, ok := it.globalResults[v.def]; ok && r != nil {
 					if v.def.evmPC == 6 {
-						fmt.Fprintf(os.Stderr, "📖 evalValue liveIn from globalResults (pointer): def.evmPC=%d def.idx=%d value=%v\n",
-							v.def.evmPC, v.def.idx, pointerVal)
+						fmt.Fprintf(os.Stderr, "📖 evalValue liveIn from globalResults (fallback): def.evmPC=%d def.idx=%d value=%v\n",
+							v.def.evmPC, v.def.idx, r)
 					}
-					return pointerVal
-				}
-				
-				// Fallback: byEvmPC cache hit, update pointer cache
-				if hasByEvmPC && byEvmPCVal != nil {
-					it.globalResults[v.def] = new(uint256.Int).Set(byEvmPCVal)
-					if v.def.evmPC == 6 {
-						fmt.Fprintf(os.Stderr, "📖 evalValue liveIn from globalResultsBySig (fallback + sync): def.evmPC=%d def.idx=%d value=%v\n",
-							v.def.evmPC, v.def.idx, byEvmPCVal)
-					}
-					return byEvmPCVal
+					return r
 				}
 			}
 		}
