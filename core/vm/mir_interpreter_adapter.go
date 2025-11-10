@@ -146,6 +146,7 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 	oldCallValue := env.CallValue
 	oldCalldata := env.Calldata
 	oldCode := env.Code
+	oldCurrentSelf := adapter.currentSelf
 
 	// Restore env after execution
 	defer func() {
@@ -155,6 +156,7 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 		env.CallValue = oldCallValue
 		env.Calldata = oldCalldata
 		env.Code = oldCode
+		adapter.currentSelf = oldCurrentSelf
 	}()
 
 	// Save and restore memShadow to prevent pollution across nested calls

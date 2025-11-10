@@ -2509,9 +2509,10 @@ func (it *MIRInterpreter) sload(key *uint256.Int) *uint256.Int {
 func (it *MIRInterpreter) sstore(key, val *uint256.Int) {
 	var k [32]byte
 	var v [32]byte
-	copy(k[:], key.Bytes())
-	bytes := val.Bytes()
-	copy(v[32-len(bytes):], bytes)
+	keyBytes := key.Bytes()
+	copy(k[32-len(keyBytes):], keyBytes)
+	valBytes := val.Bytes()
+	copy(v[32-len(valBytes):], valBytes)
 	// Prefer runtime hook if provided
 	if it.env.SStoreFunc != nil {
 		it.env.SStoreFunc(k, v)
