@@ -197,6 +197,82 @@ func BenchmarkMIRVsEVM_WBNB(b *testing.B) {
 	}
 }
 
+// BenchmarkBlockGasRate_USDT simulates a 'block' by executing many ERC20 calls and reports gas/s.
+func BenchmarkBlockGasRate_USDT(b *testing.B) {
+	cfgBase := &runtime.Config{ChainConfig: params.MainnetChainConfig, GasLimit: 15_000_000, Origin: common.Address{}, BlockNumber: big.NewInt(1), Value: big.NewInt(0), EVMConfig: vm.Config{EnableOpcodeOptimizations: false}}
+	cfgMIR := &runtime.Config{ChainConfig: params.MainnetChainConfig, GasLimit: 15_000_000, Origin: common.Address{}, BlockNumber: big.NewInt(1), Value: big.NewInt(0), EVMConfig: vm.Config{EnableOpcodeOptimizations: true, EnableMIR: true, EnableMIRInitcode: true}}
+	compiler.EnableOpcodeParse()
+
+	code, err := hex.DecodeString(usdtHex[2:])
+	if err != nil {
+		b.Fatalf("decode USDT hex: %v", err)
+	}
+	zeroAddress := make([]byte, 32)
+	oneUint := make([]byte, 32)
+	oneUint[31] = 1
+	invocations := [][]byte{
+		append([]byte{0x09, 0x5e, 0xa7, 0xb3}, append(append([]byte{}, zeroAddress...), oneUint...)...), // approve
+		append([]byte{0xa9, 0x05, 0x9c, 0xbb}, append([]byte{}, zeroAddress...)...),                     // transfer
+	}
+	// Repeat set to simulate many tx per block
+	const perIter = 200
+	inputs := make([][]byte, 0, perIter*len(invocations))
+	for i := 0; i < perIter; i++ {
+		inputs = append(inputs, invocations...)
+	}
+
+	b.Run("EVM_Base_gasps", func(b *testing.B) {
+		if cfgBase.State == nil {
+			cfgBase.State, _ = state.New(types.EmptyRootHash, state.NewDatabaseForTesting())
+		}
+		evm := runtime.NewEnv(cfgBase)
+		address := common.BytesToAddress([]byte("contract_usdt_block"))
+		sender := vm.AccountRef(cfgBase.Origin)
+		evm.StateDB.CreateAccount(address)
+		evm.StateDB.SetCode(address, code)
+
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			var used uint64
+			for _, in := range inputs {
+				_, leftover, _ := evm.Call(sender, address, in, cfgBase.GasLimit, uint256.MustFromBig(cfgBase.Value))
+				used += cfgBase.GasLimit - leftover
+			}
+			// Report metric as gas/s using ns/op: gasPerSec = (used * 1e9) / ns/op
+			nsPerOp := float64(b.Elapsed().Nanoseconds()) / float64(i+1)
+			if nsPerOp > 0 {
+				gps := (float64(used) * 1e9) / nsPerOp
+				b.ReportMetric(gps, "gas/s")
+			}
+		}
+	})
+
+	b.Run("MIR_Interpreter_gasps", func(b *testing.B) {
+		if cfgMIR.State == nil {
+			cfgMIR.State, _ = state.New(types.EmptyRootHash, state.NewDatabaseForTesting())
+		}
+		evm := runtime.NewEnv(cfgMIR)
+		address := common.BytesToAddress([]byte("contract_usdt_block"))
+		sender := vm.AccountRef(cfgMIR.Origin)
+		evm.StateDB.CreateAccount(address)
+		evm.StateDB.SetCode(address, code)
+
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			var used uint64
+			for _, in := range inputs {
+				_, leftover, _ := evm.Call(sender, address, in, cfgMIR.GasLimit, uint256.MustFromBig(cfgMIR.Value))
+				used += cfgMIR.GasLimit - leftover
+			}
+			nsPerOp := float64(b.Elapsed().Nanoseconds()) / float64(i+1)
+			if nsPerOp > 0 {
+				gps := (float64(used) * 1e9) / nsPerOp
+				b.ReportMetric(gps, "gas/s")
+			}
+		}
+	})
+}
+
 // TestCountUSDTMIR generates MIR CFG for the USDT bytecode and reports total MIR instructions
 func TestCountUSDTMIR(t *testing.T) {
 	// Decode USDT bytecode

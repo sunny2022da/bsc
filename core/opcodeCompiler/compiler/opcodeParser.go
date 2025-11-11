@@ -307,7 +307,7 @@ func GenerateMIRCFG(hash common.Hash, code []byte) (*CFG, error) {
 		if curBB == nil {
 			continue
 		}
-		log.Warn("==GenerateMIRCFG== unprcessedBBs.Pop", "curBB", curBB.blockNum, "curBB.built", curBB.built, "firstPC", curBB.firstPC,
+		log.Info("==GenerateMIRCFG== unprcessedBBs.Pop", "curBB", curBB.blockNum, "curBB.built", curBB.built, "firstPC", curBB.firstPC,
 			"lastPC", curBB.lastPC, "parents", len(curBB.parents),
 			"children", len(curBB.children))
 		// Track unique blocks processed

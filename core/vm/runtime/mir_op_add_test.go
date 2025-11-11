@@ -102,3 +102,64 @@ func BenchmarkMIR_Op_ADD(b *testing.B) {
 		}
 	})
 }
+
+// makeCodeManyADD returns bytecode that performs n additions with constant increment
+// using an accumulator to keep stack height constant:
+//
+//	PUSH1 seed; repeat n times: (PUSH1 inc; ADD); MSTORE; RETURN
+//
+// This avoids growing the stack beyond limit.
+func makeCodeManyADD(n int, seed, inc byte) []byte {
+	if n < 1 {
+		n = 1
+	}
+	code := make([]byte, 0, 2+n*2+6) // PUSH1 seed + n*(PUSH1,ADD) + trailer
+	// seed
+	code = append(code, 0x60, seed) // PUSH1 seed
+	for i := 0; i < n; i++ {
+		code = append(code,
+			0x60, inc, // PUSH1 inc
+			0x01, // ADD
+		)
+	}
+	// MSTORE and RETURN
+	code = append(code,
+		0x60, 0x00, // PUSH1 0 (offset)
+		0x52,       // MSTORE (offset, value)
+		0x60, 0x20, // PUSH1 32 (size)
+		0x60, 0x00, // PUSH1 0 (offset)
+		0xf3, // RETURN
+	)
+	return code
+}
+
+// Benchmark many ADDs to amortize MIR setup overhead
+func BenchmarkMIR_Op_ADD_Many(b *testing.B) {
+	compiler.EnableOpcodeParse()
+	code := makeCodeManyADD(2000, 0x00, 0x01) // 2000 ADDs of +1 starting from 0
+
+	b.Run("BaseMany", func(b *testing.B) {
+		cfg := vm.Config{EnableOpcodeOptimizations: false}
+		if _, err := runWithCfg(code, cfg); err != nil {
+			b.Fatalf("base priming err: %v", err)
+		}
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			if _, err := runWithCfg(code, cfg); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("MIRMany", func(b *testing.B) {
+		cfg := vm.Config{EnableOpcodeOptimizations: true, EnableMIR: true, EnableMIRInitcode: true}
+		if _, err := runWithCfg(code, cfg); err != nil {
+			b.Fatalf("mir priming err: %v", err)
+		}
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			if _, err := runWithCfg(code, cfg); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
