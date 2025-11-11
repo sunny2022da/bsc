@@ -397,6 +397,7 @@ func runRuntimeTests(t *testing.T, tests []RuntimeTestCase, checkStorage bool) {
 func TestMIRvsEVM_ContractCreation(t *testing.T) {
 	t.Logf("\n%s\n🚀 测试类别: Contract Creation (CREATE, CREATE2)\n%s\n", strings.Repeat("=", 80), strings.Repeat("=", 80))
 
+	// Small initcode (10 bytes)
 	initCode := []byte{
 		byte(vm.PUSH1), 10,
 		byte(vm.PUSH1), 0,
@@ -406,10 +407,18 @@ func TestMIRvsEVM_ContractCreation(t *testing.T) {
 		byte(vm.RETURN),
 	}
 
+	// Larger initcode (64 bytes = 2 words)
+	largeInitCode := make([]byte, 64)
+	for i := range largeInitCode {
+		largeInitCode[i] = byte(vm.PUSH1)
+	}
+	largeInitCode = append(largeInitCode, byte(vm.PUSH1), 0, byte(vm.RETURN))
+
 	tests := []RuntimeTestCase{
+		// CREATE - Dynamic gas: 32000 + memExpansion + (EIP-3860: 2*initCodeWords)
 		{
-			Name:        "CREATE_SimpleContract",
-			Description: "Use CREATE to deploy",
+			Name:        "CREATE_SmallInitCode",
+			Description: "CREATE with small initcode (10 bytes) - dynamic gas = memExpansion + (EIP-3860: 2*1 words)",
 			MainContract: append([]byte{
 				byte(vm.PUSH1), byte(len(initCode)),
 				byte(vm.PUSH1), 32 - byte(len(initCode)),
@@ -424,11 +433,12 @@ func TestMIRvsEVM_ContractCreation(t *testing.T) {
 			}, makeMstoreBytes(initCode, 32-len(initCode))...)...),
 			ContractAddr: common.HexToAddress("0xaaaa"),
 		},
+		// CREATE2 - Dynamic gas: 32000 + keccak256(initcode) + memExpansion + (EIP-3860: 2*initCodeWords)
 		{
-			Name:        "CREATE2_WithSalt",
-			Description: "Use CREATE2 with salt",
+			Name:        "CREATE2_SmallInitCode",
+			Description: "CREATE2 with small initcode - dynamic gas = keccak256(10 bytes) + memExpansion + (EIP-3860: 2*1)",
 			MainContract: append([]byte{
-				byte(vm.PUSH1), 0x42,
+				byte(vm.PUSH1), 0x42, // salt
 				byte(vm.PUSH1), byte(len(initCode)),
 				byte(vm.PUSH1), 32 - byte(len(initCode)),
 				byte(vm.PUSH1), 0,
@@ -441,6 +451,26 @@ func TestMIRvsEVM_ContractCreation(t *testing.T) {
 				byte(vm.RETURN),
 			}, makeMstoreBytes(initCode, 32-len(initCode))...)...),
 			ContractAddr: common.HexToAddress("0xbbbb"),
+		},
+		// CREATE2 with larger initcode to test different keccak256 cost
+		{
+			Name:        "CREATE2_LargeInitCode",
+			Description: "CREATE2 with large initcode (67 bytes) - dynamic gas includes keccak256(67 bytes = 3 words)",
+			MainContract: append([]byte{
+				byte(vm.PUSH1), 0x99, // salt
+				byte(vm.PUSH1), byte(len(largeInitCode)),
+				byte(vm.PUSH1), 0,
+				byte(vm.PUSH1), 0,
+			}, append([]byte{
+				byte(vm.CREATE2),
+				byte(vm.PUSH1), 0,
+				byte(vm.MSTORE),
+				byte(vm.PUSH1), 32,
+				byte(vm.PUSH1), 0,
+				byte(vm.RETURN),
+			}, makeMstoreBytes(largeInitCode, 0)...)...),
+			ContractAddr: common.HexToAddress("0xcccc"),
+			GasLimit:     1000000,
 		},
 	}
 
@@ -692,6 +722,144 @@ func TestMIRvsEVM_ExternalCodeAccess(t *testing.T) {
 	runRuntimeTests(t, tests, false)
 }
 
+// TestMIRvsEVM_AccountAccessWarmCold tests EIP-2929 warm/cold access
+// Dynamic gas: cold access (first time) vs warm access (subsequent times)
+func TestMIRvsEVM_AccountAccessWarmCold(t *testing.T) {
+	t.Logf("\n%s\n🔥 测试类别: Account Access Warm/Cold (EIP-2929 Dynamic Gas)\n%s\n", strings.Repeat("=", 80), strings.Repeat("=", 80))
+
+	targetAddr := common.HexToAddress("0xbbbb")
+	targetCode := []byte{byte(vm.PUSH1), 0x42, byte(vm.PUSH1), 0, byte(vm.RETURN)}
+
+	tests := []RuntimeTestCase{
+		// BALANCE - Dynamic gas: cold=2600, warm=100
+		{
+			Name:        "BALANCE_ColdAccess",
+			Description: "First BALANCE call (cold access = 2600 gas)",
+			MainContract: []byte{
+				byte(vm.PUSH1), 0xbb, byte(vm.PUSH1), 0xbb,
+				byte(vm.BALANCE), // First access = cold
+				byte(vm.PUSH1), 0,
+				byte(vm.MSTORE),
+				byte(vm.PUSH1), 32,
+				byte(vm.PUSH1), 0,
+				byte(vm.RETURN),
+			},
+			SetupContracts: map[common.Address][]byte{
+				targetAddr: targetCode,
+			},
+			ContractAddr: common.HexToAddress("0xaaaa"),
+		},
+		{
+			Name:        "BALANCE_WarmAccess",
+			Description: "Two BALANCE calls to same address: cold(2600) then warm(100)",
+			MainContract: []byte{
+				byte(vm.PUSH1), 0xbb, byte(vm.PUSH1), 0xbb,
+				byte(vm.BALANCE), // First access = cold (2600)
+				byte(vm.POP),
+				byte(vm.PUSH1), 0xbb, byte(vm.PUSH1), 0xbb,
+				byte(vm.BALANCE), // Second access = warm (100)
+				byte(vm.PUSH1), 0,
+				byte(vm.MSTORE),
+				byte(vm.PUSH1), 32,
+				byte(vm.PUSH1), 0,
+				byte(vm.RETURN),
+			},
+			SetupContracts: map[common.Address][]byte{
+				targetAddr: targetCode,
+			},
+			ContractAddr: common.HexToAddress("0xaaaa"),
+		},
+		// EXTCODESIZE - Dynamic gas: cold=2600, warm=100
+		{
+			Name:        "EXTCODESIZE_WarmAccess",
+			Description: "Two EXTCODESIZE calls: cold(2600) then warm(100)",
+			MainContract: []byte{
+				byte(vm.PUSH1), 0xbb, byte(vm.PUSH1), 0xbb,
+				byte(vm.EXTCODESIZE), // First = cold
+				byte(vm.POP),
+				byte(vm.PUSH1), 0xbb, byte(vm.PUSH1), 0xbb,
+				byte(vm.EXTCODESIZE), // Second = warm
+				byte(vm.PUSH1), 0,
+				byte(vm.MSTORE),
+				byte(vm.PUSH1), 32,
+				byte(vm.PUSH1), 0,
+				byte(vm.RETURN),
+			},
+			SetupContracts: map[common.Address][]byte{
+				targetAddr: targetCode,
+			},
+			ContractAddr: common.HexToAddress("0xaaaa"),
+		},
+		// EXTCODEHASH - Dynamic gas: cold=2600, warm=100
+		{
+			Name:        "EXTCODEHASH_WarmAccess",
+			Description: "Two EXTCODEHASH calls: cold(2600) then warm(100)",
+			MainContract: []byte{
+				byte(vm.PUSH1), 0xbb, byte(vm.PUSH1), 0xbb,
+				byte(vm.EXTCODEHASH), // First = cold
+				byte(vm.POP),
+				byte(vm.PUSH1), 0xbb, byte(vm.PUSH1), 0xbb,
+				byte(vm.EXTCODEHASH), // Second = warm
+				byte(vm.PUSH1), 0,
+				byte(vm.MSTORE),
+				byte(vm.PUSH1), 32,
+				byte(vm.PUSH1), 0,
+				byte(vm.RETURN),
+			},
+			SetupContracts: map[common.Address][]byte{
+				targetAddr: targetCode,
+			},
+			ContractAddr: common.HexToAddress("0xaaaa"),
+		},
+		// EXTCODECOPY - Dynamic gas: cold=2600, warm=100 + copy cost + mem expansion
+		{
+			Name:        "EXTCODECOPY_ColdAccess",
+			Description: "EXTCODECOPY with cold access (2600 gas)",
+			MainContract: []byte{
+				byte(vm.PUSH1), byte(len(targetCode)),
+				byte(vm.PUSH1), 0,
+				byte(vm.PUSH1), 0,
+				byte(vm.PUSH2), 0xbb, 0xbb, // Push address 0xbbbb correctly
+				byte(vm.EXTCODECOPY), // First = cold (2600 gas)
+				byte(vm.PUSH1), 32,
+				byte(vm.PUSH1), 0,
+				byte(vm.RETURN),
+			},
+			SetupContracts: map[common.Address][]byte{
+				targetAddr: targetCode,
+			},
+			ContractAddr: common.HexToAddress("0xaaaa"),
+		},
+		{
+			Name:        "EXTCODECOPY_WarmAccess",
+			Description: "Two EXTCODECOPY calls: cold(2600) then warm(100)",
+			MainContract: []byte{
+				// First call - cold access
+				byte(vm.PUSH1), byte(len(targetCode)),
+				byte(vm.PUSH1), 0,
+				byte(vm.PUSH1), 0,
+				byte(vm.PUSH2), 0xbb, 0xbb, // Push address 0xbbbb correctly
+				byte(vm.EXTCODECOPY),
+				// Second call - warm access
+				byte(vm.PUSH1), byte(len(targetCode)),
+				byte(vm.PUSH1), 0,
+				byte(vm.PUSH1), 32,
+				byte(vm.PUSH2), 0xbb, 0xbb, // Push address 0xbbbb correctly
+				byte(vm.EXTCODECOPY),
+				byte(vm.PUSH1), 32,
+				byte(vm.PUSH1), 0,
+				byte(vm.RETURN),
+			},
+			SetupContracts: map[common.Address][]byte{
+				targetAddr: targetCode,
+			},
+			ContractAddr: common.HexToAddress("0xaaaa"),
+		},
+	}
+
+	runRuntimeTests(t, tests, false)
+}
+
 func TestMIRvsEVM_RuntimeStorage(t *testing.T) {
 	t.Logf("\n%s\n💾 测试类别: Runtime Storage\n%s\n", strings.Repeat("=", 80), strings.Repeat("=", 80))
 
@@ -771,9 +939,10 @@ func TestMIRvsEVM_LogOperations(t *testing.T) {
 	t.Logf("\n%s\n📝 测试类别: Log Operations\n%s\n", strings.Repeat("=", 80), strings.Repeat("=", 80))
 
 	tests := []RuntimeTestCase{
+		// LOG0-4 - Dynamic gas: 375 + 375*topics + 8*dataSize + memExpansion
 		{
 			Name:        "LOG0_NoTopics",
-			Description: "Emit log with no topics",
+			Description: "Emit log with no topics - dynamic gas: 375 + 0*375 + 8*32 + memExpansion",
 			MainContract: []byte{
 				byte(vm.PUSH1), 0xaa,
 				byte(vm.PUSH1), 0,

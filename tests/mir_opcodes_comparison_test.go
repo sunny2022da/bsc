@@ -468,7 +468,10 @@ func TestMIRvsEVM_Arithmetic(t *testing.T) {
 		buildBinaryOpTest("SDIV", byte(vm.SDIV), []byte{0xfe}, []byte{0x02}, "-2 / 2 = -1"),
 		buildBinaryOpTest("MOD", byte(vm.MOD), []byte{0x07}, []byte{0x03}, "7 % 3 = 1"),
 		buildBinaryOpTest("SMOD", byte(vm.SMOD), []byte{0xf9}, []byte{0x03}, "-7 % 3 = -1"),
-		buildBinaryOpTest("EXP", byte(vm.EXP), []byte{0x03}, []byte{0x02}, "2 ** 3 = 8"),
+		// EXP - Dynamic gas: 10 + 50*byteLength(exponent) after EIP-158
+		buildBinaryOpTest("EXP_SmallExponent", byte(vm.EXP), []byte{0x03}, []byte{0x02}, "2^3=8, exp=3 (1 byte) - dynamic gas = 10 + 50*1 = 60"),
+		buildBinaryOpTest("EXP_ZeroExponent", byte(vm.EXP), []byte{0x00}, []byte{0x02}, "2^0=1, exp=0 (0 bytes) - dynamic gas = 10 + 50*0 = 10"),
+		buildBinaryOpTest("EXP_LargeExponent", byte(vm.EXP), []byte{0x10, 0x00}, []byte{0x02}, "2^4096, exp=0x1000 (2 bytes) - dynamic gas = 10 + 50*2 = 110"),
 		buildBinaryOpTest("SIGNEXTEND", byte(vm.SIGNEXTEND), []byte{0xff}, []byte{0x00}, "Sign extend 0xff"),
 		buildTernaryOpTest("ADDMOD", byte(vm.ADDMOD), []byte{0x05}, []byte{0x04}, []byte{0x03}, "(3+4)%5=2"),
 		buildTernaryOpTest("MULMOD", byte(vm.MULMOD), []byte{0x05}, []byte{0x04}, []byte{0x03}, "(3*4)%5=2"),
@@ -578,17 +581,33 @@ func TestMIRvsEVM_SpecialOpcodes(t *testing.T) {
 
 func TestMIRvsEVM_Memory(t *testing.T) {
 	tests := []OpcodeTestCase{
+		// MLOAD/MSTORE - Dynamic gas: memory expansion (quadratic: newWords*3 + newWords^2/512)
 		{
-			Name:        "MLOAD_MSTORE",
+			Name:        "MLOAD_MSTORE_32Bytes",
 			Bytecode:    []byte{0x60, 0x42, 0x60, 0x00, 0x52, 0x60, 0x00, 0x51, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3},
 			InitialGas:  100000,
-			Description: "Store 0x42 at offset 0, load it back",
+			Description: "Store/Load at offset 0 (1 word) - mem expansion = 1*3 + 1^2/512 = 3",
 		},
+		// MSTORE8 - Dynamic gas: memory expansion
 		{
-			Name:        "MSTORE8",
+			Name:        "MSTORE8_1Byte",
 			Bytecode:    []byte{0x60, 0xff, 0x60, 0x00, 0x53, 0x60, 0x00, 0x51, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3},
 			InitialGas:  100000,
-			Description: "Store byte 0xff at offset 0",
+			Description: "Store 1 byte at offset 0 - mem expansion = 1*3 + 1^2/512 = 3",
+		},
+		// Memory expansion test: larger offset causes quadratic growth
+		{
+			Name:        "MSTORE_LargeOffset",
+			Bytecode:    []byte{0x60, 0x42, 0x61, 0x04, 0x00, 0x52, 0x60, 0x00, 0x51, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3}, // MSTORE at offset 1024
+			InitialGas:  100000,
+			Description: "MSTORE at offset 1024 (33 words) - mem expansion = 33*3 + 33^2/512 = 99 + 2 = 101",
+		},
+		// Multiple memory expansions (test cumulative cost)
+		{
+			Name:        "MSTORE_MultipleExpansions",
+			Bytecode:    []byte{0x60, 0x11, 0x60, 0x00, 0x52, 0x60, 0x22, 0x60, 0x20, 0x52, 0x60, 0x33, 0x60, 0x40, 0x52, 0x60, 0x00, 0x51, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3},
+			InitialGas:  100000,
+			Description: "MSTORE at 0, 32, 64 (3 words) - cumulative mem expansion",
 		},
 		{
 			Name:        "MSIZE",
@@ -694,11 +713,26 @@ func TestMIRvsEVM_CodeOperations(t *testing.T) {
 
 func TestMIRvsEVM_Crypto(t *testing.T) {
 	tests := []OpcodeTestCase{
+		// KECCAK256 - Dynamic gas: 30 + 6*words + memory expansion
 		{
-			Name:        "KECCAK256",
+			Name:        "KECCAK256_32Bytes",
 			Bytecode:    []byte{0x60, 0xaa, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0x20, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3},
 			InitialGas:  100000,
-			Description: "Hash memory[0:32]",
+			Description: "Hash 32 bytes (1 word) - dynamic gas = 30 + 6*1 + memExpansion = 36",
+		},
+		// KECCAK256 with 64 bytes (2 words)
+		{
+			Name:        "KECCAK256_64Bytes",
+			Bytecode:    []byte{0x60, 0xaa, 0x60, 0x00, 0x52, 0x60, 0xbb, 0x60, 0x20, 0x52, 0x60, 0x40, 0x60, 0x00, 0x20, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3},
+			InitialGas:  100000,
+			Description: "Hash 64 bytes (2 words) - dynamic gas = 30 + 6*2 + memExpansion = 42",
+		},
+		// KECCAK256 with 128 bytes (4 words)
+		{
+			Name:        "KECCAK256_128Bytes",
+			Bytecode:    []byte{0x60, 0xaa, 0x60, 0x00, 0x52, 0x60, 0x80, 0x60, 0x00, 0x20, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3}, // hash 128 bytes
+			InitialGas:  100000,
+			Description: "Hash 128 bytes (4 words) - dynamic gas = 30 + 6*4 + memExpansion = 54",
 		},
 	}
 	runOpcodeTests(t, "Crypto", tests)
@@ -706,17 +740,48 @@ func TestMIRvsEVM_Crypto(t *testing.T) {
 
 func TestMIRvsEVM_Storage(t *testing.T) {
 	tests := []OpcodeTestCase{
+		// SLOAD - Dynamic gas: EIP-2929 warm (100) vs cold (2100)
 		{
-			Name:        "SLOAD",
-			Bytecode:    []byte{0x60, 0x00, 0x54, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3},
+			Name:        "SLOAD_Single",
+			Bytecode:    []byte{0x60, 0x00, 0x54, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3}, // PUSH1 0, SLOAD, PUSH1 0, MSTORE, PUSH1 32, PUSH1 0, RETURN
 			InitialGas:  100000,
-			Description: "Load from storage slot 0",
+			Description: "Load from storage slot 0 once (cold access = 2100 gas)",
 		},
+		// SLOAD - Warm access test: second access to same slot costs less
 		{
-			Name:        "SSTORE",
-			Bytecode:    []byte{0x60, 0x42, 0x60, 0x00, 0x55, 0x60, 0x00, 0x54, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3},
+			Name:        "SLOAD_WarmAccess",
+			Bytecode:    []byte{0x60, 0x00, 0x54, 0x60, 0x00, 0x54, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3}, // PUSH1 0, SLOAD, PUSH1 0, SLOAD, ...
 			InitialGas:  100000,
-			Description: "Store 0x42 in slot 0, then load it",
+			Description: "Load same slot twice: first=cold(2100), second=warm(100)",
+		},
+		// SSTORE - Dynamic gas: depends on original/current/new value (9 cases in EIP-2200)
+		// Case 1: 0 → non-zero (first write to empty slot = 20000 gas)
+		{
+			Name:        "SSTORE_ZeroToNonZero",
+			Bytecode:    []byte{0x60, 0x42, 0x60, 0x00, 0x55, 0x60, 0x00, 0x54, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3}, // PUSH1 0x42, PUSH1 0, SSTORE, ...
+			InitialGas:  100000,
+			Description: "Store 0x42 in empty slot 0 (0→non-zero = 20000 gas)",
+		},
+		// Case 2: Modify existing non-zero value (5000 gas)
+		{
+			Name:        "SSTORE_ModifyNonZero",
+			Bytecode:    []byte{0x60, 0x11, 0x60, 0x00, 0x55, 0x60, 0x22, 0x60, 0x00, 0x55, 0x60, 0x00, 0x54, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3},
+			InitialGas:  150000,
+			Description: "Store 0x11 then 0x22 in slot 0 (modify existing = 5000 gas)",
+		},
+		// Case 3: Set to zero (delete, 5000 gas + refund)
+		{
+			Name:        "SSTORE_SetToZero",
+			Bytecode:    []byte{0x60, 0x11, 0x60, 0x00, 0x55, 0x60, 0x00, 0x60, 0x00, 0x55, 0x60, 0x00, 0x54, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3},
+			InitialGas:  150000,
+			Description: "Store 0x11 then 0 in slot 0 (delete = 5000 gas + refund)",
+		},
+		// Case 4: No-op (same value, 200 gas after EIP-2200)
+		{
+			Name:        "SSTORE_NoOp",
+			Bytecode:    []byte{0x60, 0x11, 0x60, 0x00, 0x55, 0x60, 0x11, 0x60, 0x00, 0x55, 0x60, 0x00, 0x54, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3},
+			InitialGas:  150000,
+			Description: "Store 0x11 twice in slot 0 (no-op = 200 gas)",
 		},
 	}
 	runOpcodeTests(t, "Storage", tests)
@@ -742,11 +807,41 @@ func TestMIRvsEVM_TransientStorage(t *testing.T) {
 
 func TestMIRvsEVM_MemoryCopy(t *testing.T) {
 	tests := []OpcodeTestCase{
+		// MCOPY - Dynamic gas: 3 + 3*words + memory expansion
 		{
-			Name:        "MCOPY",
+			Name:        "MCOPY_Small",
 			Bytecode:    []byte{0x60, 0xaa, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0x60, 0x20, 0x5e, 0x60, 0x20, 0x60, 0x20, 0xf3},
 			InitialGas:  100000,
-			Description: "Copy 32 bytes from memory[0] to memory[32]",
+			Description: "Copy 32 bytes (1 word) - dynamic gas = 3 + 3*1 + memExpansion",
+		},
+		// MCOPY with larger size
+		{
+			Name:        "MCOPY_64Bytes",
+			Bytecode:    []byte{0x60, 0xaa, 0x60, 0x00, 0x52, 0x60, 0x40, 0x60, 0x00, 0x60, 0x40, 0x5e, 0x60, 0x20, 0x60, 0x00, 0xf3}, // copy 64 bytes = 2 words
+			InitialGas:  100000,
+			Description: "Copy 64 bytes (2 words) - dynamic gas = 3 + 3*2 + memExpansion",
+		},
+		// CALLDATACOPY - Dynamic gas: 3 + 3*words + memory expansion
+		{
+			Name:        "CALLDATACOPY_32Bytes",
+			Bytecode:    []byte{0x60, 0x20, 0x60, 0x00, 0x60, 0x00, 0x37, 0x60, 0x20, 0x60, 0x00, 0xf3}, // PUSH1 32, PUSH1 0, PUSH1 0, CALLDATACOPY, RETURN
+			Calldata:    []byte{0xaa, 0xbb, 0xcc, 0xdd},
+			InitialGas:  100000,
+			Description: "Copy 32 bytes from calldata - dynamic gas = 3 + 3*1 + memExpansion",
+		},
+		// CODECOPY - Dynamic gas: 3 + 3*words + memory expansion
+		{
+			Name:        "CODECOPY_32Bytes",
+			Bytecode:    []byte{0x60, 0x20, 0x60, 0x00, 0x60, 0x00, 0x39, 0x60, 0x20, 0x60, 0x00, 0xf3}, // PUSH1 32, PUSH1 0, PUSH1 0, CODECOPY, RETURN
+			InitialGas:  100000,
+			Description: "Copy 32 bytes from code - dynamic gas = 3 + 3*1 + memExpansion",
+		},
+		// RETURNDATACOPY - Dynamic gas: 3 + 3*words + memory expansion
+		{
+			Name:        "RETURNDATACOPY",
+			Bytecode:    []byte{0x60, 0x00, 0x3d, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3}, // PUSH1 0, RETURNDATASIZE, PUSH1 0, MSTORE, RETURN
+			InitialGas:  100000,
+			Description: "RETURNDATASIZE (no copy, just measure) - dynamic gas for RETURNDATASIZE = 3",
 		},
 	}
 	runOpcodeTests(t, "MemoryCopy", tests)
