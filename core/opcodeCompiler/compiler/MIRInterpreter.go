@@ -129,8 +129,6 @@ type MIRInterpreter struct {
 	lastCopyDest uint64
 	lastCopyOff  uint64
 	lastCopySize uint64
-	// DEBUG: Track jump iterations to detect infinite loops
-	jumpCount map[uint]int
 }
 
 // mirGlobalTracer is an optional global tracer invoked for each MIR instruction.
@@ -343,9 +341,6 @@ func (it *MIRInterpreter) publishLiveOut(block *MIRBasicBlock) {
 
 	defs := block.LiveOutDefs()
 
-	// DEBUG: Log which block is publishing
-	fmt.Fprintf(os.Stderr, "🔖 publishLiveOut block=%d defs_count=%d\n", block.blockNum, len(defs))
-
 	//log.Warn("MIR publishLiveOut", "block", block.blockNum, "size", len(block.instructions), "defs", defs, "it.results", it.results, "block.exitStack", block.ExitStack())
 	if len(defs) == 0 {
 		log.Warn("MIR publishLiveOut: no live outs", "block", block.blockNum)
@@ -374,12 +369,12 @@ func (it *MIRInterpreter) publishLiveOut(block *MIRBasicBlock) {
 						it.globalResultsBySig[uint64(def.evmPC)] = make(map[int]*uint256.Int)
 					}
 					it.globalResultsBySig[uint64(def.evmPC)][def.idx] = new(uint256.Int).Set(r)
-					
+
 					// DEBUG: Log cache update
 					fmt.Fprintf(os.Stderr, "📝 Updated globalResultsBySig for block %d: def.evmPC=%d def.idx=%d value=%v\n",
 						block.blockNum, def.evmPC, def.idx, r)
 				}
-				
+
 				// Also update pointer-based cache for mirHandleJUMP compatibility
 				it.globalResults[def] = new(uint256.Int).Set(r)
 			}
@@ -398,7 +393,7 @@ func (it *MIRInterpreter) publishLiveOut(block *MIRBasicBlock) {
 					_, hasInSigCache = byPC[v.def.idx]
 				}
 			}
-			
+
 			if !hasInSigCache {
 				val := it.evalValue(v)
 				if val != nil && v.def.evmPC != 0 {
@@ -408,9 +403,6 @@ func (it *MIRInterpreter) publishLiveOut(block *MIRBasicBlock) {
 					it.globalResultsBySig[uint64(v.def.evmPC)][v.def.idx] = new(uint256.Int).Set(val)
 					// Also update pointer cache for compatibility
 					it.globalResults[v.def] = new(uint256.Int).Set(val)
-					// DEBUG: Log backfill
-					fmt.Fprintf(os.Stderr, "🔙 Backfilled ancestor def in block %d: def.evmPC=%d def.idx=%d value=%v\n",
-						block.blockNum, v.def.evmPC, v.def.idx, val)
 				}
 			}
 		}
@@ -1468,7 +1460,6 @@ func mirHandleJUMP(it *MIRInterpreter, m *MIR) error {
 		return ErrMIRFallback
 	}
 	udest, _ := dest.Uint64WithOverflow()
-	fmt.Fprintf(os.Stderr, "⬅️  JUMP evmPC=%d dest_pc=%d currentBB=%d\n", m.evmPC, udest, it.currentBB.blockNum)
 	if m.evmPC == 5842 {
 		log.Warn("MIR JUMP", "oprands0", m.oprands[0], "dest", dest, "udest", udest, "it.globalResults", it.globalResults)
 		if m.oprands[0].def != nil {
@@ -1498,21 +1489,6 @@ func mirHandleJUMPI(it *MIRInterpreter, m *MIR) error {
 		return fmt.Errorf("JUMPI missing operands")
 	}
 	cond := it.evalValue(m.oprands[1])
-
-	// DEBUG: Log JUMPI execution details
-	prevBBNum := -1
-	if it.prevBB != nil {
-		prevBBNum = int(it.prevBB.blockNum)
-	}
-	// Track iterations to detect infinite loops
-	if it.jumpCount == nil {
-		it.jumpCount = make(map[uint]int)
-	}
-	it.jumpCount[m.evmPC]++
-	if it.jumpCount[m.evmPC] <= 50 {
-		fmt.Fprintf(os.Stderr, "🔁 JUMPI [iter=%d] evmPC=%d cond=%v cond.IsZero=%v currentBB=%d prevBB=%d\n",
-			it.jumpCount[m.evmPC], m.evmPC, cond, cond.IsZero(), it.currentBB.blockNum, prevBBNum)
-	}
 
 	if cond.IsZero() {
 		// fallthrough
@@ -2148,33 +2124,33 @@ func (it *MIRInterpreter) evalValue(v *Value) *uint256.Int {
 					}
 				}
 			}
-		if v.liveIn {
-			// PURE APPROACH 1: Always use signature-based cache (evmPC, idx)
-			// This is simpler, more maintainable, and absolutely correct for loops
-			if v.def.evmPC != 0 {
-				if byPC := it.globalResultsBySig[uint64(v.def.evmPC)]; byPC != nil {
-					if val, ok := byPC[v.def.idx]; ok && val != nil {
-						// DEBUG: Log read
-						if v.def.evmPC == 6 {
-							fmt.Fprintf(os.Stderr, "📖 evalValue liveIn from globalResultsBySig: def.evmPC=%d def.idx=%d value=%v\n",
-								v.def.evmPC, v.def.idx, val)
+			if v.liveIn {
+				// PURE APPROACH 1: Always use signature-based cache (evmPC, idx)
+				// This is simpler, more maintainable, and absolutely correct for loops
+				if v.def.evmPC != 0 {
+					if byPC := it.globalResultsBySig[uint64(v.def.evmPC)]; byPC != nil {
+						if val, ok := byPC[v.def.idx]; ok && val != nil {
+							// DEBUG: Log read
+							if v.def.evmPC == 6 {
+								fmt.Fprintf(os.Stderr, "📖 evalValue liveIn from globalResultsBySig: def.evmPC=%d def.idx=%d value=%v\n",
+									v.def.evmPC, v.def.idx, val)
+							}
+							return val
 						}
-						return val
+					}
+				}
+
+				// Fallback to pointer-based cache for compatibility (mirHandleJUMP uses it)
+				if it.globalResults != nil {
+					if r, ok := it.globalResults[v.def]; ok && r != nil {
+						if v.def.evmPC == 6 {
+							fmt.Fprintf(os.Stderr, "📖 evalValue liveIn from globalResults (fallback): def.evmPC=%d def.idx=%d value=%v\n",
+								v.def.evmPC, v.def.idx, r)
+						}
+						return r
 					}
 				}
 			}
-			
-			// Fallback to pointer-based cache for compatibility (mirHandleJUMP uses it)
-			if it.globalResults != nil {
-				if r, ok := it.globalResults[v.def]; ok && r != nil {
-					if v.def.evmPC == 6 {
-						fmt.Fprintf(os.Stderr, "📖 evalValue liveIn from globalResults (fallback): def.evmPC=%d def.idx=%d value=%v\n",
-							v.def.evmPC, v.def.idx, r)
-					}
-					return r
-				}
-			}
-		}
 			// Then try local per-block result
 			if v.def.idx >= 0 && v.def.idx < len(it.results) {
 				if r := it.results[v.def.idx]; r != nil {
