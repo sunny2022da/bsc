@@ -3,10 +3,11 @@ package compiler
 import (
 	"errors"
 	"fmt"
+	"os"
+
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/holiman/uint256"
-	"os"
 )
 
 // logging shim is defined in debug_flags.go

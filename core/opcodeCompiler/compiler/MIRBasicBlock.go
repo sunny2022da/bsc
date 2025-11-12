@@ -62,8 +62,9 @@ type MIRBasicBlock struct {
 	// Precomputed live-outs: definitions (MIR) whose values are live at block exit
 	liveOutDefs []*MIR
 	// Build bookkeeping
-	built  bool // set true after first successful build
-	queued bool // true if currently enqueued for (re)build
+	built        bool // set true after first successful build
+	queued       bool // true if currently enqueued for (re)build
+	rebuildCount int  // tracks number of rebuilds to prevent infinite loops
 }
 
 func (b *MIRBasicBlock) Size() uint {
@@ -914,6 +915,12 @@ func equalValueForFlow(a, b *Value) bool {
 		if a.def.op != b.def.op {
 			return false
 		}
+		// For PHI nodes: only compare phiStackIndex, not evmPC
+		// This ensures PHI comparison is stable across rebuilds even if evmPC varies
+		if a.def.op == MirPHI {
+			return a.def.phiStackIndex == b.def.phiStackIndex
+		}
+		// For non-PHI Variables: compare both evmPC and phiStackIndex
 		if a.def.evmPC != b.def.evmPC {
 			return false
 		}

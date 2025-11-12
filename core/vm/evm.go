@@ -18,6 +18,7 @@ package vm
 
 import (
 	"errors"
+	"fmt"
 	"math/big"
 	"sync"
 	"sync/atomic"
@@ -30,6 +31,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/tracing"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
 )
 
@@ -276,8 +278,17 @@ func (evm *EVM) Call(caller ContractRef, addr common.Address, input []byte, gas 
 				//runStart := time.Now()
 
 				// Choose interpreter based on available optimizations
+				log.Warn("EVM.Call: Checking interpreter", "has_mir", contract.HasMIRCode(), "mir_interp_nil", evm.mirInterpreter == nil, "addr", addrCopy.Hex()[:10])
+				
+				// In strict mode, if MIR was requested but CFG is not available, fail immediately
+				if evm.Config.MIRStrictNoFallback && evm.Config.EnableMIR && !contract.HasMIRCode() {
+					log.Error("EVM.Call: MIR strict mode - CFG not available, aborting", "addr", addrCopy.Hex()[:10])
+					return nil, gas, fmt.Errorf("MIR strict mode: CFG generation failed or not available for contract %s", addrCopy.Hex())
+				}
+				
 				if contract.HasMIRCode() && evm.mirInterpreter != nil {
 					// Use MIR interpreter for contracts with MIR representation
+					log.Warn("EVM.Call: Using MIR interpreter", "addr", addrCopy.Hex()[:10])
 					contract.SetCallCode(&addrCopy, codeHash, code)
 					ret, err = evm.mirInterpreter.Run(contract, input, false)
 				} else if contract.optimized {
@@ -609,18 +620,25 @@ func tryGetOptimizedCodeWithMIR(evm *EVM, codeHash common.Hash, rawCode []byte, 
 	code = rawCode
 
 	// Check if MIR optimization is enabled
+	log.Warn("tryGetOptimizedCodeWithMIR: Checking MIR", "opt_enabled", evm.Config.EnableOpcodeOptimizations, "mir_interp_nil", evm.mirInterpreter == nil, "parse_enabled", compiler.IsOpcodeParseEnabled())
 	if evm.Config.EnableOpcodeOptimizations && evm.mirInterpreter != nil && compiler.IsOpcodeParseEnabled() {
+		log.Warn("tryGetOptimizedCodeWithMIR: Attempting to load/generate MIR CFG", "hash", codeHash.Hex()[:10])
 		// Try global compiler MIR CFG cache first
 		if cfg := compiler.LoadMIRCFG(codeHash); cfg != nil {
+			log.Warn("tryGetOptimizedCodeWithMIR: MIR CFG loaded from cache", "hash", codeHash.Hex()[:10])
 			contract.SetMIRCFG(cfg)
 			return false, rawCode
 		}
 
 		// If no cached CFG, try to generate-and-cache synchronously as fallback
+		log.Warn("tryGetOptimizedCodeWithMIR: Generating new MIR CFG", "hash", codeHash.Hex()[:10], "code_len", len(rawCode))
 		cfg, err := compiler.TryGenerateMIRCFG(codeHash, rawCode)
 		if err == nil && cfg != nil {
+			log.Warn("tryGetOptimizedCodeWithMIR: MIR CFG generated successfully", "hash", codeHash.Hex()[:10])
 			contract.SetMIRCFG(cfg)
 			return false, rawCode
+		} else {
+			log.Warn("tryGetOptimizedCodeWithMIR: MIR CFG generation failed", "hash", codeHash.Hex()[:10], "err", err, "cfg_nil", cfg == nil)
 		}
 	}
 	// Superinstruction path: fall back to traditional bytecode optimization if no MIR CFG

@@ -336,6 +336,26 @@ func GenerateMIRCFG(hash common.Hash, code []byte) (*CFG, error) {
 		// or if it hasn't been built yet. Entry height alone is not sufficient because incomingStacks
 		// may change across enqueues even if height stays constant.
 		if !curBB.built || curBB.queued {
+			// Guard against infinite rebuild loops: limit each block to 10 rebuilds
+			const maxRebuildsPerBlock = 10
+			curBB.rebuildCount++
+			if curBB.rebuildCount > maxRebuildsPerBlock {
+				log.Warn("MIR CFG: block rebuild limit exceeded", "bb", curBB.blockNum, "firstPC", curBB.firstPC, "rebuilds", curBB.rebuildCount)
+				// Log exit stack details for diagnosis
+				if curBB.ExitStack() != nil {
+					log.Warn("MIR CFG: exit stack at limit", "bb", curBB.blockNum, "exit_len", len(curBB.ExitStack()))
+					for i, v := range curBB.ExitStack() {
+						if v.kind == Variable && v.def != nil {
+							log.Warn("MIR CFG: exit stack value", "idx", i, "kind", "Variable", "def_op", v.def.op, "def_evmPC", v.def.evmPC, "def_phiStackIndex", v.def.phiStackIndex)
+						} else if v.kind == Konst {
+							log.Warn("MIR CFG: exit stack value", "idx", i, "kind", "Konst", "value", debugFormatValue(&v))
+						}
+					}
+				}
+				return nil, fmt.Errorf("block %d (PC=%d) exceeded rebuild limit (%d rebuilds), possible infinite loop in CFG generation",
+					curBB.blockNum, curBB.firstPC, maxRebuildsPerBlock)
+			}
+
 			// Snapshot previous exit to detect changes after rebuild
 			prevExit := curBB.ExitStack()
 			if curBB.firstPC == 5351 || curBB.firstPC == 5374 {
@@ -371,12 +391,69 @@ func GenerateMIRCFG(hash common.Hash, code []byte) (*CFG, error) {
 			if curBB.firstPC == 5351 || curBB.firstPC == 5374 || curBB.firstPC == 5829 {
 				log.Warn("==GenerateMIRCFG== MIR newExit", "bb", curBB.blockNum)
 			}
-			if !stacksEqual(prevExit, newExit) {
+			// Smart convergence detection for loops:
+			// If rebuild count >= 3 and only stack height changed (not content), consider converged
+			earlyConverged := false
+			if curBB.rebuildCount >= 3 {
+				// Case 1: Both stacks non-empty, linear growth pattern
+				if len(prevExit) > 0 && len(newExit) > 0 {
+					heightDiff := len(newExit) - len(prevExit)
+					if heightDiff > 0 && heightDiff <= 2 { // Linear growth, likely loop with function calls
+						// Check if content at common positions is semantically equal
+						commonLen := len(prevExit)
+						if commonLen > len(newExit) {
+							commonLen = len(newExit)
+						}
+						contentEqual := true
+						for i := 0; i < commonLen && i < 5; i++ { // Check first 5 elements
+							if !equalValueForFlow(&prevExit[i], &newExit[i]) {
+								contentEqual = false
+								break
+							}
+						}
+						if contentEqual {
+							earlyConverged = true
+							log.Warn("MIR CFG: early convergence detected (loop, height growth)", "bb", curBB.blockNum, "firstPC", curBB.firstPC,
+								"rebuild", curBB.rebuildCount, "prev_len", len(prevExit), "new_len", len(newExit))
+						}
+					}
+				}
+				// Case 2: Both empty, stable empty stack (terminal blocks in loop)
+				if !earlyConverged && len(prevExit) == 0 && len(newExit) == 0 {
+					earlyConverged = true
+					log.Warn("MIR CFG: early convergence detected (loop, stable empty)", "bb", curBB.blockNum, "firstPC", curBB.firstPC,
+						"rebuild", curBB.rebuildCount)
+				}
+				// Case 3: Incoming stack growth but exit stable (blocks with complex PHI merging)
+				if !earlyConverged && curBB.rebuildCount >= 5 {
+					// Check if incoming stacks are growing but exit is stable
+					incomingGrowing := false
+					for _, parent := range curBB.Parents() {
+						incoming := curBB.IncomingStacks()[parent]
+						if incoming != nil && len(incoming) > 15 { // Arbitrary threshold
+							incomingGrowing = true
+							break
+						}
+					}
+					if incomingGrowing && stacksEqual(prevExit, newExit) {
+						earlyConverged = true
+						log.Warn("MIR CFG: early convergence detected (loop, incoming growth, exit stable)", "bb", curBB.blockNum, "firstPC", curBB.firstPC,
+							"rebuild", curBB.rebuildCount, "exit_len", len(newExit))
+					}
+				}
+			}
+
+			if !earlyConverged && !stacksEqual(prevExit, newExit) {
 				if curBB.firstPC == 5351 || curBB.firstPC == 5374 || curBB.firstPC == 5829 {
 					log.Warn("==GenerateMIRCFG== not equal MIR prevExit", "bb", curBB.blockNum, "prevExit", prevExit, "newExit", newExit)
 				}
 				for _, ch := range curBB.Children() {
 					if ch == nil {
+						continue
+					}
+					// Skip propagation to children that have been rebuilt too many times (likely converged)
+					if ch.rebuildCount >= 5 {
+						log.Warn("MIR CFG: skipping child propagation (child over-rebuilt)", "parent_bb", curBB.blockNum, "child_bb", ch.blockNum, "child_rebuilds", ch.rebuildCount)
 						continue
 					}
 					log.Warn("==GenerateMIRCFG== MIR not equal check children", "bb", curBB.blockNum, "child.blocknum", ch.blockNum)
@@ -392,6 +469,8 @@ func GenerateMIRCFG(hash common.Hash, code []byte) (*CFG, error) {
 						}
 					}
 				}
+			} else if earlyConverged {
+				log.Warn("MIR CFG: skipping child propagation due to early convergence", "bb", curBB.blockNum)
 			}
 		}
 	}
@@ -485,6 +564,14 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 	depthKnown := false
 
 	log.Warn("==buildBasicBlock==", "bb", curBB.blockNum, "firstPC", curBB.firstPC, "lastPC", curBB.lastPC, "parents", len(curBB.parents), "children", len(curBB.children))
+
+	// Save current EVM build context and set stable PC for PHI nodes to ensure consistent evmPC
+	// across rebuilds, preventing infinite loops in CFG generation.
+	savedEVMBuildPC := currentEVMBuildPC
+	savedEVMBuildOp := currentEVMBuildOp
+	// Use block's firstPC as stable evmPC for all PHIs in this block
+	currentEVMBuildPC = curBB.firstPC
+	currentEVMBuildOp = 0 // Sentinel value for PHI context
 
 	// If this block begins at a JUMPDEST, emit the MirJUMPDEST first, then place PHIs after it.
 	// This preserves the invariant that PHIs do not precede JUMPDEST and avoids PHI-only blocks.
@@ -642,6 +729,11 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 		depth = valueStack.size()
 		depthKnown = true
 	}
+
+	// Restore EVM build context after PHI/JUMPDEST handling
+	currentEVMBuildPC = savedEVMBuildPC
+	currentEVMBuildOp = savedEVMBuildOp
+
 	if i == 5352 || i == 5375 || i == 5830 {
 		log.Warn("==buildBasicBlock== MIR build", "bb", curBB.blockNum, "pc", i, "valueStack", valueStack)
 	}

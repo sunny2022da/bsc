@@ -2073,3 +2073,166 @@ func TestUSDC_BSC_Proxy_Parity_NoArgs(t *testing.T) {
 		}
 	}
 }
+
+// BenchmarkMIRVsEVM_USDT_Warmup is the same as BenchmarkMIRVsEVM_USDT but with warmup call before ResetTimer
+func BenchmarkMIRVsEVM_USDT_Warmup(b *testing.B) {
+	// Base and MIR configs
+	cfgBase := &runtime.Config{ChainConfig: params.MainnetChainConfig, GasLimit: 10_000_000, Origin: common.Address{}, BlockNumber: big.NewInt(1), Value: big.NewInt(0), EVMConfig: vm.Config{EnableOpcodeOptimizations: false}}
+	cfgMIR := &runtime.Config{ChainConfig: params.MainnetChainConfig, GasLimit: 10_000_000, Origin: common.Address{}, BlockNumber: big.NewInt(1), Value: big.NewInt(0), EVMConfig: vm.Config{EnableOpcodeOptimizations: true, EnableMIR: true, EnableMIRInitcode: true}}
+	compiler.EnableOpcodeParse()
+
+	// decode bytecode
+	realCode, err := hex.DecodeString(usdtHex[2:])
+	if err != nil {
+		b.Fatalf("decode USDT hex: %v", err)
+	}
+
+	zeroAddress := make([]byte, 32)
+	oneUint := make([]byte, 32)
+	oneUint[31] = 1
+	anotherAddress := make([]byte, 32)
+	anotherAddress[31] = 0x01
+
+	methods := []struct {
+		name     string
+		selector []byte
+		args     [][]byte
+	}{
+		{"name", []byte{0x06, 0xfd, 0xde, 0x03}, nil},
+		{"symbol", []byte{0x95, 0xd8, 0x9b, 0x41}, nil},
+		{"decimals", []byte{0x31, 0x3c, 0xe5, 0x67}, nil},
+		{"totalSupply", []byte{0x18, 0x16, 0x0d, 0xdd}, nil},
+		{"balanceOf", []byte{0x70, 0xa0, 0x82, 0x31}, [][]byte{zeroAddress}},
+		{"allowance", []byte{0x39, 0x50, 0x93, 0x51}, [][]byte{zeroAddress, zeroAddress}},
+		{"approve", []byte{0x09, 0x5e, 0xa7, 0xb3}, [][]byte{zeroAddress, oneUint}},
+		{"transfer", []byte{0xa9, 0x05, 0x9c, 0xbb}, [][]byte{zeroAddress, oneUint}},
+		{"transferFrom", []byte{0x23, 0xb8, 0x72, 0xdd}, [][]byte{zeroAddress, anotherAddress, oneUint}},
+		{"allowance_std", []byte{0xdd, 0x62, 0xed, 0x3e}, [][]byte{zeroAddress, anotherAddress}},
+	}
+
+	for _, m := range methods {
+		input := append([]byte{}, m.selector...)
+		for _, arg := range m.args {
+			input = append(input, arg...)
+		}
+
+		b.Run("EVM_Base_"+m.name, func(b *testing.B) {
+			if cfgBase.State == nil {
+				cfgBase.State, _ = state.New(types.EmptyRootHash, state.NewDatabaseForTesting())
+			}
+			evm := runtime.NewEnv(cfgBase)
+			address := common.BytesToAddress([]byte("contract_usdt"))
+			sender := vm.AccountRef(cfgBase.Origin)
+			evm.StateDB.CreateAccount(address)
+			evm.StateDB.SetCode(address, realCode)
+
+			// Warmup call (not counted)
+			_, _, _ = evm.Call(sender, address, input, cfgBase.GasLimit, uint256.MustFromBig(cfgBase.Value))
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				_, _, _ = evm.Call(sender, address, input, cfgBase.GasLimit, uint256.MustFromBig(cfgBase.Value))
+			}
+		})
+
+		b.Run("MIR_Interpreter_"+m.name, func(b *testing.B) {
+			if cfgMIR.State == nil {
+				cfgMIR.State, _ = state.New(types.EmptyRootHash, state.NewDatabaseForTesting())
+			}
+			evm := runtime.NewEnv(cfgMIR)
+			address := common.BytesToAddress([]byte("contract_usdt"))
+			sender := vm.AccountRef(cfgMIR.Origin)
+			evm.StateDB.CreateAccount(address)
+			evm.StateDB.SetCode(address, realCode)
+
+			// Warmup call (not counted) - for MIR this will compile CFG and cache it
+			_, _, _ = evm.Call(sender, address, input, cfgMIR.GasLimit, uint256.MustFromBig(cfgMIR.Value))
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				_, _, _ = evm.Call(sender, address, input, cfgMIR.GasLimit, uint256.MustFromBig(cfgMIR.Value))
+			}
+		})
+	}
+}
+
+// BenchmarkMIRVsEVM_WBNB_Warmup is the same as BenchmarkMIRVsEVM_WBNB but with warmup call before ResetTimer
+func BenchmarkMIRVsEVM_WBNB_Warmup(b *testing.B) {
+	cfgBase := &runtime.Config{ChainConfig: params.MainnetChainConfig, GasLimit: 10_000_000, Origin: common.Address{}, BlockNumber: big.NewInt(1), Value: big.NewInt(0), EVMConfig: vm.Config{EnableOpcodeOptimizations: false}}
+	cfgMIR := &runtime.Config{ChainConfig: params.MainnetChainConfig, GasLimit: 10_000_000, Origin: common.Address{}, BlockNumber: big.NewInt(1), Value: big.NewInt(0), EVMConfig: vm.Config{EnableOpcodeOptimizations: true, EnableMIR: true, EnableMIRInitcode: true}}
+	compiler.EnableOpcodeParse()
+
+	code, err := hex.DecodeString(wbnbHex[2:])
+	if err != nil {
+		b.Fatalf("decode WBNB hex: %v", err)
+	}
+	zeroAddress := make([]byte, 32)
+	oneUint := make([]byte, 32)
+	oneUint[31] = 1
+	anotherAddress := make([]byte, 32)
+	anotherAddress[31] = 0x01
+
+	methods := []struct {
+		name     string
+		selector []byte
+		args     [][]byte
+	}{
+		{"name", []byte{0x06, 0xfd, 0xde, 0x03}, nil},
+		{"symbol", []byte{0x95, 0xd8, 0x9b, 0x41}, nil},
+		{"decimals", []byte{0x31, 0x3c, 0xe5, 0x67}, nil},
+		{"totalSupply", []byte{0x18, 0x16, 0x0d, 0xdd}, nil},
+		{"balanceOf", []byte{0x70, 0xa0, 0x82, 0x31}, [][]byte{zeroAddress}},
+		{"deposit", []byte{0xd0, 0xe3, 0x0d, 0xb0}, nil},
+		{"withdraw", []byte{0x2e, 0x1a, 0x7d, 0x4d}, [][]byte{oneUint}},
+		{"transfer", []byte{0xa9, 0x05, 0x9c, 0xbb}, [][]byte{zeroAddress, oneUint}},
+	}
+
+	for _, m := range methods {
+		input := append([]byte{}, m.selector...)
+		for _, arg := range m.args {
+			input = append(input, arg...)
+		}
+
+		b.Run("EVM_Base_"+m.name, func(b *testing.B) {
+			if cfgBase.State == nil {
+				cfgBase.State, _ = state.New(types.EmptyRootHash, state.NewDatabaseForTesting())
+			}
+			evm := runtime.NewEnv(cfgBase)
+			address := common.BytesToAddress([]byte("contract_wbnb"))
+			sender := vm.AccountRef(cfgBase.Origin)
+			evm.StateDB.CreateAccount(address)
+			evm.StateDB.SetCode(address, code)
+
+			// Warmup call (not counted)
+			_, _, _ = evm.Call(sender, address, input, cfgBase.GasLimit, uint256.MustFromBig(cfgBase.Value))
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				_, _, _ = evm.Call(sender, address, input, cfgBase.GasLimit, uint256.MustFromBig(cfgBase.Value))
+			}
+		})
+
+		b.Run("MIR_Interpreter_"+m.name, func(b *testing.B) {
+			if cfgMIR.State == nil {
+				cfgMIR.State, _ = state.New(types.EmptyRootHash, state.NewDatabaseForTesting())
+			}
+			evm := runtime.NewEnv(cfgMIR)
+			address := common.BytesToAddress([]byte("contract_wbnb"))
+			sender := vm.AccountRef(cfgMIR.Origin)
+			evm.StateDB.CreateAccount(address)
+			evm.StateDB.SetCode(address, code)
+
+			// Warmup call (not counted) - for MIR this will compile CFG and cache it
+			_, _, _ = evm.Call(sender, address, input, cfgMIR.GasLimit, uint256.MustFromBig(cfgMIR.Value))
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				_, _, _ = evm.Call(sender, address, input, cfgMIR.GasLimit, uint256.MustFromBig(cfgMIR.Value))
+			}
+		})
+	}
+}

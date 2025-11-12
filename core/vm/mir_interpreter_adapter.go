@@ -118,11 +118,19 @@ func NewMIRInterpreterAdapter(evm *EVM) *MIRInterpreterAdapter {
 // Run executes the contract using MIR interpreter
 // This method should match the signature of EVMInterpreter.Run
 func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, readOnly bool) (ret []byte, err error) {
+	log.Warn("MIRAdapter.Run called", "has_mir", contract.HasMIRCode(), "addr", contract.Address().Hex()[:10])
 	// Check if we have MIR-optimized code
 	if !contract.HasMIRCode() {
+		// In strict mode, reject contracts without MIR CFG instead of falling back
+		if adapter.evm.Config.MIRStrictNoFallback {
+			log.Error("MIR strict mode: No MIR CFG available, refusing to fall back to EVM", "addr", contract.Address().Hex()[:10])
+			return nil, fmt.Errorf("MIR strict mode: contract has no MIR CFG")
+		}
+		log.Warn("MIRAdapter: No MIR CFG, falling back to EVM", "addr", contract.Address().Hex()[:10])
 		// Fallback to regular EVM interpreter
 		return adapter.evm.Interpreter().Run(contract, input, readOnly)
 	}
+	log.Warn("MIRAdapter: Has MIR CFG, proceeding with MIR execution", "addr", contract.Address().Hex()[:10])
 
 	// Pre-flight fork gating: if the bytecode contains opcodes not enabled at the current fork,
 	// mirror EVM behavior by returning invalid opcode errors instead of running MIR.
@@ -138,6 +146,11 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 	cfgInterface := contract.GetMIRCFG()
 	cfg, ok := cfgInterface.(*compiler.CFG)
 	if !ok || cfg == nil {
+		// In strict mode, reject invalid CFG instead of falling back
+		if adapter.evm.Config.MIRStrictNoFallback {
+			log.Error("MIR strict mode: invalid CFG, refusing to fall back to EVM", "addr", contract.Address(), "codehash", contract.CodeHash)
+			return nil, fmt.Errorf("MIR strict mode: invalid or nil CFG")
+		}
 		// Fallback if no valid MIR CFG available
 		log.Error("MIR fallback: invalid CFG, using EVM interpreter", "addr", contract.Address(), "codehash", contract.CodeHash)
 		return adapter.evm.Interpreter().Run(contract, input, readOnly)
@@ -192,10 +205,8 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 		// Determine originating EVM opcode for this MIR
 		evmOp := OpCode(ctx.EvmOp)
 		// Emit tracer OnOpcode before charging to maintain step-count parity
-		if adapter.evm != nil && adapter.evm.Config.Tracer != nil && adapter.evm.Config.Tracer.OnOpcode != nil {
-			scope := &ScopeContext{Memory: adapter.memShadow, Stack: nil, Contract: contract}
-			adapter.evm.Config.Tracer.OnOpcode(uint64(ctx.M.EvmPC()), byte(evmOp), contract.Gas, 0, scope, nil, adapter.evm.depth, nil)
-		}
+		// Record gas before operation for tracer
+		gasBeforeOp := contract.Gas
 		// Charge per-op constant gas for the originating EVM opcode, but skip PHI (compiler artifact)
 		if ctx.M.Op() != compiler.MirPHI {
 			if adapter.table != nil && (*adapter.table)[evmOp] != nil {
@@ -288,10 +299,10 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 					}
 					return err
 				}
-			if contract.Gas < gas {
-				return ErrOutOfGas
-			}
-			contract.Gas -= gas
+				if contract.Gas < gas {
+					return ErrOutOfGas
+				}
+				contract.Gas -= gas
 				// CREATE2: Always charge Keccak256WordGas for salt hashing (Constantinople feature)
 				if evmOp == CREATE2 {
 					if len(ctx.Operands) >= 3 {
@@ -586,6 +597,15 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 		if mirGasProbe != nil {
 			mirGasProbe(uint64(ctx.M.EvmPC()), ctx.EvmOp, contract.Gas)
 		}
+
+		// Call OnOpcode tracer after gas deduction (to report accurate cost)
+		if adapter.evm != nil && adapter.evm.Config.Tracer != nil && adapter.evm.Config.Tracer.OnOpcode != nil {
+			// Calculate the actual cost: gasBeforeOp - gasAfterOp
+			gasCost := gasBeforeOp - contract.Gas
+			scope := &ScopeContext{Memory: adapter.memShadow, Stack: nil, Contract: contract}
+			adapter.evm.Config.Tracer.OnOpcode(uint64(ctx.M.EvmPC()), byte(evmOp), gasBeforeOp, gasCost, scope, nil, adapter.evm.depth, nil)
+		}
+
 		return nil
 	}
 	// Save current beforeOp hook to restore after this execution
