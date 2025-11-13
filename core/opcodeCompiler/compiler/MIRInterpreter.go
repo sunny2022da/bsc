@@ -559,6 +559,13 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 		ctx.Length = 0
 		ctx.IsBlockEntry = true
 		ctx.Block = it.currentBB
+		// For SELFDESTRUCT at block entry, evaluate operand for gas calculation
+		if m.op == MirSELFDESTRUCT && len(m.oprands) > 0 {
+			v := it.evalValue(m.oprands[0])
+			it.preOpVals[0].Set(v)
+			it.preOpOps[0] = &it.preOpVals[0]
+			ctx.Operands = it.preOpOps[:1]
+		}
 		// Call hook for block entry gas charging (even for NOPs)
 		if err := it.beforeOp(ctx); err != nil {
 			return err
@@ -606,6 +613,14 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 			} else {
 				ctx.Operands = it.preOpOps[:nWanted]
 			}
+		}
+		// Ensure SELFDESTRUCT has its operand evaluated for gas calculation
+		if m.op == MirSELFDESTRUCT && len(m.oprands) > 0 {
+			// Always evaluate SELFDESTRUCT operand for gas calculation, even if it was evaluated above
+			v := it.evalValue(m.oprands[0])
+			it.preOpVals[0].Set(v)
+			it.preOpOps[0] = &it.preOpVals[0]
+			ctx.Operands = it.preOpOps[:1]
 		}
 		// Compute a requested memory size for common memory-affecting ops
 		switch m.op {

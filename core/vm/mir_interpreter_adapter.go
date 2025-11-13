@@ -652,8 +652,25 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 		if ctx == nil || ctx.M == nil {
 			return nil
 		}
-		// Removed block-entry eliminated-op precharge; per-op accounting will be done via emitted MIR (including NOPs for PUSH)
-		// Charge constant gas for this emitted opcode
+		// On block entry, charge constant gas for all EVM opcodes in the block
+		// (including PUSH/DUP/SWAP that don't have MIR instructions)
+		if ctx.IsBlockEntry && ctx.Block != nil {
+			if counts := ctx.Block.EVMOpCounts(); counts != nil {
+				for opb, cnt := range counts {
+					if cnt == 0 {
+						continue
+					}
+					jt := (*adapter.table)[OpCode(opb)]
+					if jt != nil && jt.constantGas > 0 {
+						total := jt.constantGas * uint64(cnt)
+						if contract.Gas < total {
+							return ErrOutOfGas
+						}
+						contract.Gas -= total
+					}
+				}
+			}
+		}
 		// Determine originating EVM opcode for this MIR
 		evmOp := OpCode(ctx.EvmOp)
 		// Emit tracer OnOpcode before charging to maintain step-count parity
@@ -661,18 +678,8 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 			scope := &ScopeContext{Memory: adapter.memShadow, Stack: nil, Contract: contract}
 			adapter.evm.Config.Tracer.OnOpcode(uint64(ctx.M.EvmPC()), byte(evmOp), contract.Gas, 0, scope, nil, adapter.evm.depth, nil)
 		}
-		// Charge per-op constant gas for the originating EVM opcode, but skip PHI (compiler artifact)
-		if ctx.M.Op() != compiler.MirPHI {
-			if adapter.table != nil && (*adapter.table)[evmOp] != nil {
-				constGas := (*adapter.table)[evmOp].constantGas
-				if constGas > 0 {
-					if contract.Gas < constGas {
-						return ErrOutOfGas
-					}
-					contract.Gas -= constGas
-				}
-			}
-		}
+		// Constant gas is charged at block entry, so we don't charge it per instruction
+		// Dynamic gas will still be charged per instruction in the switch statement below
 		// Dynamic gas metering
 		// Ensure shadow memory reflects prior expansions
 		if adapter.memShadow == nil {
