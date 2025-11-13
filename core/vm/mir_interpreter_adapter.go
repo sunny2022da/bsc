@@ -106,19 +106,35 @@ func NewMIRInterpreterAdapter(evm *EVM) *MIRInterpreterAdapter {
 		}
 		// The following body mirrors the per-run innerHook logic
 		evmOp := OpCode(ctx.EvmOp)
-		if adapter.evm != nil && adapter.evm.Config.Tracer != nil && adapter.evm.Config.Tracer.OnOpcode != nil && ctx.IsBlockEntry {
-			scope := &ScopeContext{Memory: adapter.memShadow, Stack: nil, Contract: contract}
-			adapter.evm.Config.Tracer.OnOpcode(uint64(ctx.M.EvmPC()), byte(evmOp), contract.Gas, 0, scope, nil, adapter.evm.depth, nil)
-		}
-		if ctx.M.Op() != compiler.MirPHI {
-			jt := (*adapter.table)[evmOp]
-			if jt != nil && jt.constantGas > 0 {
-				if contract.Gas < jt.constantGas {
-					return ErrOutOfGas
-				}
-				contract.Gas -= jt.constantGas
+		// Call EVM tracer for all MIR instructions that correspond to EVM opcodes (not PHI, not NOP)
+		if adapter.evm != nil && adapter.evm.Config.Tracer != nil && adapter.evm.Config.Tracer.OnOpcode != nil {
+			// Only trace actual EVM opcodes, not internal MIR operations like PHI
+			if ctx.M.Op() != compiler.MirPHI && ctx.M.Op() != compiler.MirNOP {
+				scope := &ScopeContext{Memory: adapter.memShadow, Stack: nil, Contract: contract}
+				adapter.evm.Config.Tracer.OnOpcode(uint64(ctx.M.EvmPC()), byte(evmOp), contract.Gas, 0, scope, nil, adapter.evm.depth, nil)
 			}
 		}
+		// On block entry, charge constant gas for all EVM opcodes in the block
+		// (including PUSH/DUP/SWAP that don't have MIR instructions)
+		if ctx.IsBlockEntry && ctx.Block != nil {
+			if counts := ctx.Block.EVMOpCounts(); counts != nil {
+				for opb, cnt := range counts {
+					if cnt == 0 {
+						continue
+					}
+					jt := (*adapter.table)[OpCode(opb)]
+					if jt != nil && jt.constantGas > 0 {
+						total := jt.constantGas * uint64(cnt)
+						if contract.Gas < total {
+							return ErrOutOfGas
+						}
+						contract.Gas -= total
+					}
+				}
+			}
+		}
+		// Constant gas is charged at block entry, so we don't charge it per instruction
+		// Dynamic gas will still be charged per instruction in the switch statement below
 		if adapter.memShadow == nil {
 			adapter.memShadow = NewMemory()
 		}

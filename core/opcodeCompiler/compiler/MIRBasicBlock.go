@@ -158,6 +158,10 @@ func (b *MIRBasicBlock) SetChildren(children []*MIRBasicBlock) {
 
 func (b *MIRBasicBlock) CreateVoidMIR(op MirOperation) (mir *MIR) {
 	mir = newVoidMIR(op)
+	// Do not emit runtime MIR for NOP; gas is accounted via block aggregation
+	if mir.op == MirNOP {
+		return nil
+	}
 	return b.appendMIR(mir)
 }
 
@@ -240,7 +244,10 @@ func (b *MIRBasicBlock) CreateBinOpMIR(op MirOperation, stack *ValueStack) (mir 
 		stack.push(mir.Result())
 	}
 	// If mir.op == MirNOP, doPeepHole already pushed the optimized constant to stack
-
+	if mir.op == MirNOP {
+		// Do not emit runtime MIR for NOP; gas is accounted via block aggregation
+		return nil
+	}
 	mir = b.appendMIR(mir)
 	mir.genStackDepth = stack.size()
 	// noisy generation logging removed
@@ -269,7 +276,10 @@ func (b *MIRBasicBlock) CreateTernaryOpMIR(op MirOperation, stack *ValueStack) (
 		stack.push(mir.Result())
 	}
 	// If mir.op == MirNOP, doPeepHole3Ops already pushed the optimized constant to stack
-
+	if mir.op == MirNOP {
+		// Do not emit runtime MIR for NOP; gas is accounted via block aggregation
+		return nil
+	}
 	mir = b.appendMIR(mir)
 	mir.genStackDepth = stack.size()
 	return mir
@@ -432,22 +442,16 @@ func (b *MIRBasicBlock) CreateDupMIR(n int, stack *ValueStack) *MIR {
 		// If the value to duplicate is a constant, duplicate by pushing same constant
 		optimizedValue := newValue(Konst, nil, nil, dupValue.payload)
 		stack.push(optimizedValue)
-		// Emit NOP to account for DUP base gas
-		mir := new(MIR)
-		mir.op = MirNOP
-		b.appendMIR(mir)
-		return mir
+		// No runtime MIR for DUP; gas handled via per-block opcode counts
+		return nil
 	}
 
 	// For non-constant values, perform the actual duplication on the stack
 	duplicatedValue := *dupValue // Copy the value
 	stack.push(&duplicatedValue)
 
-	// Emit NOP to account for DUP base gas
-	mir := new(MIR)
-	mir.op = MirNOP
-	b.appendMIR(mir)
-	return mir
+	// No runtime MIR for DUP; gas handled via per-block opcode counts
+	return nil
 }
 
 func (b *MIRBasicBlock) CreateSwapMIR(n int, stack *ValueStack) *MIR {
@@ -470,21 +474,15 @@ func (b *MIRBasicBlock) CreateSwapMIR(n int, stack *ValueStack) *MIR {
 		topValue.kind == Konst && swapValue.kind == Konst {
 		// Both values are constants, just swap in stack
 		stack.swap(0, n)
-		// Emit NOP to account for SWAP base gas
-		mir := new(MIR)
-		mir.op = MirNOP
-		b.appendMIR(mir)
-		return mir
+		// No runtime MIR for SWAP; gas handled via per-block opcode counts
+		return nil
 	}
 
 	// For non-constant values, perform the actual swap on the stack
 	stack.swap(0, n)
 	// Diagnostics: after swap snapshot removed
-	// Emit NOP to account for SWAP base gas
-	mir := new(MIR)
-	mir.op = MirNOP
-	b.appendMIR(mir)
-	return mir
+	// No runtime MIR for SWAP; gas handled via per-block opcode counts
+	return nil
 }
 
 // CreatePhiMIR creates a PHI node merging incoming stack values.
@@ -961,13 +959,8 @@ func (b *MIRBasicBlock) ResetForRebuild(preserveEntry bool) {
 
 func (b *MIRBasicBlock) CreatePushMIR(n int, value []byte, stack *ValueStack) *MIR {
 	stack.push(newValue(Konst, nil, nil, value))
-	// Emit a NOP to account for base gas of the PUSH opcode at runtime
-	mir := new(MIR)
-	mir.op = MirNOP
-	if mir != nil {
-		b.appendMIR(mir)
-	}
-	return mir
+	// No runtime MIR for PUSH; gas handled via per-block opcode counts
+	return nil
 }
 
 func (bb *MIRBasicBlock) GetNextOp() *MIR {

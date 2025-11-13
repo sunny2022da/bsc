@@ -502,6 +502,30 @@ var (
 )
 
 func (it *MIRInterpreter) exec(m *MIR) error {
+	// Check if this is block entry before skipping NOPs
+	isBlockEntry := m != nil && m.idx == 0
+
+	// For block entry, we need to charge gas even if the first instruction is a NOP
+	if isBlockEntry && it.beforeOp != nil {
+		ctx := &it.preOpCtx
+		ctx.M = m
+		ctx.EvmOp = m.evmOp
+		ctx.Operands = nil
+		ctx.MemorySize = 0
+		ctx.Length = 0
+		ctx.IsBlockEntry = true
+		ctx.Block = it.currentBB
+		// Call hook for block entry gas charging (even for NOPs)
+		if err := it.beforeOp(ctx); err != nil {
+			return err
+		}
+	}
+
+	// Hot skip: MirNOPs carry no semantics; avoid pre-op hook and dispatch
+	if m.op == MirNOP {
+		return nil
+	}
+
 	// Allow embedding runtimes (e.g., adapter) to run pre-op logic such as gas metering
 	if it.beforeOp != nil {
 		// Build a lightweight context with evaluated operands when useful and an estimated memory size
@@ -513,11 +537,7 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 		ctx.MemorySize = 0
 		ctx.Length = 0
 		ctx.IsBlockEntry = false
-		// Mark block entry for the first instruction in the current basic block
-		if m != nil && m.idx == 0 {
-			ctx.IsBlockEntry = true
-			ctx.Block = it.currentBB
-		}
+		// Note: Block entry already handled above for first instruction
 		// Evaluate operands into concrete values, preserving order, except for KECCAK256 (handled below)
 		if len(m.oprands) > 0 && m.op != MirKECCAK256 {
 			nWanted := len(m.oprands)
@@ -673,13 +693,6 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 	// Try fast handler if available
 	// Inline hot micro-ops to avoid function call dispatch overhead
 	switch m.op {
-	case MirNOP:
-		if it.tracerEx != nil {
-			it.tracerEx(m)
-		} else if it.tracer != nil {
-			it.tracer(m.op)
-		}
-		return nil
 	case MirADD:
 		if it.tracerEx != nil {
 			it.tracerEx(m)
@@ -723,8 +736,6 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 		it.tracer(m.op)
 	}
 	switch m.op {
-	case MirNOP:
-		return nil
 	case MirPHI:
 		// Select operand based on actual predecessor block when available; fallback to first.
 		if len(m.oprands) == 0 {
