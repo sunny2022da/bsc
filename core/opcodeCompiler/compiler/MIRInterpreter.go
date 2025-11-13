@@ -5,10 +5,11 @@ import (
 	"fmt"
 	"time"
 
+	"os"
+
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/holiman/uint256"
-	"os"
 )
 
 // Precomputed keccak256("") constant as a static array to avoid per-call allocations

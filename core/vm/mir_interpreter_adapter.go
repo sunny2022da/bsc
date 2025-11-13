@@ -753,10 +753,10 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 					}
 					return err
 				}
-			if contract.Gas < gas {
-				return ErrOutOfGas
-			}
-			contract.Gas -= gas
+				if contract.Gas < gas {
+					return ErrOutOfGas
+				}
+				contract.Gas -= gas
 				// CREATE2: Always charge Keccak256WordGas for salt hashing (Constantinople feature)
 				if evmOp == CREATE2 {
 					if len(ctx.Operands) >= 3 {
