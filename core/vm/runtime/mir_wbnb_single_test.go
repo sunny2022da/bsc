@@ -84,6 +84,17 @@ func TestWBNB_Transfer_EVMvsMIR_Debug(t *testing.T) {
 	if mir.State == nil {
 		mir.State, _ = state.New(types.EmptyRootHash, state.NewDatabaseForTesting())
 	}
+	// Attach base tracer BEFORE creating env so it takes effect
+	var baseGasSeq []uint64
+	var basePCSeq []uint64
+	var baseOpSeq []byte
+	base.EVMConfig.Tracer = &tracing.Hooks{
+		OnOpcode: func(pc uint64, op byte, gas uint64, cost uint64, scope tracing.OpContext, rData []byte, depth int, err error) {
+			baseGasSeq = append(baseGasSeq, gas)
+			basePCSeq = append(basePCSeq, pc)
+			baseOpSeq = append(baseOpSeq, op)
+		},
+	}
 	evmB := runtime.NewEnv(base)
 	evmM := runtime.NewEnv(mir)
 	evmB.StateDB.CreateAccount(address)
@@ -211,6 +222,17 @@ func TestWBNB_View_Name_EVMvsMIR_Success(t *testing.T) {
 	if mir.State == nil {
 		mir.State, _ = state.New(types.EmptyRootHash, state.NewDatabaseForTesting())
 	}
+	// Attach base tracer BEFORE creating env so it takes effect
+	var baseGasSeq []uint64
+	var basePCSeq []uint64
+	var baseOpSeq []byte
+	base.EVMConfig.Tracer = &tracing.Hooks{
+		OnOpcode: func(pc uint64, op byte, gas uint64, cost uint64, scope tracing.OpContext, rData []byte, depth int, err error) {
+			baseGasSeq = append(baseGasSeq, gas)
+			basePCSeq = append(basePCSeq, pc)
+			baseOpSeq = append(baseOpSeq, op)
+		},
+	}
 	evmB := runtime.NewEnv(base)
 	evmM := runtime.NewEnv(mir)
 	evmB.StateDB.CreateAccount(address)
@@ -292,6 +314,17 @@ func TestWBNB_Deposit_Then_Transfer_EVMvsMIR_Success(t *testing.T) {
 	}
 	if mir.State == nil {
 		mir.State, _ = state.New(types.EmptyRootHash, state.NewDatabaseForTesting())
+	}
+	// Attach base tracer BEFORE creating env so it takes effect
+	var baseGasSeq []uint64
+	var basePCSeq []uint64
+	var baseOpSeq []byte
+	base.EVMConfig.Tracer = &tracing.Hooks{
+		OnOpcode: func(pc uint64, op byte, gas uint64, cost uint64, scope tracing.OpContext, rData []byte, depth int, err error) {
+			baseGasSeq = append(baseGasSeq, gas)
+			basePCSeq = append(basePCSeq, pc)
+			baseOpSeq = append(baseOpSeq, op)
+		},
 	}
 	evmB := runtime.NewEnv(base)
 	evmM := runtime.NewEnv(mir)
@@ -482,6 +515,17 @@ func TestWBNB_Deposit_EVMvsMIR_Parity(t *testing.T) {
 	if mir.State == nil {
 		mir.State, _ = state.New(types.EmptyRootHash, state.NewDatabaseForTesting())
 	}
+	// Attach base tracer BEFORE creating env so it takes effect (for base tail capture)
+	var baseGasSeq []uint64
+	var basePCSeq []uint64
+	var baseOpSeq []byte
+	base.EVMConfig.Tracer = &tracing.Hooks{
+		OnOpcode: func(pc uint64, op byte, gas uint64, cost uint64, scope tracing.OpContext, rData []byte, depth int, err error) {
+			baseGasSeq = append(baseGasSeq, gas)
+			basePCSeq = append(basePCSeq, pc)
+			baseOpSeq = append(baseOpSeq, op)
+		},
+	}
 	evmB := runtime.NewEnv(base)
 	evmM := runtime.NewEnv(mir)
 	evmB.StateDB.CreateAccount(address)
@@ -497,13 +541,46 @@ func TestWBNB_Deposit_EVMvsMIR_Parity(t *testing.T) {
 
 	// deposit selector; value=1e18
 	depositSel := []byte{0xd0, 0xe3, 0x0d, 0xb0}
+	var mirGasSeq []uint64
+	var mirPCSeq []uint64
+	var mirOpSeq []byte
+	vm.SetMIRGasProbe(func(pc uint64, op byte, gasLeft uint64) {
+		mirGasSeq = append(mirGasSeq, gasLeft)
+		mirPCSeq = append(mirPCSeq, pc)
+		mirOpSeq = append(mirOpSeq, op)
+	})
 	retB, leftB, errB := evmB.Call(senderB, address, depositSel, base.GasLimit, uint256.MustFromBig(fund))
 	retM, leftM, errM := evmM.Call(senderM, address, depositSel, mir.GasLimit, uint256.MustFromBig(fund))
+	// reset hooks
+	vm.SetMIRGasProbe(nil)
+	base.EVMConfig.Tracer = nil
 	if errB != nil || errM != nil {
 		t.Fatalf("unexpected error base=%v mir=%v", errB, errM)
 	}
 	if leftB != leftM {
-		t.Fatalf("gas leftover mismatch base=%d mir=%d", leftB, leftM)
+		// Print concise end-of-trace to spot the delta
+		t.Logf("gas leftover mismatch base=%d mir=%d (delta=%d)", leftB, leftM, int64(leftM)-int64(leftB))
+		n := 10
+		if n > len(baseGasSeq) {
+			n = len(baseGasSeq)
+		}
+		if n > 0 {
+			t.Logf("Base last %d steps:", n)
+			for i := len(baseGasSeq) - n; i < len(baseGasSeq); i++ {
+				t.Logf("  pc=%d op=0x%02x gas(before)=%d", basePCSeq[i], baseOpSeq[i], baseGasSeq[i])
+			}
+		}
+		m := 10
+		if m > len(mirGasSeq) {
+			m = len(mirGasSeq)
+		}
+		if m > 0 {
+			t.Logf("MIR last %d steps (gas after):", m)
+			for i := len(mirGasSeq) - m; i < len(mirGasSeq); i++ {
+				t.Logf("  pc=%d op=0x%02x gas(after)=%d", mirPCSeq[i], mirOpSeq[i], mirGasSeq[i])
+			}
+		}
+		t.Fatalf("gas mismatch")
 	}
 	if string(retB) != string(retM) {
 		t.Fatalf("returndata mismatch base=%x mir=%x", retB, retM)

@@ -182,11 +182,14 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 		env.GasLeft = func() uint64 { return contract.Gas }
 	}
 
+	// Track whether previous MIR op was a jump to properly charge landing JUMPDEST once
+	var lastWasJump bool
 	// Install a pre-op hook to charge constant gas per opcode and any eliminated-op constants per block entry
 	innerHook := func(ctx *compiler.MIRPreOpContext) error {
 		if ctx == nil || ctx.M == nil {
 			return nil
 		}
+		// Remove prior block-entry JUMPDEST charging; we instead charge exactly before STOP after a jump-landing JUMPDEST.
 		// Removed block-entry eliminated-op precharge; per-op accounting will be done via emitted MIR (including NOPs for PUSH)
 		// Charge constant gas for this emitted opcode
 		// Determine originating EVM opcode for this MIR
@@ -196,7 +199,7 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 			scope := &ScopeContext{Memory: adapter.memShadow, Stack: nil, Contract: contract}
 			adapter.evm.Config.Tracer.OnOpcode(uint64(ctx.M.EvmPC()), byte(evmOp), contract.Gas, 0, scope, nil, adapter.evm.depth, nil)
 		}
-		// Charge per-op constant gas for the originating EVM opcode, but skip PHI (compiler artifact)
+		// Charge per-op constant gas for the originating EVM opcode, but skip PHI (compiler artifact).
 		if ctx.M.Op() != compiler.MirPHI {
 			if adapter.table != nil && (*adapter.table)[evmOp] != nil {
 				constGas := (*adapter.table)[evmOp].constantGas
@@ -207,7 +210,19 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 					contract.Gas -= constGas
 				}
 			}
+			// Special-case: if we just jumped and landed on a JUMPDEST immediately followed by STOP,
+			// charge the 1 gas for JUMPDEST right before executing STOP to mirror base EVM ordering.
+			if evmOp == STOP && lastWasJump && ctx.Block != nil && len(contract.Code) > int(ctx.Block.FirstPC()) {
+				if OpCode(contract.Code[ctx.Block.FirstPC()]) == JUMPDEST {
+					if contract.Gas < params.JumpdestGas {
+						return ErrOutOfGas
+					}
+					contract.Gas -= params.JumpdestGas
+				}
+			}
 		}
+		// Update jump flag after charging
+		lastWasJump = (evmOp == JUMP || evmOp == JUMPI)
 		// Dynamic gas metering
 		// Ensure shadow memory reflects prior expansions
 		if adapter.memShadow == nil {
