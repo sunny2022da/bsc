@@ -273,6 +273,65 @@ func BenchmarkBlockGasRate_USDT(b *testing.B) {
 	})
 }
 
+// TestBlockGasParity_USDT runs a block-like bundle of calls and asserts gas-leftover and returndata parity.
+func TestBlockGasParity_USDT(t *testing.T) {
+	// Configs
+	cfgBase := &runtime.Config{ChainConfig: params.MainnetChainConfig, GasLimit: 15_000_000, Origin: common.Address{}, BlockNumber: big.NewInt(1), Value: big.NewInt(0), EVMConfig: vm.Config{EnableOpcodeOptimizations: false}}
+	cfgMIR := &runtime.Config{ChainConfig: params.MainnetChainConfig, GasLimit: 15_000_000, Origin: common.Address{}, BlockNumber: big.NewInt(1), Value: big.NewInt(0), EVMConfig: vm.Config{EnableOpcodeOptimizations: true, EnableMIR: true, EnableMIRInitcode: true}}
+	compiler.EnableOpcodeParse()
+
+	// Decode code
+	code, err := hex.DecodeString(usdtHex[2:])
+	if err != nil {
+		t.Fatalf("decode USDT hex: %v", err)
+	}
+	// Build a small 'block' of calls
+	zeroAddress := make([]byte, 32)
+	oneUint := make([]byte, 32)
+	oneUint[31] = 1
+	inputs := [][]byte{
+		append([]byte{0x09, 0x5e, 0xa7, 0xb3}, append(append([]byte{}, zeroAddress...), oneUint...)...), // approve
+		append([]byte{0xa9, 0x05, 0x9c, 0xbb}, append([]byte{}, zeroAddress...)...),                     // transfer
+	}
+	// Envs and code install
+	if cfgBase.State == nil {
+		cfgBase.State, _ = state.New(types.EmptyRootHash, state.NewDatabaseForTesting())
+	}
+	if cfgMIR.State == nil {
+		cfgMIR.State, _ = state.New(types.EmptyRootHash, state.NewDatabaseForTesting())
+	}
+	evmB := runtime.NewEnv(cfgBase)
+	evmM := runtime.NewEnv(cfgMIR)
+	addr := common.BytesToAddress([]byte("contract_usdt_parity"))
+	evmB.StateDB.CreateAccount(addr)
+	evmM.StateDB.CreateAccount(addr)
+	evmB.StateDB.SetCode(addr, code)
+	evmM.StateDB.SetCode(addr, code)
+	senderB := vm.AccountRef(cfgBase.Origin)
+	senderM := vm.AccountRef(cfgMIR.Origin)
+
+	var usedB, usedM uint64
+	for i, in := range inputs {
+		retB, leftB, errB := evmB.Call(senderB, addr, in, cfgBase.GasLimit, uint256.MustFromBig(cfgBase.Value))
+		retM, leftM, errM := evmM.Call(senderM, addr, in, cfgMIR.GasLimit, uint256.MustFromBig(cfgMIR.Value))
+		if (errB != nil) != (errM != nil) {
+			t.Fatalf("err mismatch at idx=%d base=%v mir=%v", i, errB, errM)
+		}
+		if leftB != leftM {
+			t.Fatalf("gas leftover mismatch at idx=%d base=%d mir=%d", i, leftB, leftM)
+		}
+		if errB == nil && string(retB) != string(retM) {
+			t.Fatalf("returndata mismatch at idx=%d base=%x mir=%x", i, retB, retM)
+		}
+		usedB += cfgBase.GasLimit - leftB
+		usedM += cfgMIR.GasLimit - leftM
+	}
+	if usedB != usedM {
+		t.Fatalf("total gas used mismatch base=%d mir=%d", usedB, usedM)
+	}
+	t.Logf("parity OK: total gas used %d, calls=%d", usedB, len(inputs))
+}
+
 // TestCountUSDTMIR generates MIR CFG for the USDT bytecode and reports total MIR instructions
 func TestCountUSDTMIR(t *testing.T) {
 	// Decode USDT bytecode
