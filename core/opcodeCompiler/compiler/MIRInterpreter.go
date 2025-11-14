@@ -566,6 +566,15 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 			it.preOpOps[0] = &it.preOpVals[0]
 			ctx.Operands = it.preOpOps[:1]
 		}
+		// For EXP at block entry, evaluate operands for gas calculation
+		if m.op == MirEXP && len(m.oprands) >= 2 {
+			for i := 0; i < 2 && i < len(m.oprands); i++ {
+				v := it.evalValue(m.oprands[i])
+				it.preOpVals[i].Set(v)
+				it.preOpOps[i] = &it.preOpVals[i]
+			}
+			ctx.Operands = it.preOpOps[:2]
+		}
 		// Call hook for block entry gas charging (even for NOPs)
 		if err := it.beforeOp(ctx); err != nil {
 			return err
@@ -622,6 +631,16 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 			it.preOpOps[0] = &it.preOpVals[0]
 			ctx.Operands = it.preOpOps[:1]
 		}
+		// Ensure EXP has its operands evaluated for gas calculation
+		if m.op == MirEXP && len(m.oprands) >= 2 {
+			// Always evaluate EXP operands for gas calculation
+			for i := 0; i < 2 && i < len(m.oprands); i++ {
+				v := it.evalValue(m.oprands[i])
+				it.preOpVals[i].Set(v)
+				it.preOpOps[i] = &it.preOpVals[i]
+			}
+			ctx.Operands = it.preOpOps[:2]
+		}
 		// Compute a requested memory size for common memory-affecting ops
 		switch m.op {
 		case MirMLOAD:
@@ -677,6 +696,8 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 				ln := vln.Uint64()
 				ctx.MemorySize = off + ln
 				ctx.Length = ln
+				// Set ctx.Operands for gas calculation
+				ctx.Operands = it.preOpOps[:2]
 			}
 		case MirRETURN, MirREVERT:
 			if len(ctx.Operands) >= 2 {

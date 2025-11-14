@@ -1,0 +1,366 @@
+diff --git a/core/opcodeCompiler/compiler/MIRBasicBlock.go b/core/opcodeCompiler/compiler/MIRBasicBlock.go
+index b0f078b53..923a5b53f 100644
+--- a/core/opcodeCompiler/compiler/MIRBasicBlock.go
++++ b/core/opcodeCompiler/compiler/MIRBasicBlock.go
+@@ -707,8 +707,9 @@ func (b *MIRBasicBlock) CreateStorageOpMIR(op MirOperation, stack *ValueStack, a
+ 		}
+ 		mir.oprands = []*Value{&key}
+ 	case MirTSTORE:
+-		value := stack.pop()
++		// EVM pops: loc (key) (top), val
+ 		key := stack.pop()
++		value := stack.pop()
+ 		if accessor != nil {
+ 			accessor.recordStateStore(key, value)
+ 		}
+@@ -770,11 +771,11 @@ func (b *MIRBasicBlock) CreateBlockInfoMIR(op MirOperation, stack *ValueStack) *
+ 		mir.oprands = []*Value{&addr}
+ 
+ 	case MirEXTCODECOPY:
+-		// pops: address, dest, offset, size
+-		size := stack.pop()
+-		offset := stack.pop()
+-		dest := stack.pop()
++		// pops (EVM order): address (top), memOffset, codeOffset, length
+ 		addr := stack.pop()
++		dest := stack.pop()
++		offset := stack.pop()
++		size := stack.pop()
+ 		mir.oprands = []*Value{&addr, &dest, &offset, &size}
+ 
+ 	case MirRETURNDATACOPY:
+@@ -799,10 +800,10 @@ func (b *MIRBasicBlock) CreateBlockInfoMIR(op MirOperation, stack *ValueStack) *
+ 		// Immediate-indexed load in EOF; not modeled via stack here
+ 
+ 	case MirDATACOPY:
+-		// pops: dest, offset, size
+-		size := stack.pop()
+-		offset := stack.pop()
++		// pops (EVM order): dest (top), offset, size
+ 		dest := stack.pop()
++		offset := stack.pop()
++		size := stack.pop()
+ 		mir.oprands = []*Value{&dest, &offset, &size}
+ 
+ 	case MirRETURNDATALOAD:
+diff --git a/core/opcodeCompiler/compiler/MIRInterpreter.go b/core/opcodeCompiler/compiler/MIRInterpreter.go
+index 33cd945af..182914514 100644
+--- a/core/opcodeCompiler/compiler/MIRInterpreter.go
++++ b/core/opcodeCompiler/compiler/MIRInterpreter.go
+@@ -190,6 +190,7 @@ func init() {
+ 	mirHandlers[byte(MirISZERO)] = mirHandleISZERO
+ 	mirHandlers[byte(MirNOT)] = mirHandleNOT
+ 	mirHandlers[byte(MirBYTE)] = mirHandleBYTE
++	mirHandlers[byte(MirREVERT)] = mirHandleREVERT
+ }
+ 
+ func NewMIRInterpreter(env *MIRExecutionEnv) *MIRInterpreter {
+@@ -349,6 +350,9 @@ func (it *MIRInterpreter) RunMIR(block *MIRBasicBlock) ([]byte, error) {
+ 				return it.returndata, nil
+ 			case errREVERT:
+ 				return it.returndata, err
++			case ErrMIRFallback:
++				// Propagate fallback request to adapter
++				return nil, err
+ 			default:
+ 				mirDebugWarn("RunMIR return nil", "err", err)
+ 				return nil, err
+@@ -484,6 +488,9 @@ func (it *MIRInterpreter) RunCFGWithResolver(cfg *CFG, entry *MIRBasicBlock) ([]
+ 			return it.returndata, nil
+ 		case errREVERT:
+ 			return it.returndata, err
++		case ErrMIRFallback:
++			// Propagate fallback request to adapter
++			return nil, err
+ 		default:
+ 			return nil, err
+ 		}
+@@ -760,9 +767,23 @@ func (it *MIRInterpreter) exec(m *MIR) error {
+ 		return errRETURN
+ 	}
+ 	if h := mirHandlers[byte(m.op)]; h != nil {
+-		return h(it, m)
++		if it.tracerEx != nil {
++			it.tracerEx(m)
++		} else if it.tracer != nil {
++			it.tracer(m.op)
++		}
++		var start time.Time
++		if mirExecTimingHook != nil {
++			start = time.Now()
++		}
++		err := h(it, m)
++		if mirExecTimingHook != nil {
++			mirExecTimingHook(m.op, uint64(m.EvmPC()), time.Since(start))
++		}
++		return err
+ 	}
+-	return fmt.Errorf("MIR op not implemented: 0x%x", byte(m.op))
++	// Operation not implemented - request fallback to EVM
++	return ErrMIRFallback
+ }
+ 
+ // Fast handlers
+@@ -790,6 +811,29 @@ func mirHandleRETURN(it *MIRInterpreter, m *MIR) error {
+ 	return errRETURN
+ }
+ 
++func mirHandleREVERT(it *MIRInterpreter, m *MIR) error {
++	if !it.env.IsByzantium {
++		return fmt.Errorf("invalid opcode: REVERT")
++	}
++	if len(m.oprands) < 2 {
++		return fmt.Errorf("REVERT missing operands")
++	}
++	var off, sz *uint256.Int
++	if it.preOpOps[0] != nil {
++		off = it.preOpOps[0]
++	} else {
++		off = it.evalValue(m.oprands[0])
++	}
++	if len(it.preOpOps) > 1 && it.preOpOps[1] != nil {
++		sz = it.preOpOps[1]
++	} else {
++		sz = it.evalValue(m.oprands[1])
++	}
++	// Copy revert data to returndata (same as RETURN, but returns errREVERT)
++	it.returndata = it.readMemCopy(off, sz)
++	return errREVERT
++}
++
+ func mirHandleJUMP(it *MIRInterpreter, m *MIR) error {
+ 	if it.env == nil || it.env.CheckJumpdest == nil || it.env.ResolveBB == nil {
+ 		return nil
+diff --git a/core/opcodeCompiler/compiler/opcodeParser.go b/core/opcodeCompiler/compiler/opcodeParser.go
+index b871c2241..f8c5d4d46 100644
+--- a/core/opcodeCompiler/compiler/opcodeParser.go
++++ b/core/opcodeCompiler/compiler/opcodeParser.go
+@@ -1642,10 +1642,10 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
+ 				depth = 0
+ 			}
+ 		case MCOPY:
+-			// MCOPY takes 3 operands: dest, src, length
+-			length := valueStack.pop()
+-			src := valueStack.pop()
++			// MCOPY takes 3 operands (EVM pop order): dest (top), src, length
+ 			dest := valueStack.pop()
++			src := valueStack.pop()
++			length := valueStack.pop()
+ 			mir = new(MIR)
+ 			mir.op = MirMCOPY
+ 			mir.oprands = []*Value{&dest, &src, &length}
+@@ -1701,10 +1701,10 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
+ 				depth = 0
+ 			}
+ 		case CREATE:
+-			// CREATE takes 3 operands: value, offset, size
+-			size := valueStack.pop()
+-			offset := valueStack.pop()
++			// CREATE takes 3 operands (EVM pop order): value (top), offset, size
+ 			value := valueStack.pop()
++			offset := valueStack.pop()
++			size := valueStack.pop()
+ 			mir = new(MIR)
+ 			mir.op = MirCREATE
+ 			mir.oprands = []*Value{&value, &offset, &size}
+@@ -1728,11 +1728,11 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
+ 			}
+ 			return nil
+ 		case CREATE2:
+-			// CREATE2 takes 4 operands: value, offset, size, salt
+-			salt := valueStack.pop()
+-			size := valueStack.pop()
+-			offset := valueStack.pop()
++			// CREATE2 takes 4 operands (EVM pop order): value (top), offset, size, salt
+ 			value := valueStack.pop()
++			offset := valueStack.pop()
++			size := valueStack.pop()
++			salt := valueStack.pop()
+ 			mir = new(MIR)
+ 			mir.op = MirCREATE2
+ 			mir.oprands = []*Value{&value, &offset, &size, &salt}
+@@ -1756,14 +1756,14 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
+ 			}
+ 			return nil
+ 		case CALL:
+-			// CALL takes 7 operands: gas, addr, value, inOffset, inSize, outOffset, outSize
+-			outSize := valueStack.pop()
+-			outOffset := valueStack.pop()
+-			inSize := valueStack.pop()
+-			inOffset := valueStack.pop()
+-			value := valueStack.pop()
+-			addr := valueStack.pop()
++			// CALL takes 7 operands (EVM pop order): gas (top), addr, value, inOffset, inSize, outOffset, outSize
+ 			gas := valueStack.pop()
++			addr := valueStack.pop()
++			value := valueStack.pop()
++			inOffset := valueStack.pop()
++			inSize := valueStack.pop()
++			outOffset := valueStack.pop()
++			outSize := valueStack.pop()
+ 			mir = new(MIR)
+ 			mir.op = MirCALL
+ 			mir.oprands = []*Value{&gas, &addr, &value, &inOffset, &inSize, &outOffset, &outSize}
+@@ -1788,14 +1788,14 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
+ 			}
+ 			return nil
+ 		case CALLCODE:
+-			// CALLCODE takes same operands as CALL
+-			outSize := valueStack.pop()
+-			outOffset := valueStack.pop()
+-			inSize := valueStack.pop()
+-			inOffset := valueStack.pop()
+-			value := valueStack.pop()
+-			addr := valueStack.pop()
++			// CALLCODE takes same operands as CALL (EVM pop order): gas (top), addr, value, inOffset, inSize, outOffset, outSize
+ 			gas := valueStack.pop()
++			addr := valueStack.pop()
++			value := valueStack.pop()
++			inOffset := valueStack.pop()
++			inSize := valueStack.pop()
++			outOffset := valueStack.pop()
++			outSize := valueStack.pop()
+ 			mir = new(MIR)
+ 			mir.op = MirCALLCODE
+ 			mir.oprands = []*Value{&gas, &addr, &value, &inOffset, &inSize, &outOffset, &outSize}
+@@ -1837,13 +1837,13 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
+ 			}
+ 			return nil
+ 		case DELEGATECALL:
+-			// DELEGATECALL takes 6 operands: gas, addr, inOffset, inSize, outOffset, outSize
+-			outSize := valueStack.pop()
+-			outOffset := valueStack.pop()
+-			inSize := valueStack.pop()
+-			inOffset := valueStack.pop()
+-			addr := valueStack.pop()
++			// DELEGATECALL takes 6 operands (EVM pop order): gas (top), addr, inOffset, inSize, outOffset, outSize
+ 			gas := valueStack.pop()
++			addr := valueStack.pop()
++			inOffset := valueStack.pop()
++			inSize := valueStack.pop()
++			outOffset := valueStack.pop()
++			outSize := valueStack.pop()
+ 			mir = new(MIR)
+ 			mir.op = MirDELEGATECALL
+ 			mir.oprands = []*Value{&gas, &addr, &inOffset, &inSize, &outOffset, &outSize}
+@@ -1866,13 +1866,13 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
+ 			}
+ 			return nil
+ 		case STATICCALL:
+-			// STATICCALL takes 6 operands: gas, addr, inOffset, inSize, outOffset, outSize
+-			outSize := valueStack.pop()
+-			outOffset := valueStack.pop()
+-			inSize := valueStack.pop()
+-			inOffset := valueStack.pop()
+-			addr := valueStack.pop()
++			// STATICCALL takes 6 operands (EVM pop order): gas (top), addr, inOffset, inSize, outOffset, outSize
+ 			gas := valueStack.pop()
++			addr := valueStack.pop()
++			inOffset := valueStack.pop()
++			inSize := valueStack.pop()
++			outOffset := valueStack.pop()
++			outSize := valueStack.pop()
+ 			mir = new(MIR)
+ 			mir.op = MirSTATICCALL
+ 			mir.oprands = []*Value{&gas, &addr, &inOffset, &inSize, &outOffset, &outSize}
+@@ -1967,9 +1967,9 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
+ 		case DATACOPY:
+ 			mir = curBB.CreateBlockInfoMIR(MirDATACOPY, valueStack)
+ 		case CALLF:
+-			// CALLF takes 2 operands: gas, function_id
+-			functionID := valueStack.pop()
++			// CALLF takes 2 operands (EVM pop order): gas (top), function_id
+ 			gas := valueStack.pop()
++			functionID := valueStack.pop()
+ 			mir = new(MIR)
+ 			mir.op = MirCALLF
+ 			mir.oprands = []*Value{&gas, &functionID}
+@@ -2002,11 +2002,11 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
+ 		case EXCHANGE:
+ 			mir = curBB.CreateStackOpMIR(MirEXCHANGE, valueStack)
+ 		case EOFCREATE:
+-			// EOFCREATE takes 4 operands: value, code_offset, code_size, salt
+-			salt := valueStack.pop()
+-			codeSize := valueStack.pop()
+-			codeOffset := valueStack.pop()
++			// EOFCREATE takes 4 operands (EVM pop order): value (top), code_offset, code_size, salt
+ 			value := valueStack.pop()
++			codeOffset := valueStack.pop()
++			codeSize := valueStack.pop()
++			salt := valueStack.pop()
+ 			mir = new(MIR)
+ 			mir.op = MirEOFCREATE
+ 			mir.oprands = []*Value{&value, &codeOffset, &codeSize, &salt}
+@@ -2032,14 +2032,14 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
+ 		case RETURNDATALOAD:
+ 			mir = curBB.CreateBlockInfoMIR(MirRETURNDATALOAD, valueStack)
+ 		case EXTCALL:
+-			// EXTCALL takes 7 operands: gas, addr, value, inOffset, inSize, outOffset, outSize
+-			outSize := valueStack.pop()
+-			outOffset := valueStack.pop()
+-			inSize := valueStack.pop()
+-			inOffset := valueStack.pop()
+-			value := valueStack.pop()
+-			addr := valueStack.pop()
++			// EXTCALL takes 7 operands (EVM pop order): gas (top), addr, value, inOffset, inSize, outOffset, outSize
+ 			gas := valueStack.pop()
++			addr := valueStack.pop()
++			value := valueStack.pop()
++			inOffset := valueStack.pop()
++			inSize := valueStack.pop()
++			outOffset := valueStack.pop()
++			outSize := valueStack.pop()
+ 			mir = new(MIR)
+ 			mir.op = MirEXTCALL
+ 			mir.oprands = []*Value{&gas, &addr, &value, &inOffset, &inSize, &outOffset, &outSize}
+@@ -2057,13 +2057,13 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
+ 			unprcessedBBs.Push(fallthroughBB)
+ 			return nil
+ 		case EXTDELEGATECALL:
+-			// EXTDELEGATECALL takes 6 operands: gas, addr, inOffset, inSize, outOffset, outSize
+-			outSize := valueStack.pop()
+-			outOffset := valueStack.pop()
+-			inSize := valueStack.pop()
+-			inOffset := valueStack.pop()
+-			addr := valueStack.pop()
++			// EXTDELEGATECALL takes 6 operands (EVM pop order): gas (top), addr, inOffset, inSize, outOffset, outSize
+ 			gas := valueStack.pop()
++			addr := valueStack.pop()
++			inOffset := valueStack.pop()
++			inSize := valueStack.pop()
++			outOffset := valueStack.pop()
++			outSize := valueStack.pop()
+ 			mir = new(MIR)
+ 			mir.op = MirEXTDELEGATECALL
+ 			mir.oprands = []*Value{&gas, &addr, &inOffset, &inSize, &outOffset, &outSize}
+@@ -2081,13 +2081,13 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
+ 			unprcessedBBs.Push(fallthroughBB)
+ 			return nil
+ 		case EXTSTATICCALL:
+-			// EXTSTATICCALL takes 6 operands: gas, addr, inOffset, inSize, outOffset, outSize
+-			outSize := valueStack.pop()
+-			outOffset := valueStack.pop()
+-			inSize := valueStack.pop()
+-			inOffset := valueStack.pop()
+-			addr := valueStack.pop()
++			// EXTSTATICCALL takes 6 operands (EVM pop order): gas (top), addr, inOffset, inSize, outOffset, outSize
+ 			gas := valueStack.pop()
++			addr := valueStack.pop()
++			inOffset := valueStack.pop()
++			inSize := valueStack.pop()
++			outOffset := valueStack.pop()
++			outSize := valueStack.pop()
+ 			mir = new(MIR)
+ 			mir.op = MirEXTSTATICCALL
+ 			mir.oprands = []*Value{&gas, &addr, &inOffset, &inSize, &outOffset, &outSize}
+@@ -2122,6 +2122,10 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
+ 		if mir != nil {
+ 			pcCopy := uint(i)
+ 			mir.pc = &pcCopy
++			// Append MIR instruction to block if not already appended (idx < 0 means not yet appended)
++			if mir.idx < 0 {
++				curBB.appendMIR(mir)
++			}
+ 		}
+ 
+ 		i++
