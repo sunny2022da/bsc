@@ -649,7 +649,11 @@ func (b *MIRBasicBlock) CreateStorageOpMIR(op MirOperation, stack *ValueStack, a
 		// no-op
 	}
 
-	stack.push(mir.Result())
+	// Only push for producing ops (SLOAD/TLOAD). SSTORE/TSTORE produce no stack value.
+	switch op {
+	case MirSLOAD, MirTLOAD:
+		stack.push(mir.Result())
+	}
 	mir = b.appendMIR(mir)
 	mir.genStackDepth = stack.size()
 	// noisy generation logging removed
@@ -857,8 +861,7 @@ func (b *MIRBasicBlock) CreateSystemOpMIR(op MirOperation, stack *ValueStack) *M
 			operands[i] = &val
 		}
 		mir.oprands = operands
-		
-		stack.push(mir.Result())
+		// LOGx produces no stack result in EVM semantics
 		mir = b.appendMIR(mir)
 		mir.genStackDepth = stack.size()
 		// noisy generation logging removed

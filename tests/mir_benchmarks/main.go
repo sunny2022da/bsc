@@ -3,6 +3,9 @@ package main
 import (
 	"encoding/hex"
 	"fmt"
+	"github.com/ethereum/go-ethereum/core/opcodeCompiler/compiler"
+
+	// "github.com/ethereum/go-ethereum/core/opcodeCompiler/compiler"
 	"io/ioutil"
 	"log"
 	"math/big"
@@ -13,12 +16,12 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core"
 
-	"github.com/ethereum/go-ethereum/core/opcodeCompiler/compiler"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/tracing"
 	"github.com/ethereum/go-ethereum/core/vm"
-	ethlog "github.com/ethereum/go-ethereum/log"
+
+	// ethlog "github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/triedb"
 	"github.com/holiman/uint256"
@@ -73,12 +76,8 @@ func setupBSCLogging() {
 	os.Setenv("GETH_LOG_OUTPUT", "console")
 	os.Setenv("BSC_LOG_OUTPUT", "console")
 
-	// ✅ 初始化 Go-Ethereum 日志系统（这是关键！）
-	handler := ethlog.NewTerminalHandlerWithLevel(os.Stdout, ethlog.LevelWarn, true)
-	ethlog.SetDefault(ethlog.NewLogger(handler))
-
 	fmt.Println("🔧 BSC detailed logging enabled")
-	fmt.Println("📊 Log levels: BSC=debug, ETH=debug, EVM=debug, Geth=Warn")
+	fmt.Println("📊 Log levels: BSC=debug, ETH=debug, EVM=debug")
 }
 
 // 配置50万次转账测试参数（保守版本）
@@ -124,7 +123,7 @@ func getMediumScaleConfig() (int64, uint64, uint64) {
 // 配置小规模测试参数
 func getSmallScaleConfig() (int64, uint64, uint64) {
 	// 小规模测试配置
-	numTransfers := int64(1)             // 1次转账测试
+	numTransfers := int64(50000)         // 5万次转账
 	batchGasLimit := uint64(2000000000)  // 2B gas for batch transfer
 	blockGasLimit := uint64(10000000000) // 10B gas limit for block
 
@@ -132,38 +131,24 @@ func getSmallScaleConfig() (int64, uint64, uint64) {
 }
 
 func main() {
-	// 设置3分钟timeout
-	timeout := 3 * 60 * time.Second
-	done := make(chan bool, 1)
-	
-	go func() {
-		runMainTest()
-		done <- true
-	}()
-	
-	select {
-	case <-done:
-		fmt.Println("✅ 测试完成")
-	case <-time.After(timeout):
-		fmt.Println("❌ 测试超时（3分钟），可能进入无限循环")
-		os.Exit(1)
-	}
-}
-
-func runMainTest() {
 	// 启用BSC详细日志
 	setupBSCLogging()
 
-	// 测试 BUSD
-	fmt.Printf("🔬 Testing BUSD Contract\n")
+	// 选择测试规模 - 使用50万次转账
+	// numTransfers, batchGasLimit, blockGasLimit := getSmallScaleConfig()    // 5万次转账
+	// numTransfers, batchGasLimit, blockGasLimit := getMediumScaleConfig()   // 500万次转账
+	// numTransfers, batchGasLimit, blockGasLimit := getLargeScaleConfig()    // 5000万次转账
+	numTransfers, batchGasLimit, blockGasLimit := get500KScaleConfig() // 50万次转账
+	// 如果上面的配置仍然出现gas不足，可以尝试保守配置：
+	// numTransfers, batchGasLimit, blockGasLimit := get500KScaleConfigConservative() // 50万次转账（保守版本）
+
+	fmt.Printf("🚀 Pure BSC-EVM Benchmark - BUSD Token Individual Transfers (Scale: %d transfers)\n", numTransfers)
+	fmt.Printf("📊 Gas Configuration - Total: %d, Block: %d\n", batchGasLimit, blockGasLimit)
 
 	// Load BUSD contract bytecode
 	log.Println("📦 Loading BUSD contract bytecode...")
-	loopBytecode := loadBytecode("busd.bin")
-	log.Printf("✅ Bytecode loaded, size: %d bytes", len(loopBytecode))
-	
-	// 设置测试用的 gas 参数
-	blockGasLimit := uint64(10000000000) // 10B gas
+	busdBytecode := loadBytecode("busd.bin")
+	log.Printf("✅ Bytecode loaded, size: %d bytes", len(busdBytecode))
 
 	// Initialize EVM with BSC configuration
 	log.Println("🔧 Initializing EVM with BSC configuration...")
@@ -204,14 +189,14 @@ func runMainTest() {
 
 	vmConfig := vm.Config{
 		EnableOpcodeOptimizations: true,
-		// 启用 MIR 相关配置（已修复无限循环）
+		// ✅ 启用 MIR - 但禁用 initcode 以避免部署时卡住
 		EnableMIR:           true,
-		EnableMIRInitcode:   true,
-		MIRStrictNoFallback: true,
+		EnableMIRInitcode:   true, // ⚠️ 禁用initcode MIR，避免复杂constructor导致无限循环
+		MIRStrictNoFallback: true, // ✅ 严格模式：禁止fallback到传统EVM
 	}
-	log.Println("✅ EVM configuration created")
+	log.Println("✅ EVM configuration created (MIR enabled, StrictNoFallback=true)")
 
-	// 临时注释掉，可能导致部署卡住
+	// ⚠️ 暂时也禁用 OpcodeParse 来排查问题
 	compiler.EnableOpcodeParse()
 
 	blockContext := vm.BlockContext{
@@ -232,17 +217,11 @@ func runMainTest() {
 	evm := vm.NewEVM(blockContext, statedb, chainConfig, vmConfig)
 	log.Println("✅ EVM instance created successfully")
 
-	// Deploy SimpleLoop contract
-	fmt.Println("📦 Deploying SimpleLoop contract...")
-	log.Println("📦 Starting SimpleLoop contract deployment...")
-	deployContract(evm, loopBytecode)
-	
-	fmt.Println("✅ SimpleLoop deployment completed!")
-}
+	// Deploy BUSD contract
+	fmt.Println("📦 Deploying BUSD contract...")
+	log.Println("📦 Starting BUSD contract deployment...")
+	deployContract(evm, busdBytecode)
 
-// 以下是原BUSD测试代码（已禁用）
-/*
-func runBUSDTest() {
 	// BUSD合约构造函数已经给了Alice足够的代币，不需要再mint
 	fmt.Println("💰 BUSD contract constructor already gave tokens to Alice...")
 	log.Println("💰 BUSD contract constructor already gave tokens to Alice")
@@ -290,7 +269,6 @@ func runBUSDTest() {
 	fmt.Println("✨ BSC-EVM Benchmark completed successfully!")
 	log.Println("✨ BSC-EVM Benchmark completed successfully!")
 }
-*/
 
 func loadBytecode(path string) []byte {
 	data, err := ioutil.ReadFile(path)
@@ -314,7 +292,7 @@ func loadBytecode(path string) []byte {
 func deployContract(evm *vm.EVM, bytecode []byte) {
 	// Deploy contract with increased gas limit
 	value := uint256.NewInt(0)
-	deployGasLimit := uint64(10000000000) // 增加到10B gas (for MIR testing)
+	deployGasLimit := uint64(1000000000) // 增加到1B gas
 	fmt.Printf("🔧 Deploying contract with %d gas...\n", deployGasLimit)
 
 	ret, contractAddr, leftOverGas, err := evm.Create(aliceRef, bytecode, deployGasLimit, value)
