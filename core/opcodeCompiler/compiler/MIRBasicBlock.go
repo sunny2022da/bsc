@@ -2,7 +2,6 @@ package compiler
 
 import (
 	"github.com/ethereum/go-ethereum/crypto"
-	"github.com/ethereum/go-ethereum/log"
 	"github.com/holiman/uint256"
 )
 
@@ -175,11 +174,11 @@ func (b *MIRBasicBlock) appendMIR(mir *MIR) *MIR {
 		b.emittedOpCounts[currentEVMBuildOp]++
 	}
 	// Pre-encode operand info to avoid runtime eval costs
-	if len(mir.oprands) > 0 {
-		mir.opKinds = make([]byte, len(mir.oprands))
-		mir.opConst = make([]*uint256.Int, len(mir.oprands))
-		mir.opDefIdx = make([]int, len(mir.oprands))
-		for i, v := range mir.oprands {
+	if len(mir.operands) > 0 {
+		mir.opKinds = make([]byte, len(mir.operands))
+		mir.opConst = make([]*uint256.Int, len(mir.operands))
+		mir.opDefIdx = make([]int, len(mir.operands))
+		for i, v := range mir.operands {
 			if v == nil {
 				mir.opKinds[i] = 2
 				continue
@@ -333,7 +332,7 @@ func (b *MIRBasicBlock) CreateBinOpMIRWithMA(op MirOperation, stack *ValueStack,
 func (b *MIRBasicBlock) newMemoryLoadMIR(offset *Value, size *Value, accessor *MemoryAccessor, stack *ValueStack) *MIR {
 	mir := new(MIR)
 	mir.op = MirMLOAD
-	mir.oprands = []*Value{offset, size}
+	mir.operands = []*Value{offset, size}
 	stack.push(mir.Result())
 	mir = b.appendMIR(mir)
 	mir.genStackDepth = stack.size()
@@ -344,7 +343,7 @@ func (b *MIRBasicBlock) newMemoryLoadMIR(offset *Value, size *Value, accessor *M
 func (b *MIRBasicBlock) newKeccakMIR(data *Value, stack *ValueStack) *MIR {
 	mir := new(MIR)
 	mir.op = MirKECCAK256
-	mir.oprands = []*Value{data}
+	mir.operands = []*Value{data}
 	stack.push(mir.Result())
 	mir = b.appendMIR(mir)
 	mir.genStackDepth = stack.size()
@@ -397,7 +396,7 @@ func (b *MIRBasicBlock) CreateStackOpMIR(op MirOperation, stack *ValueStack) *MI
 		n := int(op - MirDUP1 + 1) // DUP1 = 1, DUP2 = 2, etc.
 		// Diagnostics: stack size before DUP
 		if stack.size() < n {
-			log.Warn("MIR DUP depth underflow - emitting NOP", "need", n, "have", stack.size(), "bb", b.blockNum, "bbFirst", b.firstPC)
+			parserDebugWarn("MIR DUP depth underflow - emitting NOP", "need", n, "have", stack.size(), "bb", b.blockNum, "bbFirst", b.firstPC)
 		}
 		return b.CreateDupMIR(n, stack)
 	}
@@ -407,7 +406,7 @@ func (b *MIRBasicBlock) CreateStackOpMIR(op MirOperation, stack *ValueStack) *MI
 		n := int(op - MirSWAP1 + 1) // SWAP1 = 1, SWAP2 = 2, etc.
 		// Diagnostics: stack size before SWAP
 		if stack.size() <= n {
-			log.Warn("MIR SWAP depth underflow - emitting NOP", "need", n+1, "have", stack.size(), "bb", b.blockNum, "bbFirst", b.firstPC)
+			parserDebugWarn("MIR SWAP depth underflow - emitting NOP", "need", n+1, "have", stack.size(), "bb", b.blockNum, "bbFirst", b.firstPC)
 		}
 		return b.CreateSwapMIR(n, stack)
 	}
@@ -486,7 +485,7 @@ func (b *MIRBasicBlock) CreateSwapMIR(n int, stack *ValueStack) *MIR {
 func (b *MIRBasicBlock) CreatePhiMIR(ops []*Value, stack *ValueStack) *MIR {
 	mir := new(MIR)
 	mir.op = MirPHI
-	mir.oprands = ops
+	mir.operands = ops
 	stack.push(mir.Result())
 	mir = b.appendMIR(mir)
 	mir.genStackDepth = stack.size()
@@ -582,7 +581,7 @@ func (b *MIRBasicBlock) CreateMemoryOpMIR(op MirOperation, stack *ValueStack, ac
 			}
 			accessor.recordLoad(offset, *size32)
 		}
-		mir.oprands = []*Value{&offset, size32}
+		mir.operands = []*Value{&offset, size32}
 	case MirMSTORE:
 		// pops: offset (top), value
 		offset := stack.pop()
@@ -599,7 +598,7 @@ func (b *MIRBasicBlock) CreateMemoryOpMIR(op MirOperation, stack *ValueStack, ac
 				accessor.recordStore(offset, *size32, value)
 			}
 		}
-		mir.oprands = []*Value{&offset, size32, &value}
+		mir.operands = []*Value{&offset, size32, &value}
 	case MirMSTORE8:
 		// pops: offset (top), value
 		offset := stack.pop()
@@ -616,7 +615,7 @@ func (b *MIRBasicBlock) CreateMemoryOpMIR(op MirOperation, stack *ValueStack, ac
 				accessor.recordStore(offset, *size1, value)
 			}
 		}
-		mir.oprands = []*Value{&offset, size1, &value}
+		mir.operands = []*Value{&offset, size1, &value}
 	case MirMSIZE:
 		// no memory access recorded
 	default:
@@ -646,7 +645,7 @@ func (b *MIRBasicBlock) CreateStorageOpMIR(op MirOperation, stack *ValueStack, a
 			accessor.recordStateLoad(key)
 		}
 		stack.push(mir.Result())
-		mir.oprands = []*Value{&key}
+		mir.operands = []*Value{&key}
 	case MirSSTORE:
 		// EVM pops key (top) then value
 		key := stack.pop()
@@ -654,13 +653,13 @@ func (b *MIRBasicBlock) CreateStorageOpMIR(op MirOperation, stack *ValueStack, a
 		if accessor != nil {
 			accessor.recordStateStore(key, value)
 		}
-		mir.oprands = []*Value{&key, &value}
+		mir.operands = []*Value{&key, &value}
 	case MirTLOAD:
 		key := stack.pop()
 		if accessor != nil {
 			accessor.recordStateLoad(key)
 		}
-		mir.oprands = []*Value{&key}
+		mir.operands = []*Value{&key}
 	case MirTSTORE:
 		// EVM pops key (top) then value, same as SSTORE
 		key := stack.pop()
@@ -668,7 +667,7 @@ func (b *MIRBasicBlock) CreateStorageOpMIR(op MirOperation, stack *ValueStack, a
 		if accessor != nil {
 			accessor.recordStateStore(key, value)
 		}
-		mir.oprands = []*Value{&key, &value}
+		mir.operands = []*Value{&key, &value}
 	default:
 		// no-op
 	}
@@ -699,31 +698,31 @@ func (b *MIRBasicBlock) CreateBlockInfoMIR(op MirOperation, stack *ValueStack) *
 	case MirBALANCE:
 		// pops: address
 		addr := stack.pop()
-		mir.oprands = []*Value{&addr}
+		mir.operands = []*Value{&addr}
 
 	case MirCALLDATALOAD:
 		// pops: offset
 		offset := stack.pop()
-		mir.oprands = []*Value{&offset}
+		mir.operands = []*Value{&offset}
 
 	case MirCALLDATACOPY:
 		// pops (EVM order): dest(memOffset), offset(dataOffset), size(length)
 		dest := stack.pop()
 		offset := stack.pop()
 		size := stack.pop()
-		mir.oprands = []*Value{&dest, &offset, &size}
+		mir.operands = []*Value{&dest, &offset, &size}
 
 	case MirCODECOPY:
 		// pops (EVM order): dest(memOffset), offset(codeOffset), size(length)
 		dest := stack.pop()
 		offset := stack.pop()
 		size := stack.pop()
-		mir.oprands = []*Value{&dest, &offset, &size}
+		mir.operands = []*Value{&dest, &offset, &size}
 
 	case MirEXTCODESIZE:
 		// pops: address
 		addr := stack.pop()
-		mir.oprands = []*Value{&addr}
+		mir.operands = []*Value{&addr}
 
 	case MirEXTCODECOPY:
 		// EVM stack (top to bottom): address, destOffset, offset, size
@@ -732,25 +731,25 @@ func (b *MIRBasicBlock) CreateBlockInfoMIR(op MirOperation, stack *ValueStack) *
 		dest := stack.pop()
 		offset := stack.pop()
 		size := stack.pop()
-		mir.oprands = []*Value{&addr, &dest, &offset, &size}
+		mir.operands = []*Value{&addr, &dest, &offset, &size}
 
 	case MirRETURNDATACOPY:
 		// pops (EVM order): dest(memOffset), offset(returnDataOffset), size(length)
 		dest := stack.pop()
 		offset := stack.pop()
 		size := stack.pop()
-		mir.oprands = []*Value{&dest, &offset, &size}
+		mir.operands = []*Value{&dest, &offset, &size}
 
 	case MirEXTCODEHASH:
 		// pops: address
 		addr := stack.pop()
-		mir.oprands = []*Value{&addr}
+		mir.operands = []*Value{&addr}
 
 	// EOF data operations
 	case MirDATALOAD:
 		// pops: offset
 		offset := stack.pop()
-		mir.oprands = []*Value{&offset}
+		mir.operands = []*Value{&offset}
 
 	case MirDATALOADN:
 		// Immediate-indexed load in EOF; not modeled via stack here
@@ -760,17 +759,17 @@ func (b *MIRBasicBlock) CreateBlockInfoMIR(op MirOperation, stack *ValueStack) *
 		size := stack.pop()
 		offset := stack.pop()
 		dest := stack.pop()
-		mir.oprands = []*Value{&dest, &offset, &size}
+		mir.operands = []*Value{&dest, &offset, &size}
 
 	case MirRETURNDATALOAD:
 		// pops: offset
 		offset := stack.pop()
-		mir.oprands = []*Value{&offset}
+		mir.operands = []*Value{&offset}
 
 	case MirBLOBHASH:
 		// pops: index
 		index := stack.pop()
-		mir.oprands = []*Value{&index}
+		mir.operands = []*Value{&index}
 
 	default:
 		// leave operands empty for any not explicitly handled
@@ -789,7 +788,7 @@ func (b *MIRBasicBlock) CreateBlockOpMIR(op MirOperation, stack *ValueStack) *MI
 	// Only MirBLOCKHASH consumes one stack operand (block number). Others are producers.
 	if op == MirBLOCKHASH {
 		blk := stack.pop()
-		mir.oprands = []*Value{&blk}
+		mir.operands = []*Value{&blk}
 	}
 	stack.push(mir.Result())
 	mir = b.appendMIR(mir)
@@ -819,9 +818,9 @@ func (b *MIRBasicBlock) CreateJumpMIR(op MirOperation, stack *ValueStack, bbStac
 				continue
 			}
 			if v.def != nil {
-				log.Warn("MIR JUMP stack", "bb", b.blockNum, "firstPC", b.firstPC, "idxFromTop", i, "val", v.DebugString(), "def_evm_pc", v.def.evmPC, "def_idx", v.def.idx)
+				parserDebugWarn("MIR JUMP stack", "bb", b.blockNum, "firstPC", b.firstPC, "idxFromTop", i, "val", v.DebugString(), "def_evm_pc", v.def.evmPC, "def_idx", v.def.idx)
 			} else {
-				log.Warn("MIR JUMP stack", "bb", b.blockNum, "firstPC", b.firstPC, "idxFromTop", i, "val", v.DebugString())
+				parserDebugWarn("MIR JUMP stack", "bb", b.blockNum, "firstPC", b.firstPC, "idxFromTop", i, "val", v.DebugString())
 			}
 		}
 	}
@@ -829,11 +828,11 @@ func (b *MIRBasicBlock) CreateJumpMIR(op MirOperation, stack *ValueStack, bbStac
 	switch op {
 	case MirJUMP:
 		dest := stack.pop()
-		mir.oprands = []*Value{&dest}
+		mir.operands = []*Value{&dest}
 	case MirJUMPI:
 		dest := stack.pop()
 		cond := stack.pop()
-		mir.oprands = []*Value{&dest, &cond}
+		mir.operands = []*Value{&dest, &cond}
 	default:
 		// Other jump-like ops not implemented here
 	}
@@ -865,32 +864,32 @@ func (b *MIRBasicBlock) CreateSystemOpMIR(op MirOperation, stack *ValueStack) *M
 	return mir
 }
 
-	func (b *MIRBasicBlock) CreateLogMIR(op MirOperation, stack *ValueStack) *MIR {
-		mir := new(MIR)
-		mir.op = op
-		
-		// Calculate number of topics based on LOG operation
-		numTopics := int(op - MirLOG0)
-		
-		// EVM pops in order: dataOffset, dataSize, topic1, topic2, ..., topicN
-		// (stack top has dataOffset, then dataSize, then topics)
-		// Total operands: 2 (offset+size) + numTopics
-		totalOperands := 2 + numTopics
-		
-		// Pop all values - they come in the right order!
-		operands := make([]*Value, totalOperands)
-		for i := 0; i < totalOperands; i++ {
-			val := stack.pop()
-			operands[i] = &val
-		}
-		mir.oprands = operands
-		
-		stack.push(mir.Result())
-		mir = b.appendMIR(mir)
-		mir.genStackDepth = stack.size()
-		// noisy generation logging removed
-		return mir
+func (b *MIRBasicBlock) CreateLogMIR(op MirOperation, stack *ValueStack) *MIR {
+	mir := new(MIR)
+	mir.op = op
+
+	// Calculate number of topics based on LOG operation
+	numTopics := int(op - MirLOG0)
+
+	// EVM pops in order: dataOffset, dataSize, topic1, topic2, ..., topicN
+	// (stack top has dataOffset, then dataSize, then topics)
+	// Total operands: 2 (offset+size) + numTopics
+	totalOperands := 2 + numTopics
+
+	// Pop all values - they come in the right order!
+	operands := make([]*Value, totalOperands)
+	for i := 0; i < totalOperands; i++ {
+		val := stack.pop()
+		operands[i] = &val
 	}
+	mir.operands = operands
+
+	stack.push(mir.Result())
+	mir = b.appendMIR(mir)
+	mir.genStackDepth = stack.size()
+	// noisy generation logging removed
+	return mir
+}
 
 // stacksEqual reports whether two Value slices are equal element-wise using Value semantics.
 // Constants are compared by numeric value, variables by stable def identity (op, evmPC, phiSlot).
