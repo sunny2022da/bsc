@@ -55,6 +55,68 @@ type MIRInterpreterAdapter struct {
 	currentBlock *compiler.MIRBasicBlock
 }
 
+// countOpcodesInRange counts EVM opcodes in a given PC range
+func countOpcodesInRange(code []byte, firstPC, lastPC uint) map[byte]uint32 {
+	counts := make(map[byte]uint32)
+	if code == nil || firstPC >= uint(len(code)) {
+		return counts
+	}
+	// If lastPC is 0 or invalid, find the next block boundary
+	if lastPC == 0 || lastPC <= firstPC || lastPC > uint(len(code)) {
+		// Find the next JUMPDEST or block terminator after firstPC
+		pc := firstPC
+		for pc < uint(len(code)) {
+			op := OpCode(code[pc])
+			// If we hit a JUMPDEST, this is likely the start of the next block
+			// (unless it's the first instruction, in which case it's the current block)
+			if op == JUMPDEST && pc > firstPC {
+				lastPC = pc
+				break
+			}
+			// If we hit a block terminator (other than JUMPDEST), include it and stop
+			if op == STOP || op == RETURN || op == REVERT || op == SELFDESTRUCT {
+				lastPC = pc + 1
+				break
+			}
+			// JUMP and JUMPI also terminate blocks (include them)
+			if op == JUMP || op == JUMPI {
+				lastPC = pc + 1
+				break
+			}
+			// Skip PUSH opcodes
+			if op >= PUSH1 && op <= PUSH32 {
+				pushSize := int(op - PUSH1 + 1)
+				pc += uint(pushSize) + 1
+			} else {
+				pc++
+			}
+			// Safety: if we've gone too far, use end of code
+			if pc > uint(len(code)) {
+				lastPC = uint(len(code))
+				break
+			}
+		}
+		// If we didn't find a boundary, use end of code
+		if lastPC == 0 || lastPC <= firstPC {
+			lastPC = uint(len(code))
+		}
+	}
+	pc := firstPC
+	for pc < lastPC && pc < uint(len(code)) {
+		op := OpCode(code[pc])
+		// Count the opcode
+		counts[byte(op)]++
+		// Skip PUSH opcodes (they have data bytes)
+		if op >= PUSH1 && op <= PUSH32 {
+			pushSize := int(op - PUSH1 + 1)
+			pc += uint(pushSize) + 1
+		} else {
+			pc++
+		}
+	}
+	return counts
+}
+
 // NewMIRInterpreterAdapter creates a new MIR interpreter adapter for EVM
 func NewMIRInterpreterAdapter(evm *EVM) *MIRInterpreterAdapter {
 	// Create adapter early so closures can reference cached fields
@@ -651,19 +713,42 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 
 	// Install a pre-op hook to charge constant gas per opcode and any eliminated-op constants per block entry
 	innerHook := func(ctx *compiler.MIRPreOpContext) error {
-		if ctx == nil || ctx.M == nil {
+		if ctx == nil {
 			return nil
 		}
 		// On block entry, charge constant gas for all EVM opcodes in the block
 		// (including PUSH/DUP/SWAP that don't have MIR instructions)
 		// Exception: EXP and KECCAK256 constant gas is charged per instruction (along with dynamic gas)
 		// But if EXP has no MIR instruction (optimized away), we need to charge it at block entry
+		// Allow block entry gas charging even when ctx.M == nil (for blocks with Size=0)
 		if ctx.IsBlockEntry && ctx.Block != nil {
 			// Update current block
 			adapter.currentBlock = ctx.Block
 			// Track total gas charged at block entry (for GAS opcode to add back)
 			var blockEntryTotalGas uint64
-			if counts := ctx.Block.EVMOpCounts(); counts != nil {
+			// Validate that we're only charging for the current block
+			// (ctx.Block should match the block we're entering)
+			// Charge block entry gas for all opcodes in the block
+			// Get counts from EVMOpCounts(), but validate against actual bytecode in block's PC range
+			// This fixes cases where EVMOpCounts() includes opcodes from other blocks
+			var counts map[byte]uint32
+			// Use currentContract instead of captured contract to handle nested calls correctly
+			currentContract := adapter.currentContract
+			if currentContract == nil {
+				currentContract = contract
+			}
+			if currentContract.Code != nil && ctx.Block != nil {
+				// Count opcodes directly from bytecode in the block's PC range
+				firstPC := ctx.Block.FirstPC()
+				lastPC := ctx.Block.LastPC()
+				validatedCounts := countOpcodesInRange(currentContract.Code, firstPC, lastPC)
+				// Use validated counts instead of EVMOpCounts() to ensure accuracy
+				counts = validatedCounts
+			} else {
+				// Fallback to EVMOpCounts() if we can't validate
+				counts = ctx.Block.EVMOpCounts()
+			}
+			if counts != nil {
 				// Track which opcodes have MIR instructions in this block
 				hasMIRInstruction := make(map[OpCode]bool)
 				if ctx.M != nil && ctx.M.EvmOp() != 0 {
@@ -704,8 +789,8 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 							// EXP was optimized away, but we still need to charge gas
 							// Get operands from the original bytecode to calculate dynamic gas
 							expGas := params.ExpGas // Start with constant gas
-							if contract.Code != nil {
-								code := contract.Code
+							if currentContract.Code != nil {
+								code := currentContract.Code
 								// Find EXP opcode (0x0a) in the bytecode and get its operands
 								for i := 0; i < len(code); i++ {
 									if OpCode(code[i]) == EXP {
@@ -762,10 +847,10 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 								}
 							}
 							totalGas := expGas * uint64(cnt)
-							if contract.Gas < totalGas {
+							if currentContract.Gas < totalGas {
 								return ErrOutOfGas
 							}
-							contract.Gas -= totalGas
+							currentContract.Gas -= totalGas
 							blockEntryTotalGas += totalGas
 						}
 						// Skip EXP constant gas at block entry if it has a MIR instruction (will be charged per instruction)
@@ -774,17 +859,31 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 					jt := (*adapter.table)[op]
 					if jt != nil && jt.constantGas > 0 {
 						total := jt.constantGas * uint64(cnt)
-						if contract.Gas < total {
+						// Debug: log opcodes being charged for small contracts
+						if currentContract.Code != nil && len(currentContract.Code) < 50 {
+							fmt.Printf("[DEBUG]   Charging opcode 0x%02x (%s) count=%d gas_per=%d total=%d\n",
+								byte(op), op.String(), cnt, jt.constantGas, total)
+						}
+						if currentContract.Gas < total {
 							return ErrOutOfGas
 						}
-						contract.Gas -= total
+						currentContract.Gas -= total
 						blockEntryTotalGas += total
 					}
 				}
-			}
-			// Store block entry gas charges for this block (for GAS opcode to add back)
-			if blockEntryTotalGas > 0 {
-				adapter.blockEntryGasCharges[ctx.Block] = blockEntryTotalGas
+				// Store block entry gas charges for this block (for GAS opcode to add back)
+				if blockEntryTotalGas > 0 {
+					adapter.blockEntryGasCharges[ctx.Block] = blockEntryTotalGas
+					// Debug: log block entry gas charges for loop tests
+					if ctx.Block != nil && currentContract.Code != nil && len(currentContract.Code) < 50 {
+						// Only log for small contracts (like loop tests)
+						var blockPCs string
+						if ctx.Block.FirstPC() < uint(len(currentContract.Code)) {
+							blockPCs = fmt.Sprintf("PC:%d-%d", ctx.Block.FirstPC(), ctx.Block.LastPC())
+						}
+						fmt.Printf("[DEBUG] Block entry gas: block=%s gas=%d total_remaining=%d\n", blockPCs, blockEntryTotalGas, currentContract.Gas)
+					}
+				}
 			}
 		}
 		// Determine originating EVM opcode for this MIR
@@ -1288,7 +1387,10 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 
 	// No selector: execute the first basic block only
 	bbs := cfg.GetBasicBlocks()
-	if len(bbs) > 0 && bbs[0] != nil && bbs[0].Size() > 0 {
+	// Allow blocks with Size=0 to execute if they have children (e.g., entry block with only PUSH)
+	// PUSH operations don't create MIR instructions but are handled via block-level opcode counts
+	entryBlockHasContent := len(bbs) > 0 && bbs[0] != nil && (bbs[0].Size() > 0 || len(bbs[0].Children()) > 0)
+	if entryBlockHasContent {
 		result, err := adapter.mirInterpreter.RunCFGWithResolver(cfg, bbs[0])
 		if err != nil {
 			if err == compiler.ErrMIRFallback {

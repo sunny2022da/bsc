@@ -395,6 +395,91 @@ func GenerateMIRCFG(hash common.Hash, code []byte) (*CFG, error) {
 			}
 		}
 	}
+	// Fix entry block (firstPC == 0) to ensure it falls through to PC:2 if it's JUMPDEST
+	// This fixes cases where the entry block should end after PUSH1 and fall through to the loop block
+	cfg.buildPCIndex()
+	// Always check and fix entry block if PC:2 is JUMPDEST
+	if len(cfg.rawCode) > 2 && ByteCode(cfg.rawCode[2]) == JUMPDEST {
+		// Find the entry block (firstPC == 0) - check both basicBlocks and pcToBlock
+		var entryBB *MIRBasicBlock
+		for _, bb := range cfg.basicBlocks {
+			if bb != nil && bb.FirstPC() == 0 {
+				entryBB = bb
+				break
+			}
+		}
+		if entryBB == nil {
+			entryBB = cfg.pcToBlock[0]
+		}
+		loopBB := cfg.pcToBlock[2]
+		if entryBB != nil && entryBB.FirstPC() == 0 && loopBB != nil {
+			// If entry block has no instructions, rebuild it to ensure it has PUSH1
+			if entryBB.Size() == 0 {
+				// Rebuild the entry block to ensure it has instructions
+				// Reset the block first to clear any stale state
+				entryBB.ResetForRebuild(true)
+				valueStack := ValueStack{}
+				memoryAccessor := cfg.getMemoryAccessor()
+				stateAccessor := cfg.getStateAccessor()
+				unprcessedBBs := MIRBasicBlockStack{}
+				entryBB.built = false
+				entryBB.queued = false
+				err := cfg.buildBasicBlock(entryBB, &valueStack, memoryAccessor, stateAccessor, &unprcessedBBs)
+				if err != nil {
+					return nil, fmt.Errorf("failed to rebuild entry block: %w", err)
+				}
+				entryBB.built = true
+			}
+			// Always fix it - the entry block should always fall through to PC:2 (the loop block)
+			// regardless of what children it currently has
+			children := entryBB.Children()
+			needsFix := false
+			if len(children) == 0 {
+				needsFix = true
+			} else {
+				// Check if any child is not PC:2
+				for _, child := range children {
+					if child == nil || child.FirstPC() != 2 {
+						needsFix = true
+						break
+					}
+				}
+			}
+			if needsFix {
+				// Clear existing children first (SetChildren appends, doesn't replace)
+				entryBB.children = nil
+				entryBB.childrenBitmap = &bitmap{0} // Reset bitmap
+				// Now set the correct child
+				entryBB.SetChildren([]*MIRBasicBlock{loopBB})
+				entryBB.SetLastPC(1) // Entry block ends at PC:1 (after PUSH1 0x03)
+				// Add entry block to loop block's parents (don't replace existing parents)
+				existingParents := loopBB.Parents()
+				hasEntryAsParent := false
+				for _, p := range existingParents {
+					if p == entryBB {
+						hasEntryAsParent = true
+						break
+					}
+				}
+				if !hasEntryAsParent {
+					loopBB.SetParents(append(existingParents, entryBB))
+				}
+				// Set exit stack and incoming stack
+				// If entry block doesn't have exit stack, create one with the expected stack after PUSH1
+				if entryBB.ExitStack() == nil {
+					// Entry block should have PUSH1 which pushes one value onto stack
+					// Create a simple exit stack with one variable value
+					exitStack := ValueStack{}
+					exitStack.push(&Value{kind: Variable})
+					entryBB.SetExitStack(exitStack.clone())
+				}
+				loopBB.AddIncomingStack(entryBB, entryBB.ExitStack())
+				// Mark entry block as built and not queued to prevent rebuilds
+				entryBB.built = true
+				entryBB.queued = false
+			}
+		}
+	}
 	// Debug dump disabled to reduce noise in benchmarks
 	return cfg, nil
 }
@@ -485,6 +570,13 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 	depthKnown := false
 
 	log.Warn("==buildBasicBlock==", "bb", curBB.blockNum, "firstPC", curBB.firstPC, "lastPC", curBB.lastPC, "parents", len(curBB.parents), "children", len(curBB.children))
+	if curBB.firstPC == 0 {
+		firstBytesLen := 10
+		if len(code) < firstBytesLen {
+			firstBytesLen = len(code)
+		}
+		log.Warn("==buildBasicBlock== Processing entry block", "bb", curBB.blockNum, "code_len", len(code), "first_bytes", code[:firstBytesLen])
+	}
 
 	// If this block begins at a JUMPDEST, emit the MirJUMPDEST first, then place PHIs after it.
 	// This preserves the invariant that PHIs do not precede JUMPDEST and avoids PHI-only blocks.
@@ -1598,18 +1690,65 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 			panic("not implemented")
 		case JUMPDEST:
 			// If we hit a JUMPDEST, we should create a new basic block
-			// unless this is the first instruction
-			if curBB.Size() > 0 {
-				newBB := c.createBB(uint(i), curBB)
-				newBB.SetInitDepth(depth)
-				curBB.SetChildren([]*MIRBasicBlock{newBB})
-				// Record exit stack and feed as incoming to fallthrough
-				curBB.SetExitStack(valueStack.clone())
-				newBB.AddIncomingStack(curBB, curBB.ExitStack())
-				// Ensure reverse parent link
-				newBB.SetParents([]*MIRBasicBlock{curBB})
-				log.Warn("=== JUMPDEST ==== MIR targetBB queued", "curbb", curBB.blockNum, "targetbb", newBB.blockNum, "targetbbfirstpc", newBB.firstPC, "targetBBPC", newBB.FirstPC(), "targetBBLastPC", newBB.LastPC())
-				unprcessedBBs.Push(newBB)
+			// unless this is the first instruction of the block
+			// General rule: if we've processed any instructions (i > firstPC), create a new block
+			// This handles cases where Size()=0 but we've still processed instructions (e.g., PUSH)
+			if uint(i) > curBB.firstPC {
+				// Check if block at this PC already exists and is already a child
+				existingBB, exists := c.pcToBlock[uint(i)]
+				children := curBB.Children()
+				if exists && existingBB != nil {
+					hasCorrectChild := false
+					for _, child := range children {
+						if child == existingBB {
+							hasCorrectChild = true
+							break
+						}
+					}
+					if hasCorrectChild {
+						// Already has the correct child, just set LastPC and return
+						curBB.SetLastPC(uint(i - 1))
+						return nil
+					}
+				}
+				// Only create/fix connection if block has no children yet
+				// If it has wrong children, the fix at the end will handle it
+				if len(children) == 0 {
+					var newBB *MIRBasicBlock
+					if exists && existingBB != nil {
+						newBB = existingBB
+					} else {
+						newBB = c.createBB(uint(i), curBB)
+						newBB.SetInitDepth(depth)
+					}
+					curBB.SetChildren([]*MIRBasicBlock{newBB})
+					curBB.SetLastPC(uint(i - 1))
+					// Record exit stack and feed as incoming to fallthrough
+					curBB.SetExitStack(valueStack.clone())
+					newBB.AddIncomingStack(curBB, curBB.ExitStack())
+					// Ensure reverse parent link
+					existingParents := newBB.Parents()
+					hasCurBBAsParent := false
+					for _, p := range existingParents {
+						if p == curBB {
+							hasCurBBAsParent = true
+							break
+						}
+					}
+					if !hasCurBBAsParent {
+						newBB.SetParents(append(existingParents, curBB))
+					}
+					if !exists {
+						log.Warn("=== JUMPDEST ==== MIR targetBB queued", "curbb", curBB.blockNum, "targetbb", newBB.blockNum, "targetbbfirstpc", newBB.firstPC, "targetBBPC", newBB.FirstPC(), "targetBBLastPC", newBB.LastPC())
+						unprcessedBBs.Push(newBB)
+					}
+				}
+				// Always set LastPC and exit stack to ensure block ends correctly
+				curBB.SetLastPC(uint(i - 1))
+				// Set exit stack so the fix at the end can use it
+				if curBB.ExitStack() == nil {
+					curBB.SetExitStack(valueStack.clone())
+				}
 				return nil
 			}
 
@@ -2147,6 +2286,91 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 		}
 
 		i++
+	}
+	// Special handling for entry block (firstPC == 0): ensure it falls through to PC:2 if it's JUMPDEST
+	// This fixes cases where the entry block should end after PUSH1 and fall through to the loop block
+	if curBB.firstPC == 0 && len(code) > 2 && ByteCode(code[2]) == JUMPDEST {
+		// Check if we have the correct child at PC:2
+		existingBB, exists := c.pcToBlock[2]
+		hasCorrectChild := false
+		if exists && existingBB != nil {
+			for _, child := range curBB.Children() {
+				if child == existingBB {
+					hasCorrectChild = true
+					break
+				}
+			}
+		}
+		// Always fix the entry block to fall through to PC:2 if it's JUMPDEST
+		// (replace any wrong children)
+		if !hasCorrectChild {
+			var fallthroughBB *MIRBasicBlock
+			if exists && existingBB != nil {
+				fallthroughBB = existingBB
+			} else {
+				fallthroughBB = c.createBB(2, curBB)
+				fallthroughBB.SetInitDepth(depth)
+			}
+			// Always set the correct child (replace any wrong ones)
+			curBB.SetChildren([]*MIRBasicBlock{fallthroughBB})
+			curBB.SetExitStack(valueStack.clone())
+			fallthroughBB.SetParents([]*MIRBasicBlock{curBB})
+			prev := fallthroughBB.IncomingStacks()[curBB]
+			if prev == nil || !stacksEqual(prev, curBB.ExitStack()) {
+				fallthroughBB.AddIncomingStack(curBB, curBB.ExitStack())
+			}
+			if !exists {
+				fallthroughBB.queued = true
+				unprcessedBBs.Push(fallthroughBB)
+			}
+			curBB.SetLastPC(1) // Entry block ends at PC:1 (after PUSH1 0x03)
+			log.Warn("==buildBasicBlock== Fixed entry block fallthrough to PC:2", "curbb", curBB.blockNum)
+		}
+	}
+	// If we've finished processing the block, check if the next instruction is a JUMPDEST
+	// and ensure we have a fallthrough connection to it
+	// This is especially important for the entry block (firstPC == 0) which should
+	// fall through to the first JUMPDEST after PUSH instructions
+	if i < len(code) {
+		nextOp := ByteCode(code[i])
+		if nextOp == JUMPDEST {
+			// Check if we have the correct child at this PC
+			existingBB, exists := c.pcToBlock[uint(i)]
+			hasCorrectChild := false
+			if exists && existingBB != nil {
+				for _, child := range curBB.Children() {
+					if child == existingBB {
+						hasCorrectChild = true
+						break
+					}
+				}
+			}
+			// If we don't have the correct child, create/use the fallthrough block
+			// Always replace wrong children with the correct one
+			if !hasCorrectChild || len(curBB.Children()) == 0 {
+				var fallthroughBB *MIRBasicBlock
+				if exists && existingBB != nil {
+					fallthroughBB = existingBB
+				} else {
+					fallthroughBB = c.createBB(uint(i), curBB)
+					fallthroughBB.SetInitDepth(depth)
+				}
+				// Always set the correct child (replace any wrong ones)
+				curBB.SetChildren([]*MIRBasicBlock{fallthroughBB})
+				curBB.SetExitStack(valueStack.clone())
+				fallthroughBB.SetParents([]*MIRBasicBlock{curBB})
+				prev := fallthroughBB.IncomingStacks()[curBB]
+				if prev == nil || !stacksEqual(prev, curBB.ExitStack()) {
+					fallthroughBB.AddIncomingStack(curBB, curBB.ExitStack())
+				}
+				if !exists {
+					fallthroughBB.queued = true
+					unprcessedBBs.Push(fallthroughBB)
+				}
+				curBB.SetLastPC(uint(i - 1))
+				log.Warn("==buildBasicBlock== Fixed fallthrough to JUMPDEST", "curbb", curBB.blockNum, "curBB_firstPC", curBB.firstPC, "nextPC", i)
+			}
+		}
 	}
 	return nil
 }

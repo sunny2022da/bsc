@@ -461,6 +461,23 @@ func (it *MIRInterpreter) RunCFGWithResolver(cfg *CFG, entry *MIRBasicBlock) ([]
 	bb := entry
 	for bb != nil {
 		it.nextBB = nil
+		// If block has no MIR instructions (Size=0), still charge block entry gas
+		// This handles cases like entry blocks with only PUSH operations
+		if bb.Size() == 0 && it.beforeOp != nil {
+			ctx := &it.preOpCtx
+			ctx.M = nil // No MIR instruction for blocks with Size=0
+			ctx.EvmOp = 0
+			ctx.Operands = nil
+			ctx.MemorySize = 0
+			ctx.Length = 0
+			ctx.IsBlockEntry = true
+			ctx.Block = bb
+			it.currentBB = bb
+			// Call hook for block entry gas charging
+			if err := it.beforeOp(ctx); err != nil {
+				return nil, err
+			}
+		}
 		_, err := it.RunMIR(bb)
 		if err == nil {
 			mirDebugWarn("MIR RunCFGWithResolver: run mir success", "bb", bb.blockNum, "firstPC", bb.firstPC, "lastPC", bb.lastPC, "it.nextBB", it.nextBB)
