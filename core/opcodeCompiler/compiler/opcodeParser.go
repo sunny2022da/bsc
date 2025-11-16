@@ -316,70 +316,31 @@ func GenerateMIRCFG(hash common.Hash, code []byte) (*CFG, error) {
 		// Seed entry stack for this block. If it has recorded entry snapshot, use it; else, if it
 		// has exactly one parent with an exit snapshot, inherit it; if multiple parents, ensure
 		// PHI nodes are materialized in buildBasicBlock.
-		// Debug for block containing PC 6440
-		if curBB.firstPC == 6437 || (curBB.firstPC <= 6440 && curBB.lastPC >= 6440) {
-			fmt.Printf("DEBUG CFG: Building block %d, firstPC=%d, lastPC=%d\n", curBB.blockNum, curBB.firstPC, curBB.lastPC)
-			fmt.Printf("DEBUG CFG: EntryStack() = %v\n", curBB.EntryStack() != nil)
-			if curBB.EntryStack() != nil {
-				fmt.Printf("DEBUG CFG: EntryStack size = %d\n", len(curBB.EntryStack()))
-			}
-			fmt.Printf("DEBUG CFG: Parents count = %d\n", len(curBB.Parents()))
-			for i, p := range curBB.Parents() {
-				if p != nil {
-					fmt.Printf("DEBUG CFG: Parent[%d] blockNum=%d, firstPC=%d, ExitStack=%v\n",
-						i, p.blockNum, p.firstPC, p.ExitStack() != nil)
-					if p.ExitStack() != nil {
-						fmt.Printf("DEBUG CFG: Parent[%d] ExitStack size = %d\n", i, len(p.ExitStack()))
-					}
-				}
-			}
-		}
 		if es := curBB.EntryStack(); es != nil {
 			valueStack.resetTo(es)
 			// Entry snapshot is a logical copy; not a parent live-in set.
-			if curBB.firstPC == 6437 || (curBB.firstPC <= 6440 && curBB.lastPC >= 6440) {
-				fmt.Printf("DEBUG CFG: Using EntryStack, size = %d\n", len(es))
-			}
 		} else if len(curBB.Parents()) == 1 {
 			parent := curBB.Parents()[0]
 			if ps := parent.ExitStack(); ps != nil {
 				valueStack.resetTo(ps)
 				// Mark inherited parent values as live-ins for this block
 				valueStack.markAllLiveIn()
-				if curBB.firstPC == 6437 || (curBB.firstPC <= 6440 && curBB.lastPC >= 6440) {
-					fmt.Printf("DEBUG CFG: Using single parent ExitStack, size = %d\n", len(ps))
-				}
 			} else {
 				// Parent has no ExitStack (likely being rebuilt). Try to use incoming stack from this parent.
 				if incomingStacks := curBB.IncomingStacks(); incomingStacks != nil {
 					if incomingStack := incomingStacks[parent]; incomingStack != nil {
 						valueStack.resetTo(incomingStack)
 						valueStack.markAllLiveIn()
-						if curBB.firstPC == 6437 || (curBB.firstPC <= 6440 && curBB.lastPC >= 6440) {
-							fmt.Printf("DEBUG CFG: Parent has no ExitStack, using incoming stack, size = %d\n", len(incomingStack))
-						}
 					} else {
 						valueStack.resetTo(nil)
-						if curBB.firstPC == 6437 || (curBB.firstPC <= 6440 && curBB.lastPC >= 6440) {
-							fmt.Printf("DEBUG CFG: Single parent has no ExitStack and no incoming stack, resetting to nil\n")
-						}
 					}
 				} else {
 					valueStack.resetTo(nil)
-					if curBB.firstPC == 6437 || (curBB.firstPC <= 6440 && curBB.lastPC >= 6440) {
-						fmt.Printf("DEBUG CFG: Single parent has no ExitStack, resetting to nil\n")
-					}
 				}
 			}
 		} else {
 			// No known entry; clear stack to start fresh and let PHI creation fill in
 			valueStack.resetTo(nil)
-			if curBB.firstPC == 6437 || (curBB.firstPC <= 6440 && curBB.lastPC >= 6440) {
-				fmt.Printf("DEBUG CFG: No EntryStack and %d parents, resetting to nil\n", len(curBB.Parents()))
-			}
-		}
-		if curBB.firstPC == 6437 || (curBB.firstPC <= 6440 && curBB.lastPC >= 6440) {
-			fmt.Printf("DEBUG CFG: Initial stack size = %d\n", valueStack.size())
 		}
 		// Only rebuild if necessary. We now rebuild whenever a block is dequeued (new parent/incoming)
 		// or if it hasn't been built yet. Entry height alone is not sufficient because incomingStacks
@@ -387,10 +348,6 @@ func GenerateMIRCFG(hash common.Hash, code []byte) (*CFG, error) {
 		if !curBB.built || curBB.queued {
 			// Snapshot previous exit to detect changes after rebuild
 			prevExit := curBB.ExitStack()
-			if curBB.firstPC == 5351 || curBB.firstPC == 5374 {
-				parserDebugWarn("==GenerateMIRCFG== MIR prevExit", "bb", curBB.blockNum,
-					"firstPC", curBB.firstPC)
-			}
 			// Also snapshot each child's previous incoming snapshot from this parent to avoid
 			// comparing against the just-updated value set during edge creation in this rebuild.
 			prevIncomingByChild := make(map[*MIRBasicBlock][]Value)
@@ -417,26 +374,16 @@ func GenerateMIRCFG(hash common.Hash, code []byte) (*CFG, error) {
 			curBB.queued = false
 			// If exit changed, propagate to children and enqueue them
 			newExit := curBB.ExitStack()
-			if curBB.firstPC == 5351 || curBB.firstPC == 5374 || curBB.firstPC == 5829 {
-				parserDebugWarn("==GenerateMIRCFG== MIR newExit", "bb", curBB.blockNum)
-			}
 			if !stacksEqual(prevExit, newExit) {
-				if curBB.firstPC == 5351 || curBB.firstPC == 5374 || curBB.firstPC == 5829 {
-					parserDebugWarn("==GenerateMIRCFG== not equal MIR prevExit", "bb", curBB.blockNum, "prevExit", prevExit, "newExit", newExit)
-				}
 				for _, ch := range curBB.Children() {
 					if ch == nil {
 						continue
 					}
-					parserDebugWarn("==GenerateMIRCFG== MIR not equal check children", "bb", curBB.blockNum, "child.blocknum", ch.blockNum)
 					prevIncoming := prevIncomingByChild[ch]
 					if !stacksEqual(prevIncoming, newExit) {
 						ch.AddIncomingStack(curBB, newExit)
 						if !ch.queued {
 							ch.queued = true
-							if ch.firstPC == 5351 || ch.firstPC == 5374 || ch.firstPC == 5829 {
-								parserDebugWarn("==GenerateMIRCFG== MIR append child queued", "ch", ch)
-							}
 							unprcessedBBs.Push(ch)
 						}
 					}
@@ -640,12 +587,6 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 				mir.genStackDepth = valueStack.size()
 			}
 
-			if i == 5351 || i == 5374 || i == 5829 {
-				parserDebugWarn("==buildBasicBlock== MIR JUMPDEST emitted", "bb", curBB.blockNum, "pc", i, "parentsLen", len(curBB.Parents()))
-				for _, p := range curBB.Parents() {
-					parserDebugWarn("==buildBasicBlock== MIR JUMPDEST parent", "parent", p.blockNum, "parentPC", p.FirstPC(), "parentLastPC", p.LastPC())
-				}
-			}
 			// Advance past JUMPDEST so PHIs (if any) are appended after it and we don't re-emit it below
 			i++
 		}
@@ -783,9 +724,6 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 		depth = valueStack.size()
 		depthKnown = true
 	}
-	if i == 5352 || i == 5375 || i == 5830 {
-		parserDebugWarn("==buildBasicBlock== MIR build", "bb", curBB.blockNum, "pc", i, "valueStack", valueStack)
-	}
 	for i < len(code) {
 		op := ByteCode(code[i])
 		// Count original EVM opcodes for static gas accounting
@@ -894,13 +832,6 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 				depth = 0
 			}
 		case LT:
-			// Debug for PC 6440
-			if i == 6440 {
-				fmt.Printf("DEBUG CFG: Creating LT at PC %d, stack size = %d\n", i, valueStack.size())
-				if valueStack.size() < 2 {
-					fmt.Printf("DEBUG CFG: WARNING - Stack underflow! Stack size = %d, need 2\n", valueStack.size())
-				}
-			}
 			mir = curBB.CreateBinOpMIR(MirLT, valueStack)
 			if depth >= 2 {
 				depth--
@@ -1635,12 +1566,6 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 						if prevFall == nil || !stacksEqual(prevFall, curBB.ExitStack()) {
 							fallthroughBB.AddIncomingStack(curBB, curBB.ExitStack())
 						}
-						if targetBB.firstPC == 5351 || targetBB.firstPC == 5832 || targetBB.firstPC == 5375 {
-							parserDebugWarn("MIR JUMPI targetBB", "curBB", curBB.blockNum, "targetBBPC", targetBB.FirstPC(), "targetBBLastPC", targetBB.LastPC())
-						}
-						if fallthroughBB.firstPC == 5351 || fallthroughBB.firstPC == 5833 || fallthroughBB.firstPC == 5376 {
-							parserDebugWarn("MIR JUMPI targetBB", "curBB", curBB.blockNum, "targetBBPC", fallthroughBB.FirstPC(), "targetBBLastPC", fallthroughBB.LastPC())
-						}
 						if !targetExists || (targetExists && !hadTargetParentBefore) {
 							if !targetBB.queued {
 								targetBB.queued = true
@@ -1681,9 +1606,6 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 						if prev == nil || !stacksEqual(prev, curBB.ExitStack()) {
 							fallthroughBB.AddIncomingStack(curBB, curBB.ExitStack())
 						}
-						if fallthroughBB.firstPC == 5351 {
-							parserDebugWarn("MIR JUMP targetBB", "curBB", curBB.blockNum, "targetBBPC", fallthroughBB.FirstPC(), "targetBBLastPC", fallthroughBB.LastPC())
-						}
 						if !fallExists || (fallExists && !hadFallParentBefore) {
 							if !fallthroughBB.queued {
 								fallthroughBB.queued = true
@@ -1715,9 +1637,6 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 					prev := fallthroughBB.IncomingStacks()[curBB]
 					if prev == nil || !stacksEqual(prev, curBB.ExitStack()) {
 						fallthroughBB.AddIncomingStack(curBB, curBB.ExitStack())
-					}
-					if fallthroughBB.firstPC == 5351 {
-						parserDebugWarn("MIR JUMP targetBB", "curBB", curBB.blockNum, "targetBBPC", fallthroughBB.FirstPC(), "targetBBLastPC", fallthroughBB.LastPC())
 					}
 					if !fallExists || (fallExists && !hadFallParentBefore) {
 						if !fallthroughBB.queued {

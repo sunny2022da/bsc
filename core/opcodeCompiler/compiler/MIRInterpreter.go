@@ -345,29 +345,9 @@ func (it *MIRInterpreter) RunMIR(block *MIRBasicBlock) ([]byte, error) {
 	// results slots are allocated lazily on first write via setResult.
 	// iterate by index to reduce overhead
 	block.pos = 0
-	// Debug for block containing PC 6448
-	if block.firstPC <= 6448 && (block.lastPC >= 6448 || block.lastPC == 0) {
-		fmt.Printf("DEBUG RunMIR: Executing block %d (firstPC=%d, lastPC=%d), instructions=%d\n",
-			block.blockNum, block.firstPC, block.lastPC, len(block.instructions))
-		for j, ins := range block.instructions {
-			if ins != nil {
-				fmt.Printf("DEBUG RunMIR: instruction[%d] evmPC=%d, op=%s\n", j, ins.evmPC, ins.op.String())
-			}
-		}
-	}
 	for i := 0; i < len(block.instructions); i++ {
 		ins := block.instructions[i]
-		if block.firstPC <= 6448 && (block.lastPC >= 6448 || block.lastPC == 0) {
-			fmt.Printf("DEBUG RunMIR: Executing instruction[%d] evmPC=%d, op=%s\n", i, ins.evmPC, ins.op.String())
-		}
 		if err := it.exec(ins); err != nil {
-			if block.firstPC <= 6448 && (block.lastPC >= 6448 || block.lastPC == 0) {
-				fmt.Printf("DEBUG RunMIR: Instruction returned error: %v\n", err)
-				// Check if it's an out of gas error
-				if err.Error() == "out of gas" {
-					fmt.Printf("DEBUG RunMIR: Out of gas error detected, should trigger fallback\n")
-				}
-			}
 			switch err {
 			case errSTOP:
 				return it.returndata, nil
@@ -381,9 +361,6 @@ func (it *MIRInterpreter) RunMIR(block *MIRBasicBlock) ([]byte, error) {
 				return nil, err
 			}
 		}
-	}
-	if block.firstPC <= 6448 && (block.lastPC >= 6448 || block.lastPC == 0) {
-		fmt.Printf("DEBUG RunMIR: Block %d finished executing all instructions\n", block.blockNum)
 	}
 
 	// 添加基本块完成执行的日志
@@ -430,26 +407,11 @@ func (it *MIRInterpreter) publishLiveOut(block *MIRBasicBlock) {
 
 			if !hasInSigCache {
 				val := it.evalValue(v)
-				// Debug for PC 3315
-				if v.def != nil && v.def.evmPC == 3315 {
-					fmt.Printf("DEBUG publishLiveOut backfill: PC 3315, idx=%d, evalValue returned=%s, block=%d\n",
-						v.def.idx, func() string {
-							if val != nil {
-								return val.String()
-							}
-							return "nil"
-						}(), block.blockNum)
-				}
 				if val != nil && v.def.evmPC != 0 {
 					if it.globalResultsBySig[uint64(v.def.evmPC)] == nil {
 						it.globalResultsBySig[uint64(v.def.evmPC)] = make(map[int]*uint256.Int)
 					}
 					it.globalResultsBySig[uint64(v.def.evmPC)][v.def.idx] = new(uint256.Int).Set(val)
-					// Debug for PC 3315
-					if v.def.evmPC == 3315 {
-						fmt.Printf("DEBUG publishLiveOut backfill: Stored in globalResultsBySig[3315][%d] = %s\n",
-							v.def.idx, it.globalResultsBySig[uint64(v.def.evmPC)][v.def.idx].String())
-					}
 					// Also update pointer cache for compatibility
 					it.globalResults[v.def] = new(uint256.Int).Set(val)
 				}
@@ -462,27 +424,12 @@ func (it *MIRInterpreter) publishLiveOut(block *MIRBasicBlock) {
 		}
 		if def.idx >= 0 && def.idx < len(it.results) {
 			if r := it.results[def.idx]; r != nil {
-				// Debug for PC 3315
-				if def.evmPC == 3315 {
-					fmt.Printf("DEBUG publishLiveOut: Publishing PC 3315, idx=%d, value=%s, block=%d\n",
-						def.idx, r.String(), block.blockNum)
-				}
 				// Update signature-based cache (uses evmPC+idx as key)
 				if def.evmPC != 0 {
 					if it.globalResultsBySig[uint64(def.evmPC)] == nil {
 						it.globalResultsBySig[uint64(def.evmPC)] = make(map[int]*uint256.Int)
 					}
 					it.globalResultsBySig[uint64(def.evmPC)][def.idx] = new(uint256.Int).Set(r)
-					// Debug for PC 31
-					if def.evmPC == 31 {
-						fmt.Printf("DEBUG publishLiveOut: Stored in globalResultsBySig[31][%d] = %s, block=%d\n",
-							def.idx, it.globalResultsBySig[uint64(def.evmPC)][def.idx].String(), block.blockNum)
-					}
-					// Debug for PC 3315
-					if def.evmPC == 3315 {
-						fmt.Printf("DEBUG publishLiveOut: Stored in globalResultsBySig[3315][%d] = %s\n",
-							def.idx, it.globalResultsBySig[uint64(def.evmPC)][def.idx].String())
-					}
 				}
 				// Also update pointer-based cache for mirHandleJUMP compatibility
 				it.globalResults[def] = new(uint256.Int).Set(r)
@@ -568,20 +515,6 @@ func (it *MIRInterpreter) RunCFGWithResolver(cfg *CFG, entry *MIRBasicBlock) ([]
 			if it.nextBB == nil {
 				// Fall through handling
 				children := bb.Children()
-				// Debug for block ending around PC 6448
-				if bb.firstPC <= 6448 && (bb.lastPC >= 6448 || bb.lastPC == 0) {
-					fmt.Printf("DEBUG RunCFG: Block %d (firstPC=%d, lastPC=%d) finished, nextBB=nil\n",
-						bb.blockNum, bb.firstPC, bb.lastPC)
-					fmt.Printf("DEBUG RunCFG: Children count = %d\n", len(children))
-					for i, ch := range children {
-						if ch != nil {
-							fmt.Printf("DEBUG RunCFG: children[%d] blockNum=%d, firstPC=%d, lastPC=%d\n",
-								i, ch.blockNum, ch.firstPC, ch.lastPC)
-						} else {
-							fmt.Printf("DEBUG RunCFG: children[%d] = nil\n", i)
-						}
-					}
-				}
 				if len(children) >= 1 && children[0] != nil {
 					// Single-successor fallthrough
 					if len(children) == 1 {
@@ -594,9 +527,6 @@ func (it *MIRInterpreter) RunCFGWithResolver(cfg *CFG, entry *MIRBasicBlock) ([]
 							mirDebugWarn("MIR: self-loop fallthrough detected; rerunning block", "blockNum", bb.blockNum)
 							bb = children[0]
 							continue
-						}
-						if bb.firstPC <= 6448 && (bb.lastPC >= 6448 || bb.lastPC == 0) {
-							fmt.Printf("DEBUG RunCFG: Taking single fallthrough to block %d\n", children[0].blockNum)
 						}
 						bb = children[0]
 						continue
@@ -612,15 +542,9 @@ func (it *MIRInterpreter) RunCFGWithResolver(cfg *CFG, entry *MIRBasicBlock) ([]
 							bb = children[1]
 							continue
 						}
-						if bb.firstPC <= 6448 && (bb.lastPC >= 6448 || bb.lastPC == 0) {
-							fmt.Printf("DEBUG RunCFG: Taking conditional fallthrough to block %d\n", children[1].blockNum)
-						}
 						bb = children[1]
 						continue
 					}
-				}
-				if bb.firstPC <= 6448 && (bb.lastPC >= 6448 || bb.lastPC == 0) {
-					fmt.Printf("DEBUG RunCFG: No children found, returning\n")
 				}
 				return it.returndata, nil
 			}
@@ -721,22 +645,7 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 				nWanted = len(it.preOpOps)
 			}
 			for i := 0; i < nWanted; i++ {
-				// Debug for PC 213
-				if m.evmPC == 213 {
-					fmt.Printf("DEBUG beforeOp 213: Evaluating operand[%d]\n", i)
-					if m.operands[i] != nil {
-						fmt.Printf("DEBUG beforeOp 213: operand[%d] kind = %v, def = %v\n", i, m.operands[i].kind, m.operands[i].def != nil)
-						if m.operands[i].def != nil {
-							fmt.Printf("DEBUG beforeOp 213: operand[%d] def evmPC = %d, def idx = %d, def op = %s\n",
-								i, m.operands[i].def.evmPC, m.operands[i].def.idx, m.operands[i].def.op.String())
-						}
-					}
-				}
 				v := it.evalValue(m.operands[i])
-				// Debug for PC 213
-				if m.evmPC == 213 {
-					fmt.Printf("DEBUG beforeOp 213: evalValue returned = %s for operand[%d]\n", v.String(), i)
-				}
 				it.preOpVals[i].Set(v)
 				it.preOpOps[i] = &it.preOpVals[i]
 			}
@@ -778,19 +687,6 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 			if len(ctx.Operands) >= 1 {
 				off := ctx.Operands[0].Uint64()
 				ctx.MemorySize = off + 32
-				// Debug for PC 6449
-				if m.evmPC == 6449 {
-					fmt.Printf("DEBUG MIR exec MLOAD 6449: offset operand = %s, off = %d, MemorySize = %d\n",
-						ctx.Operands[0].String(), off, ctx.MemorySize)
-					if len(m.operands) > 0 && m.operands[0] != nil {
-						fmt.Printf("DEBUG MIR exec MLOAD 6449: operand[0] kind = %v, def = %v\n",
-							m.operands[0].kind, m.operands[0].def != nil)
-						if m.operands[0].def != nil {
-							fmt.Printf("DEBUG MIR exec MLOAD 6449: operand[0] def evmPC = %d, def idx = %d\n",
-								m.operands[0].def.evmPC, m.operands[0].def.idx)
-						}
-					}
-				}
 			}
 		case MirMSTORE:
 			if len(ctx.Operands) >= 1 {
@@ -918,39 +814,14 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 	// Inline hot micro-ops to avoid function call dispatch overhead
 	switch m.op {
 	case MirADD:
-		// Debug for PC 6448
-		if m.evmPC == 6448 {
-			fmt.Printf("DEBUG inline ADD 6448: operands count = %d\n", len(m.operands))
-			for i, op := range m.operands {
-				if op != nil {
-					fmt.Printf("DEBUG inline ADD 6448: operand[%d] kind = %v, def = %v\n", i, op.kind, op.def != nil)
-					if op.def != nil {
-						fmt.Printf("DEBUG inline ADD 6448: operand[%d] def evmPC = %d, def idx = %d\n", i, op.def.evmPC, op.def.idx)
-					}
-				}
-			}
-		}
 		if it.tracerEx != nil {
 			it.tracerEx(m)
 		} else if it.tracer != nil {
 			it.tracer(m.op)
 		}
 		a, b, _ := mirLoadAB(it, m)
-		// Debug for PC 6448
-		if m.evmPC == 6448 {
-			fmt.Printf("DEBUG inline ADD 6448: a = %s, b = %s\n", a.String(), b.String())
-		}
 		result := it.tmpA.Clear().Add(a, b)
-		if m.evmPC == 6448 {
-			fmt.Printf("DEBUG inline ADD 6448: a+b = %s\n", result.String())
-		}
 		it.setResult(m, result)
-		// Debug for PC 6448
-		if m.evmPC == 6448 {
-			if it.results != nil && m.idx < len(it.results) && it.results[m.idx] != nil {
-				fmt.Printf("DEBUG inline ADD 6448: stored result = %s\n", it.results[m.idx].String())
-			}
-		}
 		return nil
 	case MirMUL:
 		if it.tracerEx != nil {
@@ -1992,117 +1863,14 @@ func mirHandleJUMPI(it *MIRInterpreter, m *MIR) error {
 	if len(m.operands) < 2 {
 		return fmt.Errorf("JUMPI missing operands")
 	}
-	// Debug for PC 217 and 250
-	if m.evmPC == 217 || m.evmPC == 250 {
-		fmt.Printf("DEBUG JUMPI %d: About to evaluate condition, operand[1] kind=%v, def=%v\n",
-			m.evmPC, m.operands[1].kind, m.operands[1].def != nil)
-		if m.operands[1].def != nil {
-			fmt.Printf("DEBUG JUMPI %d: condition def evmPC=%d, idx=%d, op=%s\n",
-				m.evmPC, m.operands[1].def.evmPC, m.operands[1].def.idx, m.operands[1].def.op.String())
-		}
-	}
-	// Debug for PC 6445 before evaluating condition
-	if m.evmPC == 6445 {
-		fmt.Printf("DEBUG JUMPI 6445: About to evaluate condition operand\n")
-		if m.operands[1] != nil {
-			fmt.Printf("DEBUG JUMPI 6445: condition operand kind = %v, def = %v\n", m.operands[1].kind, m.operands[1].def != nil)
-			if m.operands[1].def != nil {
-				// Try to find which block this def belongs to
-				defBlockNum := -1
-				if m.operands[1].def != nil && it.currentBB != nil {
-					for _, bb := range it.currentBB.Parents() {
-						if bb != nil {
-							for _, ins := range bb.instructions {
-								if ins == m.operands[1].def {
-									defBlockNum = int(bb.blockNum)
-									break
-								}
-							}
-							if defBlockNum >= 0 {
-								break
-							}
-						}
-					}
-				}
-				fmt.Printf("DEBUG JUMPI 6445: condition def evmPC = %d, def idx = %d, def op = %v, def.blockNum = %d\n",
-					m.operands[1].def.evmPC, m.operands[1].def.idx, m.operands[1].def.op, defBlockNum)
-				// Check if def is in current block
-				if it.currentBB != nil {
-					for i, ins := range it.currentBB.instructions {
-						if ins == m.operands[1].def {
-							fmt.Printf("DEBUG JUMPI 6445: condition def found in current block at idx %d\n", i)
-							if it.results != nil && i < len(it.results) && it.results[i] != nil {
-								fmt.Printf("DEBUG JUMPI 6445: condition def result in current block = %s\n", it.results[i].String())
-							}
-							break
-						}
-					}
-				}
-			}
-		}
-	}
 	cond := it.evalValue(m.operands[1])
-
-	// Debug for PC 217 and 250 after evaluating
-	if m.evmPC == 217 || m.evmPC == 250 {
-		fmt.Printf("DEBUG JUMPI %d: condition value = %s, IsZero() = %v\n", m.evmPC, cond.String(), cond.IsZero())
-	}
-
-	// Debug for PC 6445 after evaluating
-	if m.evmPC == 6445 {
-		fmt.Printf("DEBUG JUMPI 6445: condition value = %s, IsZero() = %v\n", cond.String(), cond.IsZero())
-		fmt.Printf("DEBUG JUMPI 6445: currentBB.blockNum=%d, firstPC=%d, lastPC=%d\n",
-			it.currentBB.blockNum, it.currentBB.firstPC, it.currentBB.lastPC)
-		// Check global results for ISZERO at PC 6441
-		if it.globalResults != nil {
-			for def, val := range it.globalResults {
-				if def != nil && def.evmPC == 6441 && def.op == MirISZERO {
-					fmt.Printf("DEBUG JUMPI 6445: Found ISZERO result in globalResults: %s\n", val.String())
-				}
-			}
-		}
-		// Check signature-based cache
-		if it.globalResultsBySig != nil {
-			if byPC := it.globalResultsBySig[6441]; byPC != nil {
-				for idx, val := range byPC {
-					fmt.Printf("DEBUG JUMPI 6445: Found ISZERO in globalResultsBySig[6441][%d] = %s\n", idx, val.String())
-				}
-			}
-		}
-	}
 
 	if cond.IsZero() {
 		// fallthrough: use children[1] which is the fallthrough block for JUMPI
 		children := it.currentBB.Children()
-		// Debug: check what we have at runtime
-		if m.evmPC == 6445 {
-			fmt.Printf("DEBUG JUMPI 6445: currentBB.blockNum=%d, currentBB.firstPC=%d, currentBB.lastPC=%d\n",
-				it.currentBB.blockNum, it.currentBB.firstPC, it.currentBB.lastPC)
-			fmt.Printf("DEBUG JUMPI 6445: len(children)=%d\n", len(children))
-			for i, ch := range children {
-				if ch != nil {
-					fmt.Printf("DEBUG JUMPI 6445: children[%d].blockNum=%d, firstPC=%d, lastPC=%d\n",
-						i, ch.blockNum, ch.firstPC, ch.lastPC)
-				} else {
-					fmt.Printf("DEBUG JUMPI 6445: children[%d]=nil\n", i)
-				}
-			}
-			// Try ResolveBB for PC 6446
-			bb6446 := it.env.ResolveBB(6446)
-			if bb6446 != nil {
-				fmt.Printf("DEBUG JUMPI 6445: ResolveBB(6446) found blockNum=%d, firstPC=%d\n",
-					bb6446.blockNum, bb6446.firstPC)
-			} else {
-				fmt.Printf("DEBUG JUMPI 6445: ResolveBB(6446) returned nil\n")
-			}
-		}
 		// Always prefer children[1] for JUMPI fallthrough as it's guaranteed by CFG construction
 		if len(children) >= 2 && children[1] != nil {
 			it.nextBB = children[1]
-			if m.evmPC == 6445 {
-				fmt.Printf("DEBUG JUMPI 6445: Using children[1], nextBB.blockNum=%d, firstPC=%d\n",
-					it.nextBB.blockNum, it.nextBB.firstPC)
-			}
 			it.publishLiveOut(it.currentBB)
 			it.prevBB = it.currentBB
 			return errJUMP
@@ -2112,10 +1880,6 @@ func mirHandleJUMPI(it *MIRInterpreter, m *MIR) error {
 		udest := uint64(dest)
 		it.nextBB = it.env.ResolveBB(udest)
 		if it.nextBB != nil {
-			if m.evmPC == 6445 {
-				fmt.Printf("DEBUG JUMPI 6445: Using ResolveBB fallback, nextBB.blockNum=%d, firstPC=%d\n",
-					it.nextBB.blockNum, it.nextBB.firstPC)
-			}
 			it.publishLiveOut(it.currentBB)
 			it.prevBB = it.currentBB
 			return errJUMP
@@ -2123,9 +1887,6 @@ func mirHandleJUMPI(it *MIRInterpreter, m *MIR) error {
 		// If we can't resolve the block and children[1] doesn't exist,
 		// return nil to let RunCFGWithResolver handle fallthrough via children logic
 		// This should only happen if the CFG is malformed
-		if m.evmPC == 6445 {
-			fmt.Printf("DEBUG JUMPI 6445: Both children[1] and ResolveBB failed, returning nil for RunCFGWithResolver\n")
-		}
 		it.nextBB = nil
 		it.publishLiveOut(it.currentBB)
 		it.prevBB = it.currentBB
@@ -2137,24 +1898,7 @@ func mirHandleJUMPI(it *MIRInterpreter, m *MIR) error {
 		return ErrMIRFallback
 	}
 	udest, _ := dest.Uint64WithOverflow()
-	// Debug for PC 6445 when jumping
-	if m.evmPC == 6445 {
-		fmt.Printf("DEBUG JUMPI 6445: Condition is TRUE, jumping to PC %d\n", udest)
-		fmt.Printf("DEBUG JUMPI 6445: CheckJumpdest(%d) = %v\n", udest, it.env.CheckJumpdest(udest))
-		bb := it.env.ResolveBB(udest)
-		if bb != nil {
-			fmt.Printf("DEBUG JUMPI 6445: ResolveBB(%d) found blockNum=%d, firstPC=%d\n", udest, bb.blockNum, bb.firstPC)
-		} else {
-			fmt.Printf("DEBUG JUMPI 6445: ResolveBB(%d) returned nil\n", udest)
-		}
-	}
 	err := it.scheduleJump(udest, m, false)
-	if m.evmPC == 6445 {
-		fmt.Printf("DEBUG JUMPI 6445: scheduleJump returned err=%v, nextBB=%v\n", err, it.nextBB != nil)
-		if it.nextBB != nil {
-			fmt.Printf("DEBUG JUMPI 6445: nextBB.blockNum=%d, firstPC=%d\n", it.nextBB.blockNum, it.nextBB.firstPC)
-		}
-	}
 	return err
 }
 
@@ -2287,27 +2031,7 @@ func mirLoadAB(it *MIRInterpreter, m *MIR) (a, b *uint256.Int, err error) {
 	}
 	// Fast path: reuse pre-op evaluated operands when available
 	if it.preOpOps[0] != nil && it.preOpOps[1] != nil {
-		// Debug for PC 213
-		if m.evmPC == 213 {
-			fmt.Printf("DEBUG mirLoadAB 213: Using preOpOps, a = %s, b = %s\n",
-				it.preOpOps[0].String(), it.preOpOps[1].String())
-		}
 		return it.preOpOps[0], it.preOpOps[1], nil
-	}
-	// Debug for PC 213
-	if m.evmPC == 213 {
-		fmt.Printf("DEBUG mirLoadAB 213: Not using preOpOps, will evaluate operands\n")
-		if len(m.operands) >= 2 {
-			for i, op := range m.operands {
-				if op != nil {
-					fmt.Printf("DEBUG mirLoadAB 213: operand[%d] kind = %v, def = %v\n", i, op.kind, op.def != nil)
-					if op.def != nil {
-						fmt.Printf("DEBUG mirLoadAB 213: operand[%d] def evmPC = %d, def idx = %d, def op = %s\n",
-							i, op.def.evmPC, op.def.idx, op.def.op.String())
-					}
-				}
-			}
-		}
 	}
 	// Use pre-encoded operand info if available
 	if len(m.opKinds) >= 2 {
@@ -2328,45 +2052,16 @@ func mirLoadAB(it *MIRInterpreter, m *MIR) (a, b *uint256.Int, err error) {
 	}
 	a = it.evalValue(m.operands[0])
 	b = it.evalValue(m.operands[1])
-	// Debug for PC 213
-	if m.evmPC == 213 {
-		fmt.Printf("DEBUG mirLoadAB 213: After evalValue, a = %s, b = %s\n", a.String(), b.String())
-	}
 	return a, b, nil
 }
 
 func mirHandleADD(it *MIRInterpreter, m *MIR) error {
-	// Debug for PC 6448
-	if m.evmPC == 6448 {
-		fmt.Printf("DEBUG mirHandleADD 6448: operands count = %d\n", len(m.operands))
-		for i, op := range m.operands {
-			if op != nil {
-				fmt.Printf("DEBUG mirHandleADD 6448: operand[%d] kind = %v, def = %v\n", i, op.kind, op.def != nil)
-				if op.def != nil {
-					fmt.Printf("DEBUG mirHandleADD 6448: operand[%d] def evmPC = %d, def idx = %d\n", i, op.def.evmPC, op.def.idx)
-				}
-			}
-		}
-	}
 	a, b, err := mirLoadAB(it, m)
 	if err != nil {
 		return err
 	}
-	// Debug for PC 6448
-	if m.evmPC == 6448 {
-		fmt.Printf("DEBUG mirHandleADD 6448: a = %s, b = %s\n", a.String(), b.String())
-	}
 	result := it.tmpA.Clear().Add(a, b)
-	if m.evmPC == 6448 {
-		fmt.Printf("DEBUG mirHandleADD 6448: a+b = %s\n", result.String())
-	}
 	it.setResult(m, result)
-	// Debug for PC 6448
-	if m.evmPC == 6448 {
-		if it.results != nil && m.idx < len(it.results) && it.results[m.idx] != nil {
-			fmt.Printf("DEBUG mirHandleADD 6448: stored result = %s\n", it.results[m.idx].String())
-		}
-	}
 	return nil
 }
 func mirHandleMUL(it *MIRInterpreter, m *MIR) error {
@@ -2420,47 +2115,12 @@ func mirHandleSHL(it *MIRInterpreter, m *MIR) error {
 	return nil
 }
 func mirHandleSHR(it *MIRInterpreter, m *MIR) error {
-	// Debug for PC 31
-	if m.evmPC == 31 {
-		fmt.Printf("DEBUG mirHandleSHR 31: About to evaluate operands, m.idx=%d\n", m.idx)
-		if len(m.operands) >= 2 {
-			for i, op := range m.operands {
-				if op != nil {
-					fmt.Printf("DEBUG mirHandleSHR 31: operand[%d] kind = %v, def = %v\n", i, op.kind, op.def != nil)
-					if op.def != nil {
-						fmt.Printf("DEBUG mirHandleSHR 31: operand[%d] def evmPC = %d, def idx = %d, def op = %s\n",
-							i, op.def.evmPC, op.def.idx, op.def.op.String())
-					}
-				}
-			}
-		}
-	}
 	a, b, err := mirLoadAB(it, m)
 	if err != nil {
 		return err
 	}
-	// Debug for PC 31
-	if m.evmPC == 31 {
-		fmt.Printf("DEBUG mirHandleSHR 31: a = %s, b = %s\n", a.String(), b.String())
-	}
 	result := it.tmpA.Clear().Rsh(b, uint(a.Uint64()))
-	// Debug for PC 31
-	if m.evmPC == 31 {
-		fmt.Printf("DEBUG mirHandleSHR 31: About to setResult, result = %s, m.idx = %d\n", result.String(), m.idx)
-	}
 	it.setResult(m, result)
-	// Debug for PC 31
-	if m.evmPC == 31 {
-		if it.results != nil && m.idx >= 0 && m.idx < len(it.results) {
-			if it.results[m.idx] != nil {
-				fmt.Printf("DEBUG mirHandleSHR 31: After setResult, results[%d] = %s\n", m.idx, it.results[m.idx].String())
-			} else {
-				fmt.Printf("DEBUG mirHandleSHR 31: After setResult, results[%d] is nil!\n", m.idx)
-			}
-		} else {
-			fmt.Printf("DEBUG mirHandleSHR 31: After setResult, m.idx=%d is out of range (results len=%d)\n", m.idx, len(it.results))
-		}
-	}
 	return nil
 }
 func mirHandleSAR(it *MIRInterpreter, m *MIR) error {
@@ -2472,60 +2132,20 @@ func mirHandleSAR(it *MIRInterpreter, m *MIR) error {
 	return nil
 }
 func mirHandleEQ(it *MIRInterpreter, m *MIR) error {
-	// Debug for PC 213 and 246
-	if m.evmPC == 213 || m.evmPC == 246 {
-		fmt.Printf("DEBUG mirHandleEQ %d: About to evaluate operands, m.idx=%d\n", m.evmPC, m.idx)
-	}
 	a, b, err := mirLoadAB(it, m)
 	//log.Warn("MIR EQ", "a", a, "==b", b)
 	if err != nil {
 		return err
 	}
-	// Debug for PC 213 and 246
-	if m.evmPC == 213 || m.evmPC == 246 {
-		fmt.Printf("DEBUG mirHandleEQ %d: a = %s, b = %s, a.Eq(b) = %v\n", m.evmPC, a.String(), b.String(), a.Eq(b))
-	}
 	result := it.zeroConst
 	if a.Eq(b) {
 		result = it.tmpA.Clear().SetOne()
 	}
-	// Debug for PC 213 and 246
-	if m.evmPC == 213 || m.evmPC == 246 {
-		fmt.Printf("DEBUG mirHandleEQ %d: About to setResult, result = %s, m.idx = %d\n", m.evmPC, result.String(), m.idx)
-	}
 	it.setResult(m, result)
-	// Debug for PC 213 and 246
-	if m.evmPC == 213 || m.evmPC == 246 {
-		if it.results != nil && m.idx >= 0 && m.idx < len(it.results) {
-			if it.results[m.idx] != nil {
-				fmt.Printf("DEBUG mirHandleEQ %d: After setResult, results[%d] = %s\n", m.evmPC, m.idx, it.results[m.idx].String())
-			} else {
-				fmt.Printf("DEBUG mirHandleEQ %d: After setResult, results[%d] is nil!\n", m.evmPC, m.idx)
-			}
-		} else {
-			fmt.Printf("DEBUG mirHandleEQ %d: After setResult, m.idx=%d is out of range (results len=%d)\n", m.evmPC, m.idx, len(it.results))
-		}
-	}
 	return nil
 }
 func mirHandleLT(it *MIRInterpreter, m *MIR) error {
-	// Debug for PC 6440 before loading operands
-	if m.evmPC == 6440 {
-		fmt.Printf("DEBUG mirHandleLT 6440: operands count = %d\n", len(m.operands))
-		for i, op := range m.operands {
-			if op != nil {
-				fmt.Printf("DEBUG mirHandleLT 6440: operand[%d] kind = %v, def = %v\n", i, op.kind, op.def != nil)
-				if op.def != nil {
-					fmt.Printf("DEBUG mirHandleLT 6440: operand[%d] def evmPC = %d, def idx = %d\n", i, op.def.evmPC, op.def.idx)
-				}
-			}
-		}
-	}
 	a, b, err := mirLoadAB(it, m)
-	// Debug for PC 6440
-	if m.evmPC == 6440 {
-		fmt.Printf("DEBUG mirHandleLT 6440: a = %s, b = %s, a.Lt(b) = %v\n", a.String(), b.String(), a.Lt(b))
-	}
 	//log.Warn("MIR LT", "a", a, "< b", b)
 	if err != nil {
 		return err
@@ -2536,9 +2156,6 @@ func mirHandleLT(it *MIRInterpreter, m *MIR) error {
 		result = it.tmpA.Clear().SetOne()
 	} else {
 		result = it.zeroConst
-	}
-	if m.evmPC == 6440 {
-		fmt.Printf("DEBUG mirHandleLT 6440: output = %s\n", result.String())
 	}
 	it.setResult(m, result)
 	return nil
@@ -2748,28 +2365,8 @@ func mirHandleCALLDATALOAD(it *MIRInterpreter, m *MIR) error {
 	if off == nil {
 		off = it.evalValue(m.operands[0])
 	}
-	// Debug for PC 31
-	if m.evmPC == 31 {
-		fmt.Printf("DEBUG mirHandleCALLDATALOAD 31: offset = %s, calldata len = %d\n",
-			off.String(), len(it.env.Calldata))
-		if len(it.env.Calldata) > 0 {
-			fmt.Printf("DEBUG mirHandleCALLDATALOAD 31: calldata[0:4] = %x\n", it.env.Calldata[0:min(4, len(it.env.Calldata))])
-		}
-	}
 	it.readCalldata32Into(off, &it.scratch32)
-	// Debug for PC 31
-	if m.evmPC == 31 {
-		fmt.Printf("DEBUG mirHandleCALLDATALOAD 31: read result = %x, as uint256 = %s\n",
-			it.scratch32[:], it.tmpA.Clear().SetBytes(it.scratch32[:]).String())
-	}
 	it.setResult(m, it.tmpA.Clear().SetBytes(it.scratch32[:]))
-	// Debug for PC 31
-	if m.evmPC == 31 {
-		if it.results != nil && m.idx >= 0 && m.idx < len(it.results) && it.results[m.idx] != nil {
-			fmt.Printf("DEBUG mirHandleCALLDATALOAD 31: After setResult, results[%d] = %s\n",
-				m.idx, it.results[m.idx].String())
-		}
-	}
 	return nil
 }
 
@@ -2788,31 +2385,11 @@ func mirHandleISZERO(it *MIRInterpreter, m *MIR) error {
 		return fmt.Errorf("ISZERO missing operand")
 	}
 	v := it.evalValue(m.operands[0])
-	// Debug for PC 6441
-	if m.evmPC == 6441 {
-		fmt.Printf("DEBUG ISZERO 6441: input value = %s, IsZero() = %v\n", v.String(), v.IsZero())
-		fmt.Printf("DEBUG ISZERO 6441: m.idx = %d, m.blockNum = %d\n", m.idx, it.currentBB.blockNum)
-	}
 	result := it.zeroConst
 	if v.IsZero() {
 		result = it.tmpA.Clear().SetOne()
 	}
-	if m.evmPC == 6441 {
-		fmt.Printf("DEBUG ISZERO 6441: output value = %s\n", result.String())
-		// Check what gets stored
-		fmt.Printf("DEBUG ISZERO 6441: Storing result, m.idx=%d\n", m.idx)
-	}
 	it.setResult(m, result)
-	if m.evmPC == 6441 {
-		// Verify what was stored
-		if it.results != nil && m.idx < len(it.results) && it.results[m.idx] != nil {
-			fmt.Printf("DEBUG ISZERO 6441: Verified stored result = %s\n", it.results[m.idx].String())
-		}
-		// Check globalResults
-		if it.globalResults != nil && it.globalResults[m] != nil {
-			fmt.Printf("DEBUG ISZERO 6441: Found in globalResults = %s\n", it.globalResults[m].String())
-		}
-	}
 	return nil
 }
 
@@ -2840,30 +2417,6 @@ func (it *MIRInterpreter) execArithmetic(m *MIR) error {
 	if len(m.operands) < 2 {
 		return fmt.Errorf("arithmetic op requires 2 operands")
 	}
-	// Debug for PC 246
-	if m.evmPC == 246 {
-		fmt.Printf("DEBUG execArithmetic 246: op = %s, operands count = %d, m.idx = %d\n", m.op.String(), len(m.operands), m.idx)
-		for i, op := range m.operands {
-			if op != nil {
-				fmt.Printf("DEBUG execArithmetic 246: operand[%d] kind = %v, def = %v\n", i, op.kind, op.def != nil)
-				if op.def != nil {
-					fmt.Printf("DEBUG execArithmetic 246: operand[%d] def evmPC = %d, def idx = %d\n", i, op.def.evmPC, op.def.idx)
-				}
-			}
-		}
-	}
-	// Debug for PC 6448
-	if m.evmPC == 6448 {
-		fmt.Printf("DEBUG execArithmetic 6448: op = %s, operands count = %d\n", m.op.String(), len(m.operands))
-		for i, op := range m.operands {
-			if op != nil {
-				fmt.Printf("DEBUG execArithmetic 6448: operand[%d] kind = %v, def = %v\n", i, op.kind, op.def != nil)
-				if op.def != nil {
-					fmt.Printf("DEBUG execArithmetic 6448: operand[%d] def evmPC = %d, def idx = %d\n", i, op.def.evmPC, op.def.idx)
-				}
-			}
-		}
-	}
 	// Check for Unknown operands - these indicate CFG construction issues
 	if m.operands[0] != nil && m.operands[0].kind == Unknown {
 		mirDebugError("MIR execArithmetic encountered Unknown operand[0] - requesting EVM fallback",
@@ -2877,23 +2430,11 @@ func (it *MIRInterpreter) execArithmetic(m *MIR) error {
 	}
 	a := it.evalValue(m.operands[0])
 	b := it.evalValue(m.operands[1])
-	// Debug for PC 246
-	if m.evmPC == 246 {
-		fmt.Printf("DEBUG execArithmetic 246: a = %s, b = %s\n", a.String(), b.String())
-	}
-	// Debug for PC 6448
-	if m.evmPC == 6448 {
-		fmt.Printf("DEBUG execArithmetic 6448: a = %s, b = %s\n", a.String(), b.String())
-	}
 
 	var out *uint256.Int
 	switch m.op {
 	case MirADD:
 		out = it.tmpA.Clear().Add(a, b)
-		// Debug for PC 6448
-		if m.evmPC == 6448 {
-			fmt.Printf("DEBUG execArithmetic 6448: a+b = %s\n", out.String())
-		}
 	case MirMUL:
 		out = it.tmpA.Clear().Mul(a, b)
 	case MirSUB:
@@ -2933,17 +2474,10 @@ func (it *MIRInterpreter) execArithmetic(m *MIR) error {
 		}
 	case MirLT:
 		// test a < b (right < left)
-		// Debug for PC 6440
-		if m != nil && m.evmPC == 6440 {
-			fmt.Printf("DEBUG LT 6440: a = %s, b = %s, a.Lt(b) = %v\n", a.String(), b.String(), a.Lt(b))
-		}
 		if a.Lt(b) {
 			out = it.tmpA.Clear().SetOne()
 		} else {
 			out = it.zeroConst
-		}
-		if m != nil && m.evmPC == 6440 {
-			fmt.Printf("DEBUG LT 6440: output = %s\n", out.String())
 		}
 	case MirGT:
 		if a.Gt(b) {
@@ -2964,18 +2498,10 @@ func (it *MIRInterpreter) execArithmetic(m *MIR) error {
 			out = it.zeroConst
 		}
 	case MirEQ:
-		// Debug for PC 246
-		if m != nil && m.evmPC == 246 {
-			fmt.Printf("DEBUG EQ 246: a = %s, b = %s, a.Eq(b) = %v\n", a.String(), b.String(), a.Eq(b))
-		}
 		if a.Eq(b) {
 			out = it.tmpA.Clear().SetOne()
 		} else {
 			out = it.zeroConst
-		}
-		// Debug for PC 246
-		if m != nil && m.evmPC == 246 {
-			fmt.Printf("DEBUG EQ 246: output = %s\n", out.String())
 		}
 	case MirAND:
 		out = it.tmpA.Clear().And(a, b)
@@ -3035,26 +2561,6 @@ func (it *MIRInterpreter) evalValue(v *Value) *uint256.Int {
 		// For now, return zeroConst as fallback, but this should ideally trigger EVM fallback
 		return it.zeroConst
 	case Variable, Arguments:
-		// Debug for PC 31
-		if v.def != nil && v.def.evmPC == 31 {
-			fmt.Printf("DEBUG evalValue: Resolving value from def evmPC=31, idx=%d, liveIn=%v, currentBB=%d\n",
-				v.def.idx, v.liveIn, func() uint {
-					if it.currentBB != nil {
-						return it.currentBB.blockNum
-					}
-					return 0
-				}())
-		}
-		// Debug for ADD operand at PC 6448
-		if v.def != nil && v.def.evmPC == 3315 {
-			fmt.Printf("DEBUG evalValue: Resolving value from def evmPC=3315, idx=%d, liveIn=%v, currentBB=%d\n",
-				v.def.idx, v.liveIn, func() uint {
-					if it.currentBB != nil {
-						return it.currentBB.blockNum
-					}
-					return 0
-				}())
-		}
 		// If this value is marked as live-in from a parent, prefer global cross-BB map first
 		if v.def != nil {
 			// For PHI definitions, prefer predecessor-sensitive cache
@@ -3108,97 +2614,19 @@ func (it *MIRInterpreter) evalValue(v *Value) *uint256.Int {
 					}
 				}
 			}
-			// Debug for PC 31
-			if v.def != nil && v.def.evmPC == 31 {
-				fmt.Printf("DEBUG evalValue: Checking local results for PC 31, idx=%d, results len=%d, defInCurrentBlock=%v\n",
-					v.def.idx, len(it.results), defInCurrentBlock)
-			}
 			if defInCurrentBlock && v.def.idx >= 0 && v.def.idx < len(it.results) {
 				if r := it.results[v.def.idx]; r != nil {
-					// Debug for PC 31
-					if v.def.evmPC == 31 {
-						fmt.Printf("DEBUG evalValue: Found PC 31 value in local results[%d] = %s, returning early\n", v.def.idx, r.String())
-					}
-					// Debug for condition evaluation at PC 6445
-					if v.def.evmPC == 6441 && v.def.op == MirISZERO {
-						fmt.Printf("DEBUG evalValue: Reading ISZERO result from results[%d] = %s\n", v.def.idx, r.String())
-					}
-					// Debug for PC 246
-					if v.def.evmPC == 246 {
-						fmt.Printf("DEBUG evalValue: Found EQ result in results[%d] = %s (currentBB=%d)\n",
-							v.def.idx, r.String(), func() uint {
-								if it.currentBB != nil {
-									return it.currentBB.blockNum
-								}
-								return 0
-							}())
-					}
-					// Debug for PC 3315
-					if v.def.evmPC == 3315 {
-						fmt.Printf("DEBUG evalValue: Found value in results[%d] = %s (currentBB=%d)\n",
-							v.def.idx, r.String(), func() uint {
-								if it.currentBB != nil {
-									return it.currentBB.blockNum
-								}
-								return 0
-							}())
-					}
 					return r
-				} else {
-					// Debug for PC 246 - result is nil
-					if v.def.evmPC == 246 {
-						fmt.Printf("DEBUG evalValue: EQ result at results[%d] is nil! (currentBB=%d, results len=%d)\n",
-							v.def.idx, func() uint {
-								if it.currentBB != nil {
-									return it.currentBB.blockNum
-								}
-								return 0
-							}(), len(it.results))
-					}
-				}
-			} else {
-				// Debug for PC 246 - idx out of range
-				if v.def != nil && v.def.evmPC == 246 {
-					fmt.Printf("DEBUG evalValue: EQ def idx=%d is out of range (results len=%d)\n", v.def.idx, len(it.results))
 				}
 			}
 			// Then try global cache for live-in values (only if not found locally)
 			if v.liveIn {
-				// Debug for PC 31
-				if v.def != nil && v.def.evmPC == 31 {
-					fmt.Printf("DEBUG evalValue: Entering liveIn path for PC 31, idx=%d\n", v.def.idx)
-				}
 				// PURE APPROACH 1: Always use signature-based cache (evmPC, idx)
 				// This is simpler, more maintainable, and absolutely correct for loops
 				if v.def.evmPC != 0 {
-					// Debug for PC 31
-					if v.def.evmPC == 31 {
-						fmt.Printf("DEBUG evalValue: Checking globalResultsBySig[31] for liveIn value, idx=%d\n", v.def.idx)
-						if it.globalResultsBySig != nil {
-							fmt.Printf("DEBUG evalValue: globalResultsBySig is not nil\n")
-							if byPC := it.globalResultsBySig[uint64(v.def.evmPC)]; byPC != nil {
-								fmt.Printf("DEBUG evalValue: globalResultsBySig[31] is not nil, checking idx=%d\n", v.def.idx)
-								if val, ok := byPC[v.def.idx]; ok && val != nil {
-									fmt.Printf("DEBUG evalValue: Found value in globalResultsBySig[31][%d] = %s (liveIn, no local result)\n", v.def.idx, val.String())
-									return val
-								} else {
-									fmt.Printf("DEBUG evalValue: NOT found in globalResultsBySig[31][%d] (liveIn, no local result), ok=%v, val=%v\n", v.def.idx, ok, val != nil)
-								}
-							} else {
-								fmt.Printf("DEBUG evalValue: globalResultsBySig[31] is nil (liveIn, no local result)\n")
-							}
-						} else {
-							fmt.Printf("DEBUG evalValue: globalResultsBySig is nil (liveIn, no local result)\n")
-						}
-					} else {
-						if byPC := it.globalResultsBySig[uint64(v.def.evmPC)]; byPC != nil {
-							if val, ok := byPC[v.def.idx]; ok && val != nil {
-								// Debug for PC 3315
-								if v.def.evmPC == 3315 {
-									fmt.Printf("DEBUG evalValue: Found value in globalResultsBySig[3315][%d] = %s (liveIn, no local result)\n", v.def.idx, val.String())
-								}
-								return val
-							}
+					if byPC := it.globalResultsBySig[uint64(v.def.evmPC)]; byPC != nil {
+						if val, ok := byPC[v.def.idx]; ok && val != nil {
+							return val
 						}
 					}
 				}
@@ -3206,10 +2634,6 @@ func (it *MIRInterpreter) evalValue(v *Value) *uint256.Int {
 				// Fallback to pointer-based cache for compatibility (mirHandleJUMP uses it)
 				if it.globalResults != nil {
 					if r, ok := it.globalResults[v.def]; ok && r != nil {
-						// Debug for PC 3315
-						if v.def.evmPC == 3315 {
-							fmt.Printf("DEBUG evalValue: Found value in globalResults[3315] = %s (liveIn, no local result)\n", r.String())
-						}
 						return r
 					}
 				}
@@ -3219,31 +2643,15 @@ func (it *MIRInterpreter) evalValue(v *Value) *uint256.Int {
 			if v.def.evmPC != 0 {
 				if byPC := it.globalResultsBySig[uint64(v.def.evmPC)]; byPC != nil {
 					if val, ok := byPC[v.def.idx]; ok && val != nil {
-						// Debug for PC 31
-						if v.def.evmPC == 31 {
-							fmt.Printf("DEBUG evalValue: Found value in globalResultsBySig[31][%d] = %s (non-liveIn)\n", v.def.idx, val.String())
-						}
 						return val
 					}
 				}
 			}
 			if it.globalResults != nil {
 				if r, ok := it.globalResults[v.def]; ok && r != nil {
-					// Debug for PC 31
-					if v.def.evmPC == 31 {
-						fmt.Printf("DEBUG evalValue: Found value in globalResults[31] = %s (non-liveIn)\n", r.String())
-					}
-					// Debug for PC 3315
-					if v.def.evmPC == 3315 {
-						fmt.Printf("DEBUG evalValue: Found value in globalResults (non-liveIn) = %s\n", r.String())
-					}
 					return r
 				}
 			}
-		}
-		// Debug for PC 31 - returning zeroConst
-		if v.def != nil && v.def.evmPC == 31 {
-			fmt.Printf("DEBUG evalValue: Returning zeroConst for PC 31, idx=%d (not found anywhere)\n", v.def.idx)
 		}
 		return it.zeroConst
 	default:
@@ -3257,10 +2665,6 @@ func (it *MIRInterpreter) setResult(m *MIR, val *uint256.Int) {
 	}
 	if m.idx < 0 {
 		return
-	}
-	// Debug for PC 3315
-	if m.evmPC == 3315 {
-		fmt.Printf("DEBUG setResult: PC 3315, idx=%d, value=%s, op=%s\n", m.idx, val.String(), m.op.String())
 	}
 	// Ensure results slice can hold index m.idx
 	if m.idx >= len(it.results) {
@@ -3277,10 +2681,6 @@ func (it *MIRInterpreter) setResult(m *MIR, val *uint256.Int) {
 		it.results[m.idx] = new(uint256.Int)
 	}
 	it.results[m.idx].Set(val)
-	// Debug for PC 3315
-	if m.evmPC == 3315 {
-		fmt.Printf("DEBUG setResult: PC 3315, stored in results[%d] = %s\n", m.idx, it.results[m.idx].String())
-	}
 }
 
 // MemoryCap returns the capacity of the internal memory buffer

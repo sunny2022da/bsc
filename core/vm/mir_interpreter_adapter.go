@@ -273,16 +273,7 @@ func NewMIRInterpreterAdapter(evm *EVM) *MIRInterpreterAdapter {
 						return err
 					}
 				}
-				// Debug for MLOAD at PC 6449
-				if ctx.EvmOp == byte(MLOAD) && ctx.M != nil && ctx.M.EvmPC() == 6449 {
-					fmt.Printf("DEBUG Gas MLOAD 6449: MemorySize=%d, memShadow.Len()=%d, gas=%d, contract.Gas=%d\n",
-						ctx.MemorySize, adapter.memShadow.Len(), gas, contract.Gas)
-				}
 				if contract.Gas < gas {
-					// Debug for out of gas
-					if ctx.EvmOp == byte(MLOAD) && ctx.M != nil && ctx.M.EvmPC() == 6449 {
-						fmt.Printf("DEBUG Gas MLOAD 6449: OUT OF GAS! contract.Gas=%d < gas=%d\n", contract.Gas, gas)
-					}
 					return ErrOutOfGas
 				}
 				contract.Gas -= gas
@@ -868,11 +859,6 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 					jt := (*adapter.table)[op]
 					if jt != nil && jt.constantGas > 0 {
 						total := jt.constantGas * uint64(cnt)
-						// Debug: log opcodes being charged for small contracts
-						if currentContract.Code != nil && len(currentContract.Code) < 50 {
-							fmt.Printf("[DEBUG]   Charging opcode 0x%02x (%s) count=%d gas_per=%d total=%d\n",
-								byte(op), op.String(), cnt, jt.constantGas, total)
-						}
 						if currentContract.Gas < total {
 							return ErrOutOfGas
 						}
@@ -883,15 +869,6 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 				// Store block entry gas charges for this block (for GAS opcode to add back)
 				if blockEntryTotalGas > 0 {
 					adapter.blockEntryGasCharges[ctx.Block] = blockEntryTotalGas
-					// Debug: log block entry gas charges for loop tests
-					if ctx.Block != nil && currentContract.Code != nil && len(currentContract.Code) < 50 {
-						// Only log for small contracts (like loop tests)
-						var blockPCs string
-						if ctx.Block.FirstPC() < uint(len(currentContract.Code)) {
-							blockPCs = fmt.Sprintf("PC:%d-%d", ctx.Block.FirstPC(), ctx.Block.LastPC())
-						}
-						fmt.Printf("[DEBUG] Block entry gas: block=%s gas=%d total_remaining=%d\n", blockPCs, blockEntryTotalGas, currentContract.Gas)
-					}
 				}
 			}
 		}
@@ -1062,11 +1039,6 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 			}
 		case MLOAD, MSTORE, MSTORE8, RETURN, REVERT, CREATE, CREATE2:
 			// Only charge gas if memory is expanding (same logic as the first beforeOp hook)
-			// Debug for MLOAD at PC 6449
-			if ctx.EvmOp == byte(MLOAD) && ctx.M != nil && ctx.M.EvmPC() == 6449 {
-				fmt.Printf("DEBUG Gas innerHook MLOAD 6449: MemorySize=%d, memShadow.Len()=%d, MIR memory len=%d\n",
-					ctx.MemorySize, adapter.memShadow.Len(), adapter.mirInterpreter.MemoryCap())
-			}
 			if ctx.MemorySize > uint64(adapter.memShadow.Len()) {
 				gas, err := memoryGasCost(adapter.memShadow, ctx.MemorySize)
 				if err != nil {
@@ -1075,15 +1047,7 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 					}
 					return err
 				}
-				// Debug for MLOAD at PC 6449
-				if ctx.EvmOp == byte(MLOAD) && ctx.M != nil && ctx.M.EvmPC() == 6449 {
-					fmt.Printf("DEBUG Gas innerHook MLOAD 6449: gas=%d, contract.Gas=%d\n", gas, contract.Gas)
-				}
 				if contract.Gas < gas {
-					// Debug for out of gas
-					if ctx.EvmOp == byte(MLOAD) && ctx.M != nil && ctx.M.EvmPC() == 6449 {
-						fmt.Printf("DEBUG Gas innerHook MLOAD 6449: OUT OF GAS! contract.Gas=%d < gas=%d\n", contract.Gas, gas)
-					}
 					return ErrOutOfGas
 				}
 				contract.Gas -= gas
