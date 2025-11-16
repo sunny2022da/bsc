@@ -273,7 +273,16 @@ func NewMIRInterpreterAdapter(evm *EVM) *MIRInterpreterAdapter {
 						return err
 					}
 				}
+				// Debug for MLOAD at PC 6449
+				if ctx.EvmOp == byte(MLOAD) && ctx.M != nil && ctx.M.EvmPC() == 6449 {
+					fmt.Printf("DEBUG Gas MLOAD 6449: MemorySize=%d, memShadow.Len()=%d, gas=%d, contract.Gas=%d\n",
+						ctx.MemorySize, adapter.memShadow.Len(), gas, contract.Gas)
+				}
 				if contract.Gas < gas {
+					// Debug for out of gas
+					if ctx.EvmOp == byte(MLOAD) && ctx.M != nil && ctx.M.EvmPC() == 6449 {
+						fmt.Printf("DEBUG Gas MLOAD 6449: OUT OF GAS! contract.Gas=%d < gas=%d\n", contract.Gas, gas)
+					}
 					return ErrOutOfGas
 				}
 				contract.Gas -= gas
@@ -1052,7 +1061,13 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 				}
 			}
 		case MLOAD, MSTORE, MSTORE8, RETURN, REVERT, CREATE, CREATE2:
-			if ctx.MemorySize > 0 {
+			// Only charge gas if memory is expanding (same logic as the first beforeOp hook)
+			// Debug for MLOAD at PC 6449
+			if ctx.EvmOp == byte(MLOAD) && ctx.M != nil && ctx.M.EvmPC() == 6449 {
+				fmt.Printf("DEBUG Gas innerHook MLOAD 6449: MemorySize=%d, memShadow.Len()=%d, MIR memory len=%d\n",
+					ctx.MemorySize, adapter.memShadow.Len(), adapter.mirInterpreter.MemoryCap())
+			}
+			if ctx.MemorySize > uint64(adapter.memShadow.Len()) {
 				gas, err := memoryGasCost(adapter.memShadow, ctx.MemorySize)
 				if err != nil {
 					if errors.Is(err, ErrGasUintOverflow) {
@@ -1060,7 +1075,15 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 					}
 					return err
 				}
+				// Debug for MLOAD at PC 6449
+				if ctx.EvmOp == byte(MLOAD) && ctx.M != nil && ctx.M.EvmPC() == 6449 {
+					fmt.Printf("DEBUG Gas innerHook MLOAD 6449: gas=%d, contract.Gas=%d\n", gas, contract.Gas)
+				}
 				if contract.Gas < gas {
+					// Debug for out of gas
+					if ctx.EvmOp == byte(MLOAD) && ctx.M != nil && ctx.M.EvmPC() == 6449 {
+						fmt.Printf("DEBUG Gas innerHook MLOAD 6449: OUT OF GAS! contract.Gas=%d < gas=%d\n", contract.Gas, gas)
+					}
 					return ErrOutOfGas
 				}
 				contract.Gas -= gas
@@ -1094,7 +1117,8 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 				resizeShadow(ctx.MemorySize)
 			}
 		case CALLDATACOPY, CODECOPY, RETURNDATACOPY:
-			if ctx.MemorySize > 0 {
+			// Only charge gas if memory is expanding
+			if ctx.MemorySize > uint64(adapter.memShadow.Len()) {
 				gas, err := memoryGasCost(adapter.memShadow, ctx.MemorySize)
 				if err != nil {
 					if errors.Is(err, ErrGasUintOverflow) {
@@ -1117,7 +1141,8 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 				resizeShadow(ctx.MemorySize)
 			}
 		case EXTCODECOPY:
-			if ctx.MemorySize > 0 {
+			// Only charge gas if memory is expanding
+			if ctx.MemorySize > uint64(adapter.memShadow.Len()) {
 				gas, err := memoryGasCost(adapter.memShadow, ctx.MemorySize)
 				if err != nil {
 					if errors.Is(err, ErrGasUintOverflow) {

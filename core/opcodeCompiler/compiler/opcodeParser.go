@@ -316,20 +316,70 @@ func GenerateMIRCFG(hash common.Hash, code []byte) (*CFG, error) {
 		// Seed entry stack for this block. If it has recorded entry snapshot, use it; else, if it
 		// has exactly one parent with an exit snapshot, inherit it; if multiple parents, ensure
 		// PHI nodes are materialized in buildBasicBlock.
+		// Debug for block containing PC 6440
+		if curBB.firstPC == 6437 || (curBB.firstPC <= 6440 && curBB.lastPC >= 6440) {
+			fmt.Printf("DEBUG CFG: Building block %d, firstPC=%d, lastPC=%d\n", curBB.blockNum, curBB.firstPC, curBB.lastPC)
+			fmt.Printf("DEBUG CFG: EntryStack() = %v\n", curBB.EntryStack() != nil)
+			if curBB.EntryStack() != nil {
+				fmt.Printf("DEBUG CFG: EntryStack size = %d\n", len(curBB.EntryStack()))
+			}
+			fmt.Printf("DEBUG CFG: Parents count = %d\n", len(curBB.Parents()))
+			for i, p := range curBB.Parents() {
+				if p != nil {
+					fmt.Printf("DEBUG CFG: Parent[%d] blockNum=%d, firstPC=%d, ExitStack=%v\n",
+						i, p.blockNum, p.firstPC, p.ExitStack() != nil)
+					if p.ExitStack() != nil {
+						fmt.Printf("DEBUG CFG: Parent[%d] ExitStack size = %d\n", i, len(p.ExitStack()))
+					}
+				}
+			}
+		}
 		if es := curBB.EntryStack(); es != nil {
 			valueStack.resetTo(es)
 			// Entry snapshot is a logical copy; not a parent live-in set.
+			if curBB.firstPC == 6437 || (curBB.firstPC <= 6440 && curBB.lastPC >= 6440) {
+				fmt.Printf("DEBUG CFG: Using EntryStack, size = %d\n", len(es))
+			}
 		} else if len(curBB.Parents()) == 1 {
-			if ps := curBB.Parents()[0].ExitStack(); ps != nil {
+			parent := curBB.Parents()[0]
+			if ps := parent.ExitStack(); ps != nil {
 				valueStack.resetTo(ps)
 				// Mark inherited parent values as live-ins for this block
 				valueStack.markAllLiveIn()
+				if curBB.firstPC == 6437 || (curBB.firstPC <= 6440 && curBB.lastPC >= 6440) {
+					fmt.Printf("DEBUG CFG: Using single parent ExitStack, size = %d\n", len(ps))
+				}
 			} else {
-				valueStack.resetTo(nil)
+				// Parent has no ExitStack (likely being rebuilt). Try to use incoming stack from this parent.
+				if incomingStacks := curBB.IncomingStacks(); incomingStacks != nil {
+					if incomingStack := incomingStacks[parent]; incomingStack != nil {
+						valueStack.resetTo(incomingStack)
+						valueStack.markAllLiveIn()
+						if curBB.firstPC == 6437 || (curBB.firstPC <= 6440 && curBB.lastPC >= 6440) {
+							fmt.Printf("DEBUG CFG: Parent has no ExitStack, using incoming stack, size = %d\n", len(incomingStack))
+						}
+					} else {
+						valueStack.resetTo(nil)
+						if curBB.firstPC == 6437 || (curBB.firstPC <= 6440 && curBB.lastPC >= 6440) {
+							fmt.Printf("DEBUG CFG: Single parent has no ExitStack and no incoming stack, resetting to nil\n")
+						}
+					}
+				} else {
+					valueStack.resetTo(nil)
+					if curBB.firstPC == 6437 || (curBB.firstPC <= 6440 && curBB.lastPC >= 6440) {
+						fmt.Printf("DEBUG CFG: Single parent has no ExitStack, resetting to nil\n")
+					}
+				}
 			}
 		} else {
 			// No known entry; clear stack to start fresh and let PHI creation fill in
 			valueStack.resetTo(nil)
+			if curBB.firstPC == 6437 || (curBB.firstPC <= 6440 && curBB.lastPC >= 6440) {
+				fmt.Printf("DEBUG CFG: No EntryStack and %d parents, resetting to nil\n", len(curBB.Parents()))
+			}
+		}
+		if curBB.firstPC == 6437 || (curBB.firstPC <= 6440 && curBB.lastPC >= 6440) {
+			fmt.Printf("DEBUG CFG: Initial stack size = %d\n", valueStack.size())
 		}
 		// Only rebuild if necessary. We now rebuild whenever a block is dequeued (new parent/incoming)
 		// or if it hasn't been built yet. Entry height alone is not sufficient because incomingStacks
@@ -844,6 +894,13 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 				depth = 0
 			}
 		case LT:
+			// Debug for PC 6440
+			if i == 6440 {
+				fmt.Printf("DEBUG CFG: Creating LT at PC %d, stack size = %d\n", i, valueStack.size())
+				if valueStack.size() < 2 {
+					fmt.Printf("DEBUG CFG: WARNING - Stack underflow! Stack size = %d, need 2\n", valueStack.size())
+				}
+			}
 			mir = curBB.CreateBinOpMIR(MirLT, valueStack)
 			if depth >= 2 {
 				depth--
