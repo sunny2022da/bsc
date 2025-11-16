@@ -603,6 +603,8 @@ func tryGetOptimizedCode(evm *EVM, codeHash common.Hash, rawCode []byte) (bool, 
 }
 
 // tryGetOptimizedCodeWithMIR attempts to get optimized code and load MIR CFG from cache for MIR interpreter execution
+// Uses a hybrid approach: synchronous generation for small contracts, async for large ones.
+// This balances performance (fast MIR for small contracts) with non-blocking behavior (async for large contracts).
 func tryGetOptimizedCodeWithMIR(evm *EVM, codeHash common.Hash, rawCode []byte, contract *Contract) (bool, []byte) {
 	var code []byte
 	optimized := false
@@ -616,25 +618,41 @@ func tryGetOptimizedCodeWithMIR(evm *EVM, codeHash common.Hash, rawCode []byte, 
 			return false, rawCode
 		}
 
-		// If no cached CFG, try to generate-and-cache synchronously as fallback
-		cfg, err := compiler.TryGenerateMIRCFG(codeHash, rawCode)
-		if err == nil && cfg != nil {
-			contract.SetMIRCFG(cfg)
-			return false, rawCode
+		// CFG not cached - use hybrid approach based on contract size
+		// Small contracts (< 10KB): synchronous generation for immediate MIR benefits
+		// Large contracts (>= 10KB): async generation to avoid blocking
+		const syncThreshold = 10 * 1024 // 10KB threshold
+		if len(rawCode) < syncThreshold {
+			// Small contract: try synchronous generation for fast MIR execution
+			cfg, err := compiler.TryGenerateMIRCFG(codeHash, rawCode)
+			if err == nil && cfg != nil {
+				contract.SetMIRCFG(cfg)
+				return false, rawCode
+			}
+			// If sync generation failed, fall through to async
 		}
+
+		// Large contract or sync generation failed: trigger async generation for future calls
+		// This is non-blocking and allows execution to proceed with EVM interpreter
+		compiler.GenOrLoadMIRCFG(codeHash, rawCode)
+
+		// Fall through to superinstruction path for this call
+		// Next time this contract is called, CFG will be ready in cache
 	}
+
 	// Superinstruction path: fall back to traditional bytecode optimization if no MIR CFG
+	// Use async generation to avoid blocking on first call
 	optCode := compiler.LoadOptimizedCode(codeHash)
 	if len(optCode) != 0 {
 		code = optCode
 		optimized = true
 	} else {
-		// Generate optimized code (superinstruction only, MIR already attempted above)
-		optCode, err := compiler.GenOrRewriteOptimizedCode(codeHash, rawCode)
-		if err == nil && len(optCode) != 0 {
-			code = optCode
-			optimized = true
-		}
+		// Trigger async superinstruction generation (non-blocking)
+		// This avoids synchronous generation overhead on first call
+		compiler.GenOrLoadOptimizedCode(codeHash, rawCode)
+		// Use raw code for this call, optimized code will be available next time
+		code = rawCode
+		optimized = false
 	}
 	return optimized, code
 }

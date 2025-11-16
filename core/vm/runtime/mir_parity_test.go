@@ -6,7 +6,10 @@ import (
 	"testing"
 
 	"os"
+
 	"sort"
+
+	"github.com/ethereum/go-ethereum/crypto"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/opcodeCompiler/compiler"
@@ -84,6 +87,12 @@ func TestMIRParity_USDT_Basic(t *testing.T) {
 
 		// Enable MIR generation only for the MIR run; base env already created
 		compiler.EnableOpcodeParse()
+		// Pre-generate CFG to ensure MIR is used
+		codeHash := crypto.Keccak256Hash(realCode)
+		_, err := compiler.TryGenerateMIRCFG(codeHash, realCode)
+		if err != nil {
+			t.Fatalf("failed to generate CFG for %s: %v", m.name, err)
+		}
 		// MIR run; capture last EVM pc via global MIR tracer
 		var mirLastPC uint64
 		compiler.SetGlobalMIRTracerExtended(func(mm *compiler.MIR) {
@@ -242,6 +251,12 @@ func TestMIRParity_Tiny(t *testing.T) {
 
 	// MIR
 	compiler.EnableOpcodeParse()
+	// Pre-generate CFG to ensure MIR is used
+	codeHash := crypto.Keccak256Hash(code)
+	_, err := compiler.TryGenerateMIRCFG(codeHash, code)
+	if err != nil {
+		t.Fatalf("failed to generate CFG: %v", err)
+	}
 	mirEnv := runtime.NewEnv(mirCfg)
 	mirAddr := common.BytesToAddress([]byte("tiny_mir"))
 	mirSender := vm.AccountRef(mirCfg.Origin)

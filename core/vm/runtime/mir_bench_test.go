@@ -366,6 +366,12 @@ func TestMIRVsEVM_Functional(t *testing.T) {
 
 	// cases: addMulReturn, storageStoreLoadReturn, keccakMemReturn, calldataKeccakReturn
 	t.Run("addMulReturn", func(t *testing.T) {
+		// Pre-generate CFG to ensure MIR is used
+		codeHash := crypto.Keccak256Hash(addMulReturn)
+		_, err := compiler.TryGenerateMIRCFG(codeHash, addMulReturn)
+		if err != nil {
+			t.Fatalf("failed to generate CFG: %v", err)
+		}
 		rb, err := run(base, addMulReturn, nil, "addr_am")
 		if err != nil {
 			t.Fatalf("base err: %v", err)
@@ -380,6 +386,12 @@ func TestMIRVsEVM_Functional(t *testing.T) {
 	})
 
 	t.Run("storage", func(t *testing.T) {
+		// Pre-generate CFG to ensure MIR is used
+		codeHash := crypto.Keccak256Hash(storageStoreLoadReturn)
+		_, err := compiler.TryGenerateMIRCFG(codeHash, storageStoreLoadReturn)
+		if err != nil {
+			t.Fatalf("failed to generate CFG: %v", err)
+		}
 		rb, err := run(base, storageStoreLoadReturn, nil, "addr_st")
 		if err != nil {
 			t.Fatalf("base err: %v", err)
@@ -394,6 +406,12 @@ func TestMIRVsEVM_Functional(t *testing.T) {
 	})
 
 	t.Run("keccak", func(t *testing.T) {
+		// Pre-generate CFG to ensure MIR is used
+		codeHash := crypto.Keccak256Hash(keccakMemReturn)
+		_, err := compiler.TryGenerateMIRCFG(codeHash, keccakMemReturn)
+		if err != nil {
+			t.Fatalf("failed to generate CFG: %v", err)
+		}
 		rb, err := run(base, keccakMemReturn, nil, "addr_km")
 		if err != nil {
 			t.Fatalf("base err: %v", err)
@@ -428,8 +446,13 @@ func TestMIRVsEVM_Functional(t *testing.T) {
 				mirKeccakSlice = append([]byte(nil), data...)
 			}
 		})
-		// Ensure MIR CFG is regenerated for this bytecode
-		compiler.DeleteMIRCFGCache(crypto.Keccak256Hash(calldataKeccakReturn))
+		// Pre-generate CFG to ensure MIR is used (delete first to force regeneration)
+		codeHash := crypto.Keccak256Hash(calldataKeccakReturn)
+		compiler.DeleteMIRCFGCache(codeHash)
+		_, err := compiler.TryGenerateMIRCFG(codeHash, calldataKeccakReturn)
+		if err != nil {
+			t.Fatalf("failed to generate CFG: %v", err)
+		}
 		// Attach base tracer to capture KECCAK inputs
 		var baseOff, baseSize uint64
 		var baseSlice []byte

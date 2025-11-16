@@ -566,13 +566,6 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 	depthKnown := false
 
 	parserDebugWarn("==buildBasicBlock==", "bb", curBB.blockNum, "firstPC", curBB.firstPC, "lastPC", curBB.lastPC, "parents", len(curBB.parents), "children", len(curBB.children))
-	if curBB.firstPC == 0 {
-		firstBytesLen := 10
-		if len(code) < firstBytesLen {
-			firstBytesLen = len(code)
-		}
-		parserDebugWarn("==buildBasicBlock== Processing entry block", "bb", curBB.blockNum, "code_len", len(code), "first_bytes", code[:firstBytesLen])
-	}
 
 	// If this block begins at a JUMPDEST, emit the MirJUMPDEST first, then place PHIs after it.
 	// This preserves the invariant that PHIs do not precede JUMPDEST and avoids PHI-only blocks.
