@@ -338,6 +338,31 @@ func (it *MIRInterpreter) RunMIR(block *MIRBasicBlock) ([]byte, error) {
 			}
 		}
 		if onlyNopsAndStop && hasStop {
+			// Ensure metering/tracing still occurs for JUMPDEST and STOP in this trivial block
+			if it.beforeOp != nil {
+				for i := 0; i < len(instrs); i++ {
+					ins := instrs[i]
+					if ins == nil {
+						continue
+					}
+					switch ins.op {
+					case MirJUMPDEST, MirSTOP:
+						ctx := &MIRPreOpContext{M: ins, EvmOp: ins.evmOp}
+						if ins.idx == 0 {
+							ctx.IsBlockEntry = true
+							ctx.Block = it.currentBB
+						}
+						if err := it.beforeOp(ctx); err != nil {
+							// STOP may be used by hooks for ordering; ignore STOP here
+							if err != errSTOP && err != errRETURN {
+								return nil, err
+							}
+						}
+					default:
+						continue
+					}
+				}
+			}
 			return it.returndata, nil
 		}
 	}
@@ -475,6 +500,94 @@ func (it *MIRInterpreter) RunCFGWithResolver(cfg *CFG, entry *MIRBasicBlock) ([]
 				return bb
 			}
 			mirDebugWarn("MIR RunCFGWithResolver: not found bb", "pc", pc)
+			// On-the-fly backfill: if destination is a valid JUMPDEST in code, synthesize the block now.
+			// This handles dynamic-dispatch patterns where PHI-derived jump targets were not statically enqueued.
+			// 0x5b is JUMPDEST
+			if cfg.rawCode != nil && int(pc) < len(cfg.rawCode) && cfg.rawCode[pc] == 0x5b {
+				// Create the target block and wire current block as a parent if available
+				parent := it.currentBB
+				targetBB := cfg.createBB(uint(pc), parent)
+				if parent != nil {
+					// Propagate exit stack snapshot as incoming for PHI materialization
+					if es := parent.ExitStack(); es != nil {
+						targetBB.AddIncomingStack(parent, es)
+					}
+				}
+				// Build the block and any immediate children enqueued during build
+				var vs ValueStack
+				// Seed entry stack: inherit from single parent if present
+				if parent != nil && len(targetBB.Parents()) == 1 {
+					if ps := targetBB.Parents()[0].ExitStack(); ps != nil {
+						vs.resetTo(ps)
+						vs.markAllLiveIn()
+					}
+				}
+				var unproc MIRBasicBlockStack
+				// Always rebuild to ensure fresh MIR
+				targetBB.ResetForRebuild(true)
+				if err := cfg.buildBasicBlock(targetBB, &vs, cfg.getMemoryAccessor(), cfg.getStateAccessor(), &unproc); err == nil {
+					targetBB.built = true
+					targetBB.queued = false
+					// Seed processing queue with both enqueued children and existing children to force rebuild with updated incoming stacks
+					type bbQueue struct{ items []*MIRBasicBlock }
+					push := func(q *bbQueue, b *MIRBasicBlock) {
+						if b != nil {
+							q.items = append(q.items, b)
+						}
+					}
+					pop := func(q *bbQueue) *MIRBasicBlock {
+						if len(q.items) == 0 {
+							return nil
+						}
+						b := q.items[len(q.items)-1]
+						q.items = q.items[:len(q.items)-1]
+						return b
+					}
+					var q bbQueue
+					// Add all statically linked children
+					for _, ch := range targetBB.Children() {
+						push(&q, ch)
+					}
+					// Drain any enqueued children from build
+					for unproc.Size() != 0 {
+						push(&q, unproc.Pop())
+					}
+					// Process queue with a conservative budget
+					limit := 256
+					visited := make(map[*MIRBasicBlock]bool)
+					for len(q.items) > 0 && limit > 0 {
+						nb := pop(&q)
+						if nb == nil {
+							break
+						}
+						if visited[nb] {
+							limit--
+							continue
+						}
+						visited[nb] = true
+						// Seed entry from single parent if possible
+						vs.resetTo(nil)
+						if len(nb.Parents()) == 1 {
+							if ps := nb.Parents()[0].ExitStack(); ps != nil {
+								vs.resetTo(ps)
+								vs.markAllLiveIn()
+							}
+						}
+						nb.ResetForRebuild(true)
+						if err := cfg.buildBasicBlock(nb, &vs, cfg.getMemoryAccessor(), cfg.getStateAccessor(), &unproc); err == nil {
+							nb.built = true
+							nb.queued = false
+							// Add its children to queue as well
+							for _, ch := range nb.Children() {
+								push(&q, ch)
+							}
+						}
+						limit--
+					}
+					// Index is updated by createBB; return the newly created bb
+					return targetBB
+				}
+			}
 			return nil
 		}
 	}
@@ -2647,6 +2760,12 @@ func (it *MIRInterpreter) evalValue(v *Value) *uint256.Int {
 					}
 				}
 			}
+			// Try to compute the value on-demand for pure/side-effect-free ops
+			if val := it.evalDefPure(v.def); val != nil {
+				// Memoize into local results for subsequent reads in this block
+				it.setResult(v.def, val)
+				return val
+			}
 			if it.globalResults != nil {
 				if r, ok := it.globalResults[v.def]; ok && r != nil {
 					return r
@@ -2657,6 +2776,101 @@ func (it *MIRInterpreter) evalValue(v *Value) *uint256.Int {
 	default:
 		return it.zeroConst
 	}
+}
+
+// evalDefPure attempts a best-effort, side-effect-free evaluation of a defining MIR instruction.
+// It is used to recover values that are needed before their producer was executed due to ordering issues.
+// Only pure arithmetic/bitwise/stackless ops are supported. Returns nil if not supported.
+func (it *MIRInterpreter) evalDefPure(m *MIR) *uint256.Int {
+	if m == nil {
+		return nil
+	}
+	switch m.op {
+	case MirADD, MirMUL, MirSUB, MirDIV, MirSDIV, MirMOD, MirSMOD, MirEXP,
+		MirLT, MirGT, MirSLT, MirSGT, MirEQ,
+		MirAND, MirOR, MirXOR,
+		MirBYTE, MirSHL, MirSHR, MirSAR,
+		MirISZERO, MirNOT:
+		// Require two operands for binary ops; unary ops will ignore b
+		var a, b *uint256.Int
+		if len(m.operands) >= 1 {
+			a = it.evalValue(m.operands[0])
+		} else {
+			a = it.zeroConst
+		}
+		if len(m.operands) >= 2 {
+			b = it.evalValue(m.operands[1])
+		} else {
+			b = it.zeroConst
+		}
+		out := new(uint256.Int)
+		switch m.op {
+		case MirADD:
+			return out.Add(a, b)
+		case MirMUL:
+			return out.Mul(a, b)
+		case MirSUB:
+			return out.Sub(a, b)
+		case MirDIV:
+			return out.Div(a, b)
+		case MirSDIV:
+			return out.SDiv(a, b)
+		case MirMOD:
+			return out.Mod(a, b)
+		case MirSMOD:
+			return out.SMod(a, b)
+		case MirEXP:
+			return out.Exp(a, b)
+		case MirLT:
+			if a.Lt(b) {
+				return out.SetOne()
+			}
+			return it.zeroConst
+		case MirGT:
+			if a.Gt(b) {
+				return out.SetOne()
+			}
+			return it.zeroConst
+		case MirSLT:
+			if a.Slt(b) {
+				return out.SetOne()
+			}
+			return it.zeroConst
+		case MirSGT:
+			if a.Sgt(b) {
+				return out.SetOne()
+			}
+			return it.zeroConst
+		case MirEQ:
+			if a.Eq(b) {
+				return out.SetOne()
+			}
+			return it.zeroConst
+		case MirAND:
+			return out.And(a, b)
+		case MirOR:
+			return out.Or(a, b)
+		case MirXOR:
+			return out.Xor(a, b)
+		case MirBYTE:
+			return b.Byte(a)
+		case MirSHL:
+			return out.Lsh(b, uint(a.Uint64()))
+		case MirSHR:
+			return out.Rsh(b, uint(a.Uint64()))
+		case MirSAR:
+			return out.SRsh(b, uint(a.Uint64()))
+		case MirISZERO:
+			if a.IsZero() {
+				return out.SetOne()
+			}
+			return it.zeroConst
+		case MirNOT:
+			return out.Not(a)
+		}
+	}
+	// Unsupported for on-demand pure eval
+	return nil
 }
 
 func (it *MIRInterpreter) setResult(m *MIR, val *uint256.Int) {

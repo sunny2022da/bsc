@@ -204,6 +204,83 @@ type CFG struct {
 	pcToBlock     map[uint]*MIRBasicBlock   // bytecode PC -> basic block
 }
 
+// --- Helpers for conservative constant extraction during CFG build ---
+// readConstUint reads a uint64 from a MIR Value if it is a constant, otherwise returns false.
+func readConstUint(v *Value) (uint64, bool) {
+	if v == nil {
+		return 0, false
+	}
+	switch v.kind {
+	case Konst:
+		// Prefer numeric form if available
+		if v.u != nil {
+			if v.u.IsUint64() {
+				return v.u.Uint64(), true
+			}
+			return 0, false
+		}
+		// Else decode big-endian payload bytes
+		var out uint64
+		for _, b := range v.payload {
+			out = (out << 8) | uint64(b)
+		}
+		return out, true
+	default:
+		return 0, false
+	}
+}
+
+// evalConstFromDef tries to evaluate a MIR definition into a constant uint64 for simple arithmetic/PC cases.
+// This is a conservative best-effort to unlock jump targets hidden behind PHIs of simple expressions.
+func evalConstFromDef(def *MIR) (uint64, bool) {
+	if def == nil {
+		return 0, false
+	}
+	switch def.op {
+	// Basic arithmetic supported by EVM jump-table patterns (e.g., SUB/ADD of small constants)
+	case MirADD, MirSUB:
+		if len(def.operands) < 2 {
+			return 0, false
+		}
+		a, okA := readConstUint(def.operands[0])
+		if !okA {
+			if def.operands[0] != nil && def.operands[0].kind == Variable && def.operands[0].def != nil {
+				a, okA = evalConstFromDef(def.operands[0].def)
+			}
+		}
+		b, okB := readConstUint(def.operands[1])
+		if !okB {
+			if def.operands[1] != nil && def.operands[1].kind == Variable && def.operands[1].def != nil {
+				b, okB = evalConstFromDef(def.operands[1].def)
+			}
+		}
+		if !okA || !okB {
+			return 0, false
+		}
+		if def.op == MirADD {
+			return a + b, true
+		}
+		return a - b, true
+	// Treat PC as its build-time EVM pc for constant folding purposes
+	case MirPC:
+		return uint64(def.evmPC), true
+	// Direct JUMPDEST placeholder yields its pc
+	case MirJUMPDEST:
+		return uint64(def.evmPC), true
+	default:
+		// Try to unwrap a variable-producing def if its single operand is constant-evaluable
+		if len(def.operands) == 1 && def.operands[0] != nil {
+			if cv, ok := readConstUint(def.operands[0]); ok {
+				return cv, true
+			}
+			if def.operands[0].kind == Variable && def.operands[0].def != nil {
+				return evalConstFromDef(def.operands[0].def)
+			}
+		}
+		return 0, false
+	}
+}
+
 func NewCFG(hash common.Hash, code []byte) (c *CFG) {
 	c = &CFG{}
 	c.codeAddr = hash
@@ -1094,8 +1171,19 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 									}
 									parserDebugWarn("==buildBasicBlock== phi.target", "pc", tpc)
 									targetSet[tpc] = true
-								} else if ov.kind == Variable && ov.def != nil && ov.def.op == MirPHI {
-									visitPhi(ov.def)
+								} else if ov.kind == Variable && ov.def != nil {
+									// Recurse into nested PHIs
+									if ov.def.op == MirPHI {
+										visitPhi(ov.def)
+										continue
+									}
+									// Try constant-folding for simple arithmetic/PC expressions
+									if tpc, ok := evalConstFromDef(ov.def); ok {
+										parserDebugWarn("==buildBasicBlock== phi.target", "pc", tpc)
+										targetSet[tpc] = true
+										continue
+									}
+									unknown = true
 								} else {
 									unknown = true
 								}
@@ -1162,6 +1250,36 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 						_ = oldExit
 						return nil
 					}
+					// Try constant-folding even if the root isn't a PHI
+					if d.kind == Variable && d.def != nil {
+						if tpc, ok := evalConstFromDef(d.def); ok {
+							if tpc < uint64(len(code)) && ByteCode(code[tpc]) == JUMPDEST {
+								existingBB, targetExists := c.pcToBlock[uint(tpc)]
+								hadParentBefore := false
+								if targetExists && existingBB != nil {
+									for _, p := range existingBB.Parents() {
+										if p == curBB {
+											hadParentBefore = true
+											break
+										}
+									}
+								}
+								targetBB := c.createBB(uint(tpc), curBB)
+								targetBB.SetInitDepthMax(depth)
+								curBB.SetChildren([]*MIRBasicBlock{targetBB})
+								curBB.SetExitStack(valueStack.clone())
+								targetBB.SetParents([]*MIRBasicBlock{curBB})
+								targetBB.AddIncomingStack(curBB, curBB.ExitStack())
+								if !targetExists || (targetExists && !hadParentBefore) {
+									if !targetBB.queued {
+										targetBB.queued = true
+										unprcessedBBs.Push(targetBB)
+									}
+								}
+								return nil
+							}
+						}
+					}
 					// Fallback: direct constant destination in operand payload
 					if d.payload != nil {
 						// Interpret payload as big-endian integer
@@ -1199,28 +1317,8 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 							targetBB.SetParents([]*MIRBasicBlock{curBB})
 							targetBB.AddIncomingStack(curBB, curBB.ExitStack())
 							parserDebugWarn("MIR JUMP targetBB", "curBB", curBB.blockNum, "curBB.firstPC", curBB.firstPC, "targetBB.firstPC", targetBB.firstPC, "targetBBPC", targetBB.FirstPC(), "targetBBLastPC", targetBB.LastPC())
-							// Ensure the linear fallthrough block (i+1) is created and queued for processing,
-							// so its pc is mapped even if no edge comes from this JUMP (useful for future targets).
-							if _, ok := c.pcToBlock[uint(i+1)]; !ok {
-								fall := c.createBB(uint(i+1), nil)
-								fall.SetInitDepthMax(depth)
-								if !fall.queued {
-									fall.queued = true
-									parserDebugWarn("==buildBasicBlock== MIR JUMP fallthrough BB queued", "curbb", curBB.blockNum, "curBB.firstPC", curBB.firstPC,
-										"targetbb", fall.blockNum, "targetbbfirstpc", fall.firstPC, "targetBBPC", fall.FirstPC(), "targetBBLastPC", fall.LastPC())
-									unprcessedBBs.Push(fall)
-								}
-							} else {
-								if fall, ok2 := c.pcToBlock[uint(i+1)]; ok2 {
-									fall.SetInitDepthMax(depth)
-									if !fall.queued {
-										fall.queued = true
-										parserDebugWarn("==buildBasicBlock== MIR JUMP fallthrough BB queued", "curbb", curBB.blockNum, "curBB.firstPC", curBB.firstPC,
-											"targetbb", fall.blockNum, "targetbbfirstpc", fall.firstPC, "targetBBPC", fall.FirstPC(), "targetBBLastPC", fall.LastPC())
-										unprcessedBBs.Push(fall)
-									}
-								}
-							}
+							// Do not enqueue or process a linear fallthrough (i+1) unless it is an actual successor edge.
+							// Creating and processing orphan fallthrough blocks (with no incoming edge) corrupts stack modeling.
 							if !targetExists || (targetExists && !hadParentBefore) {
 								if !targetBB.queued {
 									targetBB.queued = true
