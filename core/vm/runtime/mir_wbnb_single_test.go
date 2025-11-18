@@ -23,11 +23,11 @@ import (
 // TestWBNB_Transfer_EVMvsMIR_Debug only runs the WBNB transfer selector once,
 // compares base EVM vs MIR (errors and returndata), and emits debug logs.
 func TestWBNB_Transfer_EVMvsMIR_Debug(t *testing.T) {
-	// Make sure MIR opcode parsing and logging are enabled
+	// Make sure MIR opcode parsing is enabled
 	compiler.EnableOpcodeParse()
-	compiler.EnableMIRDebugLogs(true)
-	{
-		// Force logger to WARN so MIR logs are visible without env var
+	// Enable MIR debug logs only when MIR_DEBUG=1
+	if os.Getenv("MIR_DEBUG") == "1" {
+		compiler.EnableMIRDebugLogs(true)
 		h := ethlog.NewTerminalHandlerWithLevel(os.Stdout, ethlog.LevelWarn, false)
 		ethlog.SetDefault(ethlog.NewLogger(h))
 	}
@@ -167,8 +167,8 @@ func TestWBNB_Transfer_EVMvsMIR_Debug(t *testing.T) {
 // TestWBNB_View_Name_EVMvsMIR_Success: pure view success parity
 func TestWBNB_View_Name_EVMvsMIR_Success(t *testing.T) {
 	compiler.EnableOpcodeParse()
-	compiler.EnableMIRDebugLogs(true)
-	{
+	if os.Getenv("MIR_DEBUG") == "1" {
+		compiler.EnableMIRDebugLogs(true)
 		h := ethlog.NewTerminalHandlerWithLevel(os.Stdout, ethlog.LevelWarn, false)
 		ethlog.SetDefault(ethlog.NewLogger(h))
 	}
@@ -260,8 +260,8 @@ func TestWBNB_View_Name_EVMvsMIR_Success(t *testing.T) {
 // TestWBNB_Deposit_Then_Transfer_EVMvsMIR_Success: deposit then transfer to non-zero recipient
 func TestWBNB_Deposit_Then_Transfer_EVMvsMIR_Success(t *testing.T) {
 	compiler.EnableOpcodeParse()
-	compiler.EnableMIRDebugLogs(true)
-	{
+	if os.Getenv("MIR_DEBUG") == "1" {
+		compiler.EnableMIRDebugLogs(true)
 		h := ethlog.NewTerminalHandlerWithLevel(os.Stdout, ethlog.LevelWarn, false)
 		ethlog.SetDefault(ethlog.NewLogger(h))
 	}
@@ -464,6 +464,7 @@ func BenchmarkWBNB_View_Name(b *testing.B) {
 // TestWBNB_Deposit_EVMvsMIR_Success: deposit only, success and parity with MIR fallback allowed
 func TestWBNB_Deposit_EVMvsMIR_Parity(t *testing.T) {
 	compiler.EnableOpcodeParse()
+	compiler.EnableMIRDebugLogs(true)
 	// read creation code and derive runtime
 	raw, err := os.ReadFile("../test_contract/wbnb_creation_code.txt")
 	if err != nil {
@@ -590,8 +591,8 @@ func TestWBNB_Deposit_EVMvsMIR_Parity(t *testing.T) {
 // TestWBNB_Deposit_EVMvsMIR_Success: deposit mints WBNB equal to msg.value, then balanceOf(sender) must match
 func TestWBNB_Deposit_EVMvsMIR_Success(t *testing.T) {
 	compiler.EnableOpcodeParse()
-	compiler.EnableMIRDebugLogs(true)
-	{
+	if os.Getenv("MIR_DEBUG") == "1" {
+		compiler.EnableMIRDebugLogs(true)
 		h := ethlog.NewTerminalHandlerWithLevel(os.Stdout, ethlog.LevelWarn, false)
 		ethlog.SetDefault(ethlog.NewLogger(h))
 	}
@@ -635,7 +636,7 @@ func TestWBNB_Deposit_EVMvsMIR_Success(t *testing.T) {
 		Origin:      common.Address{},
 		BlockNumber: big.NewInt(15_000_000),
 		Value:       big.NewInt(0),
-		EVMConfig:   vm.Config{EnableOpcodeOptimizations: true, EnableMIR: true, EnableMIRInitcode: true, MIRStrictNoFallback: false},
+		EVMConfig:   vm.Config{EnableOpcodeOptimizations: true, EnableMIR: true, EnableMIRInitcode: true, MIRStrictNoFallback: true},
 	}
 	// setup states
 	address := common.BytesToAddress([]byte("contract_wbnb_deposit"))
