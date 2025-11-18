@@ -3,10 +3,9 @@ package runtime_test
 import (
 	"encoding/hex"
 	"math/big"
-	"testing"
-
 	"os"
 	"sort"
+	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/opcodeCompiler/compiler"
@@ -20,9 +19,7 @@ import (
 )
 
 func TestMIRParity_USDT_Basic(t *testing.T) {
-	if os.Getenv("MIR_PARITY_REAL") != "1" {
-		t.Skip("Skipping real-contract parity (set MIR_PARITY_REAL=1 to enable)")
-	}
+
 	// Decode USDT bytecode from benchmarks
 	realCode, err := hex.DecodeString(usdtHex[2:])
 	if err != nil {
@@ -134,9 +131,7 @@ func TestMIRParity_USDT_Basic(t *testing.T) {
 }
 
 func TestMIRParity_WBNB_Basic(t *testing.T) {
-	if os.Getenv("MIR_PARITY_REAL") != "1" {
-		t.Skip("Skipping real-contract parity (set MIR_PARITY_REAL=1 to enable)")
-	}
+
 	// Decode WBNB bytecode from benchmarks
 	code, err := hex.DecodeString(wbnbHex[2:])
 	if err != nil {
