@@ -503,6 +503,236 @@ func TestMIRVsEVM_Functional(t *testing.T) {
 	})
 }
 
+// -----------------------------
+// Copy ops micro-benchmarks
+// -----------------------------
+
+func BenchmarkCopyOps_CALLDATACOPY(b *testing.B) {
+	cfgBase := &runtime.Config{ChainConfig: params.BSCChainConfig, GasLimit: 10_000_000, Origin: common.Address{}, BlockNumber: params.BSCChainConfig.LondonBlock, Value: big.NewInt(0), EVMConfig: vm.Config{EnableOpcodeOptimizations: false}}
+	cfgMIR := &runtime.Config{ChainConfig: params.BSCChainConfig, GasLimit: 10_000_000, Origin: common.Address{}, BlockNumber: params.BSCChainConfig.LondonBlock, Value: big.NewInt(0), EVMConfig: vm.Config{EnableOpcodeOptimizations: true, EnableMIR: true, EnableMIRInitcode: true}}
+	sizes := []int{1, 32, 33, 1024, 65536}
+	preExpands := []bool{false, true}
+	for _, n := range sizes {
+		for _, pre := range preExpands {
+			name := fmt.Sprintf("len=%d_pre=%t", n, pre)
+			b.Run("Base_"+name, func(b *testing.B) {
+				if cfgBase.State == nil {
+					cfgBase.State, _ = state.New(types.EmptyRootHash, state.NewDatabaseForTesting())
+				}
+				evm := runtime.NewEnv(cfgBase)
+				addr := common.BytesToAddress([]byte("calldatacopy_b"))
+				evm.StateDB.CreateAccount(addr)
+				evm.StateDB.SetCode(addr, makeCodeCalldatacopy(n, pre))
+				sender := vm.AccountRef(cfgBase.Origin)
+				input := make([]byte, n)
+				for i := range input {
+					input[i] = byte(i)
+				}
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					_, _, err := evm.Call(sender, addr, input, cfgBase.GasLimit, uint256.MustFromBig(cfgBase.Value))
+					if err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+			b.Run("MIR_"+name, func(b *testing.B) {
+				compiler.EnableOpcodeParse()
+				if cfgMIR.State == nil {
+					cfgMIR.State, _ = state.New(types.EmptyRootHash, state.NewDatabaseForTesting())
+				}
+				evm := runtime.NewEnv(cfgMIR)
+				addr := common.BytesToAddress([]byte("calldatacopy_m"))
+				evm.StateDB.CreateAccount(addr)
+				evm.StateDB.SetCode(addr, makeCodeCalldatacopy(n, pre))
+				sender := vm.AccountRef(cfgMIR.Origin)
+				input := make([]byte, n)
+				for i := range input {
+					input[i] = byte(i)
+				}
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					_, _, err := evm.Call(sender, addr, input, cfgMIR.GasLimit, uint256.MustFromBig(cfgMIR.Value))
+					if err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+		}
+	}
+}
+
+func BenchmarkCopyOps_CODECOPY(b *testing.B) {
+	cfgBase := &runtime.Config{ChainConfig: params.BSCChainConfig, GasLimit: 10_000_000, Origin: common.Address{}, BlockNumber: params.BSCChainConfig.LondonBlock, Value: big.NewInt(0), EVMConfig: vm.Config{EnableOpcodeOptimizations: false}}
+	cfgMIR := &runtime.Config{ChainConfig: params.BSCChainConfig, GasLimit: 10_000_000, Origin: common.Address{}, BlockNumber: params.BSCChainConfig.LondonBlock, Value: big.NewInt(0), EVMConfig: vm.Config{EnableOpcodeOptimizations: true, EnableMIR: true, EnableMIRInitcode: true}}
+	sizes := []int{1, 32, 33, 1024, 65536}
+	preExpands := []bool{false, true}
+	for _, n := range sizes {
+		for _, pre := range preExpands {
+			name := fmt.Sprintf("len=%d_pre=%t", n, pre)
+			b.Run("Base_"+name, func(b *testing.B) {
+				if cfgBase.State == nil {
+					cfgBase.State, _ = state.New(types.EmptyRootHash, state.NewDatabaseForTesting())
+				}
+				evm := runtime.NewEnv(cfgBase)
+				addr := common.BytesToAddress([]byte("codecopy_b"))
+				evm.StateDB.CreateAccount(addr)
+				evm.StateDB.SetCode(addr, makeCodeCodecopy(n, pre))
+				sender := vm.AccountRef(cfgBase.Origin)
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					_, _, err := evm.Call(sender, addr, nil, cfgBase.GasLimit, uint256.MustFromBig(cfgBase.Value))
+					if err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+			b.Run("MIR_"+name, func(b *testing.B) {
+				compiler.EnableOpcodeParse()
+				if cfgMIR.State == nil {
+					cfgMIR.State, _ = state.New(types.EmptyRootHash, state.NewDatabaseForTesting())
+				}
+				evm := runtime.NewEnv(cfgMIR)
+				addr := common.BytesToAddress([]byte("codecopy_m"))
+				evm.StateDB.CreateAccount(addr)
+				evm.StateDB.SetCode(addr, makeCodeCodecopy(n, pre))
+				sender := vm.AccountRef(cfgMIR.Origin)
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					_, _, err := evm.Call(sender, addr, nil, cfgMIR.GasLimit, uint256.MustFromBig(cfgMIR.Value))
+					if err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+		}
+	}
+}
+
+func BenchmarkCopyOps_RETURNDATACOPY(b *testing.B) {
+	cfgBase := &runtime.Config{ChainConfig: params.BSCChainConfig, GasLimit: 10_000_000, Origin: common.Address{}, BlockNumber: params.BSCChainConfig.LondonBlock, Value: big.NewInt(0), EVMConfig: vm.Config{EnableOpcodeOptimizations: false}}
+	cfgMIR := &runtime.Config{ChainConfig: params.BSCChainConfig, GasLimit: 10_000_000, Origin: common.Address{}, BlockNumber: params.BSCChainConfig.LondonBlock, Value: big.NewInt(0), EVMConfig: vm.Config{EnableOpcodeOptimizations: true, EnableMIR: true, EnableMIRInitcode: true}}
+	sizes := []int{1, 32, 33, 1024, 65536}
+	preExpands := []bool{false, true}
+	callee := common.HexToAddress("0x1000000000000000000000000000000000000001")
+	for _, n := range sizes {
+		// RETURNDATA available is 32 bytes from callee; cap length to 32 to avoid out-of-bounds
+		ln := n
+		if ln > 32 {
+			ln = 32
+		}
+		for _, pre := range preExpands {
+			name := fmt.Sprintf("len=%d_pre=%t", ln, pre)
+			b.Run("Base_"+name, func(b *testing.B) {
+				if cfgBase.State == nil {
+					cfgBase.State, _ = state.New(types.EmptyRootHash, state.NewDatabaseForTesting())
+				}
+				evm := runtime.NewEnv(cfgBase)
+				main := common.BytesToAddress([]byte("returndatacopy_b"))
+				evm.StateDB.CreateAccount(callee)
+				evm.StateDB.SetCode(callee, makeCalleeReturn32())
+				evm.StateDB.CreateAccount(main)
+				evm.StateDB.SetCode(main, makeCodeReturndatacopy(callee, ln, pre))
+				sender := vm.AccountRef(cfgBase.Origin)
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					_, _, err := evm.Call(sender, main, nil, cfgBase.GasLimit, uint256.MustFromBig(cfgBase.Value))
+					if err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+			b.Run("MIR_"+name, func(b *testing.B) {
+				compiler.EnableOpcodeParse()
+				if cfgMIR.State == nil {
+					cfgMIR.State, _ = state.New(types.EmptyRootHash, state.NewDatabaseForTesting())
+				}
+				evm := runtime.NewEnv(cfgMIR)
+				main := common.BytesToAddress([]byte("returndatacopy_m"))
+				evm.StateDB.CreateAccount(callee)
+				evm.StateDB.SetCode(callee, makeCalleeReturn32())
+				evm.StateDB.CreateAccount(main)
+				evm.StateDB.SetCode(main, makeCodeReturndatacopy(callee, ln, pre))
+				sender := vm.AccountRef(cfgMIR.Origin)
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					_, _, err := evm.Call(sender, main, nil, cfgMIR.GasLimit, uint256.MustFromBig(cfgMIR.Value))
+					if err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+		}
+	}
+}
+
+func BenchmarkCopyOps_MCOPY(b *testing.B) {
+	// Ensure Prague is active so MCOPY is available
+	var pragueTs uint64 = 0
+	if params.BSCChainConfig.PragueTime != nil {
+		pragueTs = *params.BSCChainConfig.PragueTime
+	} else {
+		pragueTs = 1
+	}
+	cfgBase := &runtime.Config{ChainConfig: params.BSCChainConfig, GasLimit: 10_000_000, Origin: common.Address{}, BlockNumber: params.BSCChainConfig.LondonBlock, Time: pragueTs, Value: big.NewInt(0), EVMConfig: vm.Config{EnableOpcodeOptimizations: false}}
+	cfgMIR := &runtime.Config{ChainConfig: params.BSCChainConfig, GasLimit: 10_000_000, Origin: common.Address{}, BlockNumber: params.BSCChainConfig.LondonBlock, Time: pragueTs, Value: big.NewInt(0), EVMConfig: vm.Config{EnableOpcodeOptimizations: true, EnableMIR: true, EnableMIRInitcode: true}}
+	type mcase struct {
+		name      string
+		dst, src  int
+		length    int
+		preExpand bool
+	}
+	cases := []mcase{
+		{"overlap_small", 4, 0, 16, true},
+		{"nonoverlap_small", 32, 0, 16, true},
+		{"overlap_large", 64, 0, 1024, true},
+	}
+	for _, cs := range cases {
+		b.Run("Base_"+cs.name, func(b *testing.B) {
+			if cfgBase.State == nil {
+				cfgBase.State, _ = state.New(types.EmptyRootHash, state.NewDatabaseForTesting())
+			}
+			evm := runtime.NewEnv(cfgBase)
+			addr := common.BytesToAddress([]byte("mcopy_b"))
+			evm.StateDB.CreateAccount(addr)
+			evm.StateDB.SetCode(addr, makeCodeMCopyOverlap(cs.dst, cs.src, cs.length, cs.preExpand))
+			sender := vm.AccountRef(cfgBase.Origin)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				_, _, err := evm.Call(sender, addr, nil, cfgBase.GasLimit, uint256.MustFromBig(cfgBase.Value))
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+		b.Run("MIR_"+cs.name, func(b *testing.B) {
+			compiler.EnableOpcodeParse()
+			if cfgMIR.State == nil {
+				cfgMIR.State, _ = state.New(types.EmptyRootHash, state.NewDatabaseForTesting())
+			}
+			evm := runtime.NewEnv(cfgMIR)
+			addr := common.BytesToAddress([]byte("mcopy_m"))
+			evm.StateDB.CreateAccount(addr)
+			evm.StateDB.SetCode(addr, makeCodeMCopyOverlap(cs.dst, cs.src, cs.length, cs.preExpand))
+			sender := vm.AccountRef(cfgMIR.Origin)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				_, _, err := evm.Call(sender, addr, nil, cfgMIR.GasLimit, uint256.MustFromBig(cfgMIR.Value))
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
 func TestAddMulReturn_BaseAndMIR(t *testing.T) {
 	if cfg, err := compiler.GenerateMIRCFG(common.Hash{}, addMulReturn); err == nil && cfg != nil {
 		ops := make([]byte, 0)
