@@ -1,6 +1,7 @@
 package compiler
 
 import (
+	"bytes"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/holiman/uint256"
 )
@@ -62,8 +63,13 @@ type MIRBasicBlock struct {
 	// Precomputed live-outs: definitions (MIR) whose values are live at block exit
 	liveOutDefs []*MIR
 	// Build bookkeeping
-	built  bool // set true after first successful build
-	queued bool // true if currently enqueued for (re)build
+	built        bool // set true after first successful build
+	queued       bool // true if currently enqueued for (re)build
+	rebuildCount int  // number of times this block has been rebuilt
+	// Stack analysis
+	staticStackDelta int  // net stack change from executing this block once
+	isLoopHeader     bool // true if this block is a loop header
+	inferredHeight   int  // inferred stack height from Phase 1 analysis
 }
 
 func (b *MIRBasicBlock) Size() uint {
@@ -910,6 +916,7 @@ func stacksEqual(a, b []Value) bool {
 // - Konst: compare numeric equality (uint256)
 // - Variable: if both have defs, compare def.op, def.evmPC and def.phiStackIndex; else require both nil
 // - Arguments/Unknown: equal if kinds match
+// - Lazy: compare payload (slot index)
 func equalValueForFlow(a, b *Value) bool {
 	if a == nil || b == nil {
 		return a == b
@@ -946,6 +953,9 @@ func equalValueForFlow(a, b *Value) bool {
 			return false
 		}
 		return true
+	case Lazy:
+		// Compare payload (slot index)
+		return bytes.Equal(a.payload, b.payload)
 	case Arguments, Unknown:
 		return true
 	default:

@@ -1,6 +1,7 @@
 package compiler
 
 import (
+	"encoding/binary"
 	"fmt"
 	"os"
 
@@ -48,6 +49,8 @@ func debugFormatValue(v *Value) string {
 			return fmt.Sprintf("var:def@%d", v.def.idx)
 		}
 		return "var"
+	case Lazy:
+		return "lazy"
 	default:
 		return "unknown"
 	}
@@ -202,6 +205,12 @@ type CFG struct {
 	// Fast lookup helpers, built on demand
 	selectorIndex map[uint32]*MIRBasicBlock // 4-byte selector -> entry basic block
 	pcToBlock     map[uint]*MIRBasicBlock   // bytecode PC -> basic block
+	// Deep cycle detection (lazy)
+	deepCycleDetection bool                                       // whether to enable expensive DFS cycle detection
+	cycleCache         map[*MIRBasicBlock]map[*MIRBasicBlock]bool // cache isDescendant results
+	// Loop information for Phase 1 height inference
+	loopHeaders map[*MIRBasicBlock]bool                    // set of loop headers
+	loopBlocks  map[*MIRBasicBlock]map[*MIRBasicBlock]bool // loop header -> set of blocks in loop
 }
 
 func NewCFG(hash common.Hash, code []byte) (c *CFG) {
@@ -268,7 +277,314 @@ func (c *CFG) reachEndBB() {
 	// TODO - zlin:  check the child is backward only.
 }
 
+// ==============================================================================
+// Phase 0: Static Stack Delta Analysis (方案7)
+// ==============================================================================
+
+// computeStaticStackDelta calculates the net stack height change for a block
+// by simulating execution of its bytecode without considering dynamic values.
+func computeStaticStackDelta(code []byte, startPC, endPC uint) int {
+	delta := 0
+	pc := int(startPC)
+	end := int(endPC)
+
+	for pc < end && pc < len(code) {
+		op := ByteCode(code[pc])
+
+		// Stack effect of each opcode
+		switch {
+		// Zero input, one output (net +1)
+		case op >= PUSH1 && op <= PUSH32,
+			op == ADDRESS, op == ORIGIN, op == CALLER, op == CALLVALUE,
+			op == CALLDATASIZE, op == CODESIZE, op == GASPRICE,
+			op == RETURNDATASIZE, op == COINBASE, op == TIMESTAMP,
+			op == NUMBER, op == PREVRANDAO, op == GASLIMIT, op == CHAINID,
+			op == SELFBALANCE, op == PC, op == MSIZE, op == GAS:
+			delta++
+
+		// DUPn: copy stack[n-1], net +1
+		case op >= DUP1 && op <= DUP16:
+			delta++
+
+		// One input, one output (net 0)
+		case op == ISZERO, op == NOT, op == BALANCE, op == CALLDATALOAD,
+			op == EXTCODESIZE, op == EXTCODEHASH, op == BLOCKHASH, op == MLOAD,
+			op == SLOAD:
+			// delta += 0
+
+		// Two inputs, one output (net -1)
+		case op == ADD, op == MUL, op == SUB, op == DIV, op == SDIV,
+			op == MOD, op == SMOD, op == EXP, op == SIGNEXTEND,
+			op == LT, op == GT, op == SLT, op == SGT, op == EQ,
+			op == AND, op == OR, op == XOR, op == BYTE, op == SHL,
+			op == SHR, op == SAR, op == KECCAK256:
+			delta--
+
+		// Three inputs, one output (net -2)
+		case op == ADDMOD, op == MULMOD:
+			delta -= 2
+
+		// SWAPn: no net change
+		case op >= SWAP1 && op <= SWAP16:
+			// delta += 0
+
+		// POP: net -1
+		case op == POP:
+			delta--
+
+		// MSTORE, MSTORE8, SSTORE: net -2
+		case op == MSTORE, op == MSTORE8:
+			delta -= 2
+		case op == SSTORE:
+			delta -= 2
+
+		// JUMP: net -1
+		case op == JUMP:
+			delta--
+
+		// JUMPI: net -2
+		case op == JUMPI:
+			delta -= 2
+
+		// Memory/Calldata ops
+		case op == CALLDATACOPY, op == CODECOPY, op == RETURNDATACOPY:
+			delta -= 3
+
+		// LOGn: -(n+2)
+		case op >= LOG0 && op <= LOG4:
+			delta -= int(op-LOG0) + 2
+
+		// CREATE: 3 inputs, 1 output (net -2)
+		case op == CREATE:
+			delta -= 2
+
+		// CALL family: varies
+		case op == CALL, op == CALLCODE:
+			delta -= 6 // 7 inputs, 1 output
+		case op == DELEGATECALL, op == STATICCALL:
+			delta -= 5 // 6 inputs, 1 output
+		case op == CREATE2:
+			delta -= 3 // 4 inputs, 1 output
+
+		// RETURN, REVERT: net -2
+		case op == RETURN, op == REVERT:
+			delta -= 2
+
+		// SELFDESTRUCT: net -1
+		case op == SELFDESTRUCT:
+			delta--
+		}
+
+		// Advance PC (handle PUSH data)
+		if op >= PUSH1 && op <= PUSH32 {
+			pushSize := int(op - PUSH1 + 1)
+			pc += pushSize + 1
+		} else {
+			pc++
+		}
+	}
+
+	return delta
+}
+
+// ==============================================================================
+// Phase 1: Loop Detection and Height Inference (方案8)
+// ==============================================================================
+
+// detectLoops identifies loop headers using a simple back-edge detection.
+// A back-edge exists if a block has a child that is also its ancestor in DFS.
+func (c *CFG) detectLoops() {
+	if c.loopHeaders == nil {
+		c.loopHeaders = make(map[*MIRBasicBlock]bool)
+	}
+	if c.loopBlocks == nil {
+		c.loopBlocks = make(map[*MIRBasicBlock]map[*MIRBasicBlock]bool)
+	}
+
+	visited := make(map[*MIRBasicBlock]bool)
+	recStack := make(map[*MIRBasicBlock]bool) // recursion stack for DFS
+
+	var dfs func(*MIRBasicBlock)
+	dfs = func(block *MIRBasicBlock) {
+		if block == nil {
+			return
+		}
+
+		visited[block] = true
+		recStack[block] = true
+
+		for _, child := range block.Children() {
+			if child == nil {
+				continue
+			}
+
+			if recStack[child] {
+				// Back-edge found: block -> child (child is ancestor)
+				// child is a loop header
+				c.loopHeaders[child] = true
+				child.isLoopHeader = true
+			} else if !visited[child] {
+				dfs(child)
+			}
+		}
+
+		recStack[block] = false
+	}
+
+	// Start DFS from entry block (firstPC == 0)
+	for _, block := range c.basicBlocks {
+		if block != nil && block.FirstPC() == 0 {
+			dfs(block)
+			break
+		}
+	}
+}
+
+// inferStackHeights performs Phase 1: infer stack heights for all blocks.
+// This uses a worklist algorithm with cycle-aware maxH computation (方案8).
+// Returns true if inference succeeded, false if stack is too deep.
+func (c *CFG) inferStackHeights() bool {
+	const (
+		ABSOLUTE_MAX        = 100 // Conservative limit for CFG analysis
+		EARLY_THRESHOLD     = 5   // Trigger widening after 5 rebuilds (方案10)
+		MAX_LOOP_GROWTH     = 20  // Max stack growth allowed per loop
+		MAX_LOOP_ITERATIONS = 5   // Conservative loop iteration estimate
+	)
+
+	heights := make(map[*MIRBasicBlock]int)
+	iterations := make(map[*MIRBasicBlock]int)
+	worklist := []*MIRBasicBlock{}
+
+	// Initialize entry block
+	var entryBlock *MIRBasicBlock
+	for _, block := range c.basicBlocks {
+		if block != nil && block.FirstPC() == 0 {
+			entryBlock = block
+			heights[block] = 0
+			block.inferredHeight = 0
+			worklist = append(worklist, block)
+			break
+		}
+	}
+
+	if entryBlock == nil {
+		return false
+	}
+
+	// Worklist algorithm
+	for len(worklist) > 0 {
+		// Pop from worklist
+		block := worklist[0]
+		worklist = worklist[1:]
+
+		if block == nil {
+			continue
+		}
+
+		var entryH int
+
+		if block.isLoopHeader {
+			// 方案8: Cycle-aware maxH for loop headers
+			// Only consider external (non-loop) parents
+			external_maxH := 0
+			hasExternal := false
+
+			for _, parent := range block.Parents() {
+				if parent == nil {
+					continue
+				}
+
+				// Check if parent is in the same loop (is it a back-edge?)
+				isBackEdge := false
+				for _, child := range parent.Children() {
+					if child == block {
+						// Check if this is a back-edge by seeing if parent comes "after" block
+						if parent.firstPC > block.firstPC {
+							isBackEdge = true
+							break
+						}
+					}
+				}
+
+				if !isBackEdge {
+					// External parent
+					parentExit := heights[parent] + parent.staticStackDelta
+					if parentExit > external_maxH {
+						external_maxH = parentExit
+					}
+					hasExternal = true
+				}
+			}
+
+			if !hasExternal {
+				external_maxH = heights[block] // Use current if no external
+			}
+
+			// Estimate loop growth bound (方案7)
+			loopGrowth := 0
+			if block.staticStackDelta > 0 {
+				loopGrowth = block.staticStackDelta * MAX_LOOP_ITERATIONS
+			}
+			if loopGrowth > MAX_LOOP_GROWTH {
+				loopGrowth = MAX_LOOP_GROWTH
+			}
+
+			entryH = external_maxH + loopGrowth
+
+		} else {
+			// Non-loop block: normal max of all parents
+			maxH := 0
+			for _, parent := range block.Parents() {
+				if parent == nil {
+					continue
+				}
+				parentExit := heights[parent] + parent.staticStackDelta
+				if parentExit > maxH {
+					maxH = parentExit
+				}
+			}
+			entryH = maxH
+		}
+
+		// 方案10: Enhanced widening for unstable blocks
+		iterations[block]++
+		if iterations[block] > EARLY_THRESHOLD {
+			// If still growing after threshold, cap it
+			oldH := heights[block]
+			if entryH > oldH+5 { // Growing more than 5 in one iteration is suspicious
+				entryH = oldH + 5 // Limit growth
+			}
+		}
+
+		// Check absolute limit
+		if entryH > ABSOLUTE_MAX {
+			// Stack too deep, abort CFG generation
+			return false
+		}
+
+		// Update if changed
+		oldH := heights[block]
+		if entryH != oldH {
+			heights[block] = entryH
+			block.inferredHeight = entryH
+
+			// Propagate to children
+			for _, child := range block.Children() {
+				if child != nil {
+					worklist = append(worklist, child)
+				}
+			}
+		}
+	}
+
+	return true
+}
+
 // GenerateMIRCFG generates a MIR Control Flow Graph for the given bytecode
+// This implementation uses a two-phase approach:
+// Phase 0: Compute staticStackDelta for basic blocks (方案7)
+// Phase 1: Detect loops and infer stack heights with cycle-aware maxH (方案8 + 方案10)
+// Phase 2: Build CFG using fixed heights from Phase 1 (方案1)
 func GenerateMIRCFG(hash common.Hash, code []byte) (*CFG, error) {
 	if len(code) == 0 {
 		return nil, fmt.Errorf("empty code")
@@ -288,6 +604,12 @@ func GenerateMIRCFG(hash common.Hash, code []byte) (*CFG, error) {
 	unprcessedBBs := MIRBasicBlockStack{}
 	unprcessedBBs.Push(startBB)
 
+	// ==============================================================================
+	// PHASE 0: Quick scan to compute staticStackDelta for all blocks
+	// This must be done during the initial CFG construction
+	// ==============================================================================
+	// We'll compute staticStackDelta during block building (in buildBasicBlock)
+
 	// Guard against pathological CFG explosions in large contracts.
 	// Adapt the budget to the contract size: set to raw bytecode length.
 	// This keeps analysis proportional to program size and avoids premature truncation.
@@ -297,7 +619,61 @@ func GenerateMIRCFG(hash common.Hash, code []byte) (*CFG, error) {
 	}
 	processedUnique := 0
 
+	iterationCount := 0
+	lastLogIteration := 0
+	blockIterationCount := make(map[uint64]int)
+	phase1Applied := false // Track if Phase 1 has been applied
+
 	for unprcessedBBs.Size() != 0 {
+		iterationCount++
+
+		// ==============================================================================
+		// PHASE 1 TRIGGER: If iterations exceed threshold, apply cycle-aware analysis
+		// ==============================================================================
+		if iterationCount == 1000 && !phase1Applied {
+			fmt.Fprintf(os.Stderr, "\n⚠️  CFG generation exceeds 1000 iterations, applying Phase 1 analysis...\n")
+
+			// Compute staticStackDelta for all existing blocks
+			for _, block := range cfg.basicBlocks {
+				if block != nil && block.lastPC > block.firstPC {
+					block.staticStackDelta = computeStaticStackDelta(code, block.firstPC, block.lastPC)
+				}
+			}
+
+			// Detect loops
+			cfg.detectLoops()
+
+			// Infer stack heights with cycle-aware maxH
+			if !cfg.inferStackHeights() {
+				fmt.Fprintf(os.Stderr, "❌ Stack too deep during Phase 1 analysis, aborting CFG generation\n")
+				return nil, fmt.Errorf("stack depth exceeds conservative limit (100) during CFG generation")
+			}
+
+			fmt.Fprintf(os.Stderr, "✅ Phase 1 analysis completed, continuing with fixed heights...\n")
+			phase1Applied = true
+		}
+
+		// Abort if still looping after Phase 1
+		if phase1Applied && iterationCount > 5000 {
+			fmt.Fprintf(os.Stderr, "❌ CFG generation still exceeds 5000 iterations after Phase 1, aborting\n")
+			return nil, fmt.Errorf("CFG generation failed to converge after Phase 1 analysis")
+		}
+
+		// Log progress every 1000 iterations
+		if iterationCount-lastLogIteration >= 1000 {
+			// Find the most frequently rebuilt blocks
+			maxCount := 0
+			var maxPC uint64
+			for pc, count := range blockIterationCount {
+				if count > maxCount {
+					maxCount = count
+					maxPC = pc
+				}
+			}
+			fmt.Fprintf(os.Stderr, "🔄 CFG iteration=%d, unique=%d/%d, queue=%d, hottestBlock=PC%d(x%d)\n",
+				iterationCount, processedUnique, maxBasicBlocks, unprcessedBBs.Size(), maxPC, maxCount)
+			lastLogIteration = iterationCount
+		}
 		if processedUnique >= maxBasicBlocks {
 			parserDebugWarn("MIR CFG build budget reached", "blocks", processedUnique)
 			break
@@ -306,6 +682,8 @@ func GenerateMIRCFG(hash common.Hash, code []byte) (*CFG, error) {
 		if curBB == nil {
 			continue
 		}
+		// Track block processing frequency
+		blockIterationCount[uint64(curBB.firstPC)]++
 		parserDebugWarn("==GenerateMIRCFG== unprcessedBBs.Pop", "curBB", curBB.blockNum, "curBB.built", curBB.built, "firstPC", curBB.firstPC,
 			"lastPC", curBB.lastPC, "parents", len(curBB.parents),
 			"children", len(curBB.children))
@@ -360,6 +738,8 @@ func GenerateMIRCFG(hash common.Hash, code []byte) (*CFG, error) {
 			// Clear any previously generated MIR for this block to avoid duplications when
 			// the entry stack height has changed and we need to rebuild.
 			curBB.ResetForRebuild(true)
+			curBB.rebuildCount++ // Track rebuild frequency
+
 			err := cfg.buildBasicBlock(curBB, &valueStack, memoryAccessor, stateAccessor, &unprcessedBBs)
 
 			parserDebugWarn("==GenerateMIRCFG== buildBasicBlock exit", "curBB", curBB.blockNum, "firstPC", curBB.firstPC, "lastPC", curBB.lastPC,
@@ -374,6 +754,28 @@ func GenerateMIRCFG(hash common.Hash, code []byte) (*CFG, error) {
 			curBB.queued = false
 			// If exit changed, propagate to children and enqueue them
 			newExit := curBB.ExitStack()
+			// Detect infinite stack growth in cyclic graphs
+			if newExit != nil && len(newExit) > 1024 {
+				// Try deep detection if not already enabled
+				if !cfg.deepCycleDetection {
+					fmt.Fprintf(os.Stderr, "⚠️  Stack overflow detected at PC=%d (size=%d), enabling deep cycle detection and retrying\n",
+						curBB.firstPC, len(newExit))
+					cfg.deepCycleDetection = true
+					// Reset this block and retry
+					curBB.built = false
+					curBB.queued = true
+					curBB.exitStack = nil
+					unprcessedBBs.Push(curBB)
+					continue
+				}
+
+				// Even deep detection failed
+				fmt.Fprintf(os.Stderr, "❌ CFG generation failed: stack overflow at PC=%d (size=%d, rebuild#%d)\n",
+					curBB.firstPC, len(newExit), curBB.rebuildCount)
+				fmt.Fprintf(os.Stderr, "💡 Reason: PHI node infinite loop in cyclic control flow\n")
+				fmt.Fprintf(os.Stderr, "💡 Falling back to base EVM interpreter (MIR optimization disabled for this contract)\n")
+				return nil, fmt.Errorf("stack overflow during CFG generation at PC=%d", curBB.firstPC)
+			}
 			if !stacksEqual(prevExit, newExit) {
 				for _, ch := range curBB.Children() {
 					if ch == nil {
@@ -391,6 +793,8 @@ func GenerateMIRCFG(hash common.Hash, code []byte) (*CFG, error) {
 			}
 		}
 	}
+	fmt.Fprintf(os.Stderr, "✅ CFG generation completed: totalIterations=%d, uniqueBlocks=%d, totalBlocks=%d\n",
+		iterationCount, processedUnique, len(cfg.basicBlocks))
 	// Fix entry block (firstPC == 0) to ensure it falls through to PC:2 if it's JUMPDEST
 	// This fixes cases where the entry block should end after PUSH1 and fall through to the loop block
 	cfg.buildPCIndex()
@@ -595,124 +999,167 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 	// If this block has multiple parents and recorded incoming stacks, insert PHI nodes to form a unified
 	// entry stack and seed the current stack accordingly.
 	if len(curBB.Parents()) > 1 && len(curBB.IncomingStacks()) > 0 {
-		// Determine the maximum stack height among incoming paths
-		maxH := 0
-		for _, st := range curBB.IncomingStacks() {
-			if l := len(st); l > maxH {
-				maxH = l
+		// Capture snapshot of incoming stacks for the thunks
+		incomingSnapshot := make(map[*MIRBasicBlock][]Value)
+		for p, st := range curBB.IncomingStacks() {
+			if st != nil {
+				incomingSnapshot[p] = st
 			}
 		}
-		// Build PHIs from bottom to top so the last pushed corresponds to top-of-stack
-		tmp := ValueStack{}
-		for i := maxH - 1; i >= 0; i-- {
-			// Collect ith from top across parents if available
-			var ops []*Value
-			for _, p := range curBB.Parents() {
-				st := curBB.IncomingStacks()[p]
-				if st != nil && len(st) > i {
-					// stack top is end; index from top
-					v := st[len(st)-1-i]
-					vv := v          // copy
-					vv.liveIn = true // mark incoming as live-in so interpreter prefers globalResults
-					ops = append(ops, &vv)
-				} else {
-					// missing value -> nothing to append
-					// ops = append(ops, newValue(Unknown, nil, nil, nil))
-				}
+
+		var maxH int
+
+		// ==============================================================================
+		// PHASE 2: Use inferred height if Phase 1 was applied
+		// ==============================================================================
+		if curBB.inferredHeight > 0 {
+			// Use the fixed height from Phase 1 analysis (方案1 Phase 2)
+			maxH = curBB.inferredHeight
+		} else {
+			// Fallback to original strategy if Phase 1 not yet applied
+			const DEEP_DETECTION_THRESHOLD = 20
+			useDeepDetection := c.deepCycleDetection || curBB.rebuildCount > DEEP_DETECTION_THRESHOLD
+
+			if useDeepDetection {
+				maxH = c.computeMaxHWithDeepCycleDetection(curBB)
+			} else {
+				maxH = c.computeMaxHFast(curBB)
 			}
-			// Simplify: if all operands are equal, avoid PHI and push the value directly
-			simplified := false
-			// First, deduplicate equal operands within this PHI slot
-			if len(ops) > 1 {
-				uniq := make([]*Value, 0, len(ops))
-				for _, o := range ops {
-					dup := false
-					for _, u := range uniq {
-						if equalValueForFlow(o, u) {
-							dup = true
-							break
+		}
+
+		// Initialize valueStack with Lazy Thunks for each slot
+		lazyStack := make([]Value, maxH)
+		for i := 0; i < maxH; i++ {
+			// ValueStack order: [Bottom, ..., Top].
+			// i=0 -> Bottom (Deepest). Slot index from top: maxH - 1
+			// i=maxH-1 -> Top. Slot index from top: 0
+
+			slotFromTop := maxH - 1 - i
+
+			// Define the thunk closure
+			// IMPORTANT: Capture slotFromTop in closure, NOT 'i' which changes in loop
+			capturedSlot := slotFromTop
+
+			// Cache result to ensure stable identity once resolved
+			var cached *Value
+
+			thunk := func() *Value {
+				if cached != nil {
+					return cached
+				}
+
+				// Collect operands from parents
+				var ops []*Value
+				for _, p := range curBB.Parents() {
+					st := incomingSnapshot[p] // Use SNAPSHOT, not curBB.IncomingStacks()
+					// st is [Bottom...Top].
+					// We want 'capturedSlot' from Top.
+					// Index = len(st) - 1 - capturedSlot.
+					if st != nil && len(st) > capturedSlot {
+						v := &st[len(st)-1-capturedSlot]
+						// Resolve if the operand is itself lazy
+						if v.kind == Lazy && v.Lazy != nil {
+							v = resolveValue(v)
+						}
+						if v == nil {
+							// Resolution failed up the chain?
+							continue // treat as missing
+						}
+						vv := *v         // copy
+						vv.liveIn = true // mark incoming as live-in
+						ops = append(ops, &vv)
+					} else {
+						// Missing (stack too short)
+					}
+				}
+
+				if len(ops) == 0 {
+					// Resolution failed: no operands
+					return nil
+				}
+
+				// Simplify
+				simplified := false
+				if len(ops) > 1 {
+					uniq := make([]*Value, 0, len(ops))
+					for _, o := range ops {
+						dup := false
+						for _, u := range uniq {
+							if equalValueForFlow(o, u) {
+								dup = true
+								break
+							}
+						}
+						if !dup {
+							uniq = append(uniq, o)
 						}
 					}
-					if !dup {
-						uniq = append(uniq, o)
-					}
+					ops = uniq
 				}
-				ops = uniq
-			}
-			if len(ops) > 0 {
-				base := ops[0]
-				if base != nil && base.kind != Unknown {
+				if len(ops) == 1 {
+					cached = ops[0]
+					simplified = true
+				} else if len(ops) > 1 {
+					// Check if all are same (redundant with above logic, but double check)
+					base := ops[0]
 					equalAll := true
 					for k := 1; k < len(ops); k++ {
-						if ops[k] == nil || ops[k].kind == Unknown || !equalValueForFlow(base, ops[k]) {
+						if !equalValueForFlow(base, ops[k]) {
 							equalAll = false
 							break
 						}
 					}
 					if equalAll {
-						// Push the representative value and continue
-						tmp.push(base)
+						cached = base
 						simplified = true
-						// Optional debug
-						parserDebugWarn("MIR PHI simplified", "bb", curBB.blockNum, "phiSlot", i, "val", debugFormatValue(base))
 					}
 				}
+
+				if simplified {
+					return cached
+				}
+
+				// Create PHI
+				// Note: We are inside a closure called during buildBasicBlock (or later).
+				// We assume curBB is the block we are building.
+				// BUT: curBB might be finished?
+				// No, we execute instructions sequentially. We only resolve when we need the value.
+				// So we are actively building curBB.
+				// Using 'curBB' from closure scope is correct.
+
+				// Check if existing PHI matches? (Might be hard if we are generating on fly)
+				// We just create a new one.
+
+				// DO NOT PUSH result to stack (the thunk IS the stack item).
+				// We append instruction to block.
+				mir := new(MIR)
+				mir.op = MirPHI
+				mir.operands = ops
+				mir.phiStackIndex = capturedSlot
+
+				mir = curBB.appendMIR(mir)
+
+				res := mir.Result()
+				cached = res
+				return cached
 			}
-			if simplified {
-				continue
+
+			payload := make([]byte, 2)
+			binary.BigEndian.PutUint16(payload, uint16(slotFromTop))
+
+			val := Value{
+				kind:    Lazy,
+				Lazy:    thunk,
+				payload: payload,
 			}
-			// If a PHI for this slot already exists, merge new operands and reuse it
-			var existing *MIR
-			for _, m := range curBB.Instructions() {
-				if m != nil && m.op == MirPHI && (m.phiStackIndex == i) {
-					existing = m
-					break
-				}
-			}
-			if existing != nil {
-				// Merge incoming operands and deduplicate
-				merged := append(append([]*Value{}, existing.operands...), ops...)
-				uniq := make([]*Value, 0, len(merged))
-				for _, o := range merged {
-					dup := false
-					for _, u := range uniq {
-						if equalValueForFlow(o, u) {
-							dup = true
-							break
-						}
-					}
-					if !dup {
-						uniq = append(uniq, o)
-					}
-				}
-				existing.operands = uniq
-				// If only one unique operand remains, bypass PHI
-				if len(uniq) == 1 {
-					tmp.push(uniq[0])
-					parserDebugWarn("MIR PHI merged->simplified", "bb", curBB.blockNum, "phiSlot", i, "val", debugFormatValue(uniq[0]))
-				} else {
-					tmp.push(existing.Result())
-					parserDebugWarn("MIR PHI merged", "bb", curBB.blockNum, "phiSlot", i, "phi", existing, "phi.operands", existing.operands)
-				}
-			} else {
-				// If only one operand after dedup, avoid creating PHI
-				if len(ops) == 1 {
-					tmp.push(ops[0])
-					parserDebugWarn("MIR PHI single->simplified", "bb", curBB.blockNum, "phiSlot", i, "val", debugFormatValue(ops[0]))
-					continue
-				}
-				phi := curBB.CreatePhiMIR(ops, &tmp)
-				if phi != nil {
-					phi.phiStackIndex = i
-					parserDebugWarn("MIR PHI created", "bb", curBB.blockNum, "phiSlot", i, "phi", phi, "phi.operands", phi.operands)
-				}
-			}
+			lazyStack[i] = val
 		}
-		// tmp now has values bottom-to-top; assign as entry
-		curBB.SetEntryStack(tmp.clone())
-		valueStack.resetTo(curBB.EntryStack())
-		depth = len(curBB.EntryStack())
+
+		curBB.SetEntryStack(lazyStack)
+		valueStack.resetTo(lazyStack)
+		depth = maxH
 		depthKnown = true
+
 	} else if es := curBB.EntryStack(); es != nil {
 		valueStack.resetTo(es)
 		depth = len(es)
@@ -721,6 +1168,7 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 		// Single-parent path with inherited stack seeded by the caller.
 		// Align local depth tracker with the actual entry stack to avoid
 		// spurious DUP/SWAP underflow warnings and ensure exact EVM parity.
+		// Note: Inherited stack might contain Lazy Thunks. This is desired (Pass-Through).
 		depth = valueStack.size()
 		depthKnown = true
 	}
@@ -1105,7 +1553,8 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 						if unknown && len(targetSet) == 0 {
 							parserDebugWarn("MIR JUMP target PHI not fully constant", "bb", curBB.blockNum, "pc", i)
 							// Conservative end: no children, record exit
-							curBB.SetExitStack(valueStack.clone())
+							exitSt := valueStack.clone()
+							curBB.SetExitStack(exitSt)
 							return nil
 						}
 						// Build children for each constant target
@@ -1151,7 +1600,9 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 						}
 						curBB.SetChildren(children)
 						oldExit := curBB.ExitStack()
-						curBB.SetExitStack(valueStack.clone())
+						exitSt := valueStack.clone()
+						curBB.SetExitStack(exitSt)
+
 						for _, ch := range children {
 							ch.SetParents([]*MIRBasicBlock{curBB})
 							prev := ch.IncomingStacks()[curBB]
@@ -1198,7 +1649,7 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 							curBB.SetExitStack(valueStack.clone())
 							targetBB.SetParents([]*MIRBasicBlock{curBB})
 							targetBB.AddIncomingStack(curBB, curBB.ExitStack())
-							parserDebugWarn("MIR JUMP targetBB", "curBB", curBB.blockNum, "curBB.firstPC", curBB.firstPC, "targetBB.firstPC", targetBB.firstPC, "targetBBPC", targetBB.FirstPC(), "targetBBLastPC", targetBB.LastPC())
+							parserDebugWarn("MIR JUMP targetBB", "curBB", curBB.blockNum, "curBB.firstPC", curBB.firstPC, "targetBB.firstPC", targetBB.firstPC, "targetBBPC", targetBB.FirstPC(), "targetBBPC", targetBB.FirstPC(), "targetBBLastPC", targetBB.LastPC())
 							// Ensure the linear fallthrough block (i+1) is created and queued for processing,
 							// so its pc is mapped even if no edge comes from this JUMP (useful for future targets).
 							if _, ok := c.pcToBlock[uint(i+1)]; !ok {
@@ -1216,7 +1667,7 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 									if !fall.queued {
 										fall.queued = true
 										parserDebugWarn("==buildBasicBlock== MIR JUMP fallthrough BB queued", "curbb", curBB.blockNum, "curBB.firstPC", curBB.firstPC,
-											"targetbb", fall.blockNum, "targetbbfirstpc", fall.firstPC, "targetBBPC", fall.FirstPC(), "targetBBLastPC", fall.LastPC())
+											"targetbb", fall.blockNum, "targetbbfirstpc", fall.FirstPC(), "targetBBPC", fall.FirstPC(), "targetBBLastPC", fall.LastPC())
 										unprcessedBBs.Push(fall)
 									}
 								}
@@ -1574,37 +2025,6 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 									"targetBBLastPC", targetBB.LastPC())
 								unprcessedBBs.Push(targetBB)
 							}
-						}
-						if !fallExists || (fallExists && !hadFallParentBefore) {
-							if !fallthroughBB.queued {
-								fallthroughBB.queued = true
-								parserDebugWarn("==buildBasicBlock== MIR JUMPI fallthrough BB queued", "curbb", curBB.blockNum, "curBB.firstPC", curBB.firstPC,
-									"targetbb", fallthroughBB.blockNum, "targetbbfirstpc", fallthroughBB.firstPC, "targetBBPC", fallthroughBB.FirstPC(),
-									"targetBBLastPC", fallthroughBB.LastPC())
-								unprcessedBBs.Push(fallthroughBB)
-							}
-						}
-						return nil
-					} else {
-						// Target outside code range; create only fallthrough and warn
-						parserDebugWarn("MIR JUMPI unresolved targetPC out of range", "bb", curBB.blockNum, "pc", i, "targetPC", targetPC, "codeLen", len(code))
-						existingFall, fallExists := c.pcToBlock[uint(i+1)]
-						hadFallParentBefore := false
-						if fallExists && existingFall != nil {
-							for _, p := range existingFall.Parents() {
-								if p == curBB {
-									hadFallParentBefore = true
-									break
-								}
-							}
-						}
-						fallthroughBB := c.createBB(uint(i+1), curBB)
-						fallthroughBB.SetInitDepthMax(depth)
-						curBB.SetChildren([]*MIRBasicBlock{fallthroughBB})
-						curBB.SetExitStack(valueStack.clone())
-						prev := fallthroughBB.IncomingStacks()[curBB]
-						if prev == nil || !stacksEqual(prev, curBB.ExitStack()) {
-							fallthroughBB.AddIncomingStack(curBB, curBB.ExitStack())
 						}
 						if !fallExists || (fallExists && !hadFallParentBefore) {
 							if !fallthroughBB.queued {
@@ -2348,4 +2768,186 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 		}
 	}
 	return nil
+}
+
+// isDescendant checks if 'descendant' is reachable from 'ancestor' via children edges (DFS).
+// Returns false if ancestor == descendant. Uses CFG's cache if available.
+func (c *CFG) isDescendant(ancestor, descendant *MIRBasicBlock) bool {
+	if ancestor == nil || descendant == nil || ancestor == descendant {
+		return false
+	}
+
+	// Check cache first
+	if c.cycleCache != nil && c.cycleCache[ancestor] != nil {
+		if cached, ok := c.cycleCache[ancestor][descendant]; ok {
+			return cached
+		}
+	}
+
+	// DFS
+	visited := make(map[*MIRBasicBlock]bool)
+	var dfs func(*MIRBasicBlock) bool
+	dfs = func(node *MIRBasicBlock) bool {
+		if node == descendant {
+			return true
+		}
+		if visited[node] {
+			return false
+		}
+		visited[node] = true
+
+		for _, child := range node.Children() {
+			if child != nil && dfs(child) {
+				return true
+			}
+		}
+		return false
+	}
+
+	result := dfs(ancestor)
+
+	// Cache result
+	if c.cycleCache == nil {
+		c.cycleCache = make(map[*MIRBasicBlock]map[*MIRBasicBlock]bool)
+	}
+	if c.cycleCache[ancestor] == nil {
+		c.cycleCache[ancestor] = make(map[*MIRBasicBlock]bool)
+	}
+	c.cycleCache[ancestor][descendant] = result
+
+	return result
+}
+
+// computeMaxHFast implements the fast path for maxH calculation with two-layer defense.
+// Layer 1: Direct back-edge detection (O(parents × children))
+// Layer 2: Rebuild count heuristic (simple overflow protection)
+func (c *CFG) computeMaxHFast(curBB *MIRBasicBlock) int {
+	// Layer 1: Detect direct back-edges (parent is also a child)
+	excludeParents := make(map[*MIRBasicBlock]bool)
+	for _, p := range curBB.Parents() {
+		for _, ch := range curBB.Children() {
+			if ch == p {
+				excludeParents[p] = true
+				fmt.Fprintf(os.Stderr, "  🔄 Direct back-edge detected: PC=%d → PC=%d (excluded from maxH)\n",
+					p.firstPC, curBB.firstPC)
+				break
+			}
+		}
+	}
+
+	// Compute maxH from valid (non-back-edge) parents
+	maxH := 0
+	validParents := 0
+	for _, p := range curBB.Parents() {
+		if excludeParents[p] {
+			continue
+		}
+		validParents++
+		st := curBB.IncomingStacks()[p]
+		if st != nil && len(st) > maxH {
+			maxH = len(st)
+		}
+	}
+
+	// If all parents are back-edges, use widening strategy
+	if validParents == 0 && len(curBB.Parents()) > 0 {
+		const WIDENING_THRESHOLD = 10       // Allow 10 iterations to find stable value after deep detection
+		const DEEP_DETECTION_THRESHOLD = 20 // Must match the threshold in buildBasicBlock
+		const WIDENING_START = DEEP_DETECTION_THRESHOLD + WIDENING_THRESHOLD
+
+		if prevEntry := curBB.EntryStack(); prevEntry != nil && curBB.rebuildCount > WIDENING_START {
+			// Widening: fix at previous value to force convergence
+			maxH = len(prevEntry)
+			fmt.Fprintf(os.Stderr, "  🔒 Widening applied: PC=%d fixed at height=%d (rebuild#%d, threshold=%d)\n",
+				curBB.firstPC, maxH, curBB.rebuildCount, WIDENING_START)
+		} else {
+			// Warmup phase: use maximum to find stable value
+			maxH = 0
+			for _, p := range curBB.Parents() {
+				st := curBB.IncomingStacks()[p]
+				if st != nil && len(st) > maxH {
+					maxH = len(st)
+				}
+			}
+			if maxH > 0 && curBB.rebuildCount > DEEP_DETECTION_THRESHOLD {
+				fmt.Fprintf(os.Stderr, "  📈 Warmup phase: PC=%d maxH=%d (rebuild#%d/%d)\n",
+					curBB.firstPC, maxH, curBB.rebuildCount, WIDENING_START)
+			}
+		}
+	}
+
+	// Layer 2: Rebuild count heuristic (protect against indirect cycles)
+	if curBB.rebuildCount > 10 {
+		if prevEntry := curBB.EntryStack(); prevEntry != nil {
+			prevH := len(prevEntry)
+			growthLimit := 5 + len(curBB.Parents()) // Dynamic: 5 + #parents
+			if maxH > prevH+growthLimit {
+				oldMaxH := maxH
+				maxH = prevH + growthLimit
+				fmt.Fprintf(os.Stderr, "  📉 Stack growth limited: PC=%d rebuild#%d, %d → %d (growth capped at +%d)\n",
+					curBB.firstPC, curBB.rebuildCount, oldMaxH, maxH, growthLimit)
+			}
+		}
+	}
+
+	return maxH
+}
+
+// computeMaxHWithDeepCycleDetection implements deep cycle detection using DFS.
+// Only called when fast path fails or triggers overflow protection.
+func (c *CFG) computeMaxHWithDeepCycleDetection(curBB *MIRBasicBlock) int {
+	// Use DFS to detect all back-edges (including indirect)
+	excludeParents := make(map[*MIRBasicBlock]bool)
+
+	for _, p := range curBB.Parents() {
+		if c.isDescendant(curBB, p) {
+			excludeParents[p] = true
+		}
+	}
+
+	// Compute maxH from non-back-edge parents
+	maxH := 0
+	validParents := 0
+	for _, p := range curBB.Parents() {
+		if excludeParents[p] {
+			continue
+		}
+		validParents++
+		st := curBB.IncomingStacks()[p]
+		if st != nil && len(st) > maxH {
+			maxH = len(st)
+		}
+	}
+
+	// If all are back-edges, use widening strategy (same as fast path)
+	if validParents == 0 && len(curBB.Parents()) > 0 {
+		const WIDENING_THRESHOLD = 10       // Allow 10 iterations to find stable value after deep detection
+		const DEEP_DETECTION_THRESHOLD = 20 // Must match the threshold in buildBasicBlock
+		const WIDENING_START = DEEP_DETECTION_THRESHOLD + WIDENING_THRESHOLD
+
+		if prevEntry := curBB.EntryStack(); prevEntry != nil && curBB.rebuildCount > WIDENING_START {
+			// Widening: fix at previous value to force convergence
+			maxH = len(prevEntry)
+			fmt.Fprintf(os.Stderr, "  🔒 Widening applied: PC=%d fixed at height=%d (rebuild#%d, threshold=%d)\n",
+				curBB.firstPC, maxH, curBB.rebuildCount, WIDENING_START)
+		} else {
+			// Warmup phase: use maximum to find stable value
+			maxH = 0
+			for _, p := range curBB.Parents() {
+				st := curBB.IncomingStacks()[p]
+				if st != nil && len(st) > maxH {
+					maxH = len(st)
+				}
+			}
+			if maxH > 0 && curBB.rebuildCount > DEEP_DETECTION_THRESHOLD {
+				fmt.Fprintf(os.Stderr, "  📈 Warmup phase: PC=%d maxH=%d (rebuild#%d/%d)\n",
+					curBB.firstPC, maxH, curBB.rebuildCount, WIDENING_START)
+			}
+		}
+	}
+
+	fmt.Fprintf(os.Stderr, "  ✅ Deep analysis result: maxH=%d (excluded %d back-edges, kept %d parents)\n",
+		maxH, len(excludeParents), validParents)
+
+	return maxH
 }
