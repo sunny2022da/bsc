@@ -2,6 +2,7 @@ package compiler
 
 import (
 	"fmt"
+	"os"
 
 	"github.com/holiman/uint256"
 )
@@ -25,7 +26,7 @@ type Value struct {
 	// liveIn marks that this Value originated from a parent basic block and
 	// is considered a cross-BB live-in for the current block during CFG build.
 	liveIn bool
-	
+
 	// Lazy provides a thunk for lazy materialization of values (e.g. PHI nodes).
 	// If set, the value is considered "Lazy" and must be resolved before use.
 	// If kind is Lazy, this MUST be set.
@@ -85,6 +86,46 @@ func resolveValue(v *Value) *Value {
 	return v
 }
 
+// shallowPop removes and returns the top value WITHOUT resolving Lazy thunks
+// This is used for pure stack operations (SWAP, DUP) that don't need the actual value
+func (s *ValueStack) shallowPop() Value {
+	if len(s.data) == 0 {
+		return Value{kind: Unknown}
+	}
+	idx := len(s.data) - 1
+	val := s.data[idx]
+	s.data = s.data[:idx]
+	return val  // ⚠️ May still be Lazy
+}
+
+// shallowPush adds a value to the stack WITHOUT resolving Lazy thunks
+func (s *ValueStack) shallowPush(val Value) {
+	s.data = append(s.data, val)
+}
+
+// shallowPeek returns the nth value from top WITHOUT resolving Lazy thunks
+func (s *ValueStack) shallowPeek(n int) *Value {
+	idx := len(s.data) - 1 - n
+	if idx < 0 || idx >= len(s.data) {
+		return nil
+	}
+	return &s.data[idx]
+}
+
+// shallowSwap exchanges two stack positions WITHOUT resolving Lazy thunks
+// pos1 and pos2 are counted from the top (0 = top, 1 = second from top, etc.)
+func (s *ValueStack) shallowSwap(pos1, pos2 int) {
+	len := len(s.data)
+	idx1 := len - 1 - pos1
+	idx2 := len - 1 - pos2
+	
+	if idx1 < 0 || idx1 >= len || idx2 < 0 || idx2 >= len {
+		return  // Out of bounds, do nothing
+	}
+	
+	s.data[idx1], s.data[idx2] = s.data[idx2], s.data[idx1]
+}
+
 func (s *ValueStack) pop() (value Value) {
 	if len(s.data) == 0 {
 		// Try to resolve from entry stack (legacy/fallback)
@@ -97,18 +138,23 @@ func (s *ValueStack) pop() (value Value) {
 		// Return a default value if stack is empty
 		return Value{kind: Unknown}
 	}
-	
+
 	// Get top value
-	idx := len(s.data)-1
+	idx := len(s.data) - 1
 	val := s.data[idx]
-	
+
 	// Check for Lazy Thunk
 	if val.kind == Lazy && val.Lazy != nil {
+		fmt.Fprintf(os.Stderr, "🔄 [STACK-DEBUG] Pop resolving Lazy value...\n")
 		resolved := val.Lazy()
 		if resolved != nil {
 			val = *resolved
+			fmt.Fprintf(os.Stderr, "✅ [STACK-DEBUG] Lazy resolved to: %s\n", val.DebugString())
 			// Update stack with resolved value to avoid re-resolution
 			s.data[idx] = val
+		} else {
+			fmt.Fprintf(os.Stderr, "❌ [STACK-DEBUG] Lazy resolve failed, returning Unknown\n")
+			val = Value{kind: Unknown}
 		}
 	}
 	
@@ -163,7 +209,7 @@ func (s *ValueStack) peek(n int) *Value {
 	}
 	// Stack grows from left to right, so top is at the end
 	index := len(s.data) - 1 - n
-	
+
 	// Check for Lazy Thunk
 	if s.data[index].kind == Lazy && s.data[index].Lazy != nil {
 		resolved := s.data[index].Lazy()
@@ -171,7 +217,7 @@ func (s *ValueStack) peek(n int) *Value {
 			s.data[index] = *resolved
 		}
 	}
-	
+
 	return &s.data[index]
 }
 
@@ -185,7 +231,7 @@ func (s *ValueStack) swap(i, j int) {
 	// Peek to force materialization/resolution
 	v1 := s.peek(i)
 	v2 := s.peek(j)
-	
+
 	if v1 == nil || v2 == nil {
 		return
 	}
@@ -193,7 +239,7 @@ func (s *ValueStack) swap(i, j int) {
 	if i < 0 || i >= len(s.data) || j < 0 || j >= len(s.data) {
 		return
 	}
-	// Convert to actual array indices
+	// Convert to actual array indicesge
 	indexI := len(s.data) - 1 - i
 	indexJ := len(s.data) - 1 - j
 	s.data[indexI], s.data[indexJ] = s.data[indexJ], s.data[indexI]

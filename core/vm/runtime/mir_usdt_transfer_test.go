@@ -227,12 +227,13 @@ func TestMIRUSDTTransfer(t *testing.T) {
 	// Verify Alice's balance
 	t.Log("🔍 Verifying Alice's balance...")
 	aliceTokenBalance := getTokenBalance(t, evm, aliceAddr)
-	t.Logf("✅ Alice's balance: %s tokens", new(big.Int).Div(aliceTokenBalance, big.NewInt(1000000000000000000)).String())
+	t.Logf("✅ Alice's balance: %s tokens (%s raw units)", 
+		new(big.Int).Div(aliceTokenBalance, big.NewInt(1000000)).String(),
+		aliceTokenBalance.String())
 
 	// 🧪 Test with base EVM first to confirm transfer logic works
-	// DISABLED: Base EVM transfer succeeds but MIR fails, suggests state conflict
-	// t.Log("🧪 Testing transfer with base EVM first (control test)...")
-	// testTransferWithBaseEVM(t, evm.Context, statedb, evm.ChainConfig(), globalUsdtContract)
+	t.Log("🧪 Testing one transfer with base EVM first (control test)...")
+	testTransferWithBaseEVM(t, evm.Context, statedb, evm.ChainConfig(), globalUsdtContract)
 
 	// Perform individual transfers
 	t.Log("🔄 Performing individual transfers with MIR...")
@@ -250,13 +251,16 @@ func TestMIRUSDTTransfer(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		recipient := common.BigToAddress(new(big.Int).Add(startRecipient.Big(), big.NewInt(int64(i))))
 		balance := getTokenBalance(t, evm, recipient)
-		t.Logf("✅ Recipient %d (%s): %s tokens", i+1, recipient.Hex(), new(big.Int).Div(balance, big.NewInt(1000000000000000000)).String())
+		t.Logf("✅ Recipient %d (%s): %s tokens", i+1, recipient.Hex(), 
+			new(big.Int).Div(balance, big.NewInt(1000000)).String())
 	}
 
 	// Verify Alice's final balance
 	t.Log("🔍 Verifying Alice's final balance...")
 	aliceFinalBalance := getTokenBalance(t, evm, aliceAddr)
-	t.Logf("✅ Alice's final balance: %s tokens", new(big.Int).Div(aliceFinalBalance, big.NewInt(1000000000000000000)).String())
+	t.Logf("✅ Alice's final balance: %s tokens (raw: %s)", 
+		new(big.Int).Div(aliceFinalBalance, big.NewInt(1000000)).String(),
+		aliceFinalBalance.String())
 
 	t.Log("✨ BSC-EVM Benchmark completed successfully!")
 }
@@ -333,6 +337,27 @@ func deployContract(t *testing.T, evm *vm.EVM, initcode []byte) {
 	}
 }
 
+func testTransferWithBaseEVM(t *testing.T, blockCtx vm.BlockContext, statedb *state.StateDB, chainConfig *params.ChainConfig, usdtAddr common.Address) {
+	testEVMConfig := vm.Config{
+		EnableOpcodeOptimizations: false,
+		EnableMIR:                 false,
+		EnableMIRInitcode:         false,
+	}
+	testEVM := vm.NewEVM(blockCtx, statedb, chainConfig, testEVMConfig)
+	
+	testRecipient := common.HexToAddress("0x9000000000000000000000000000000000000001") // Different recipient
+	testAmount := big.NewInt(1000000) // 1 USDT
+	
+	calldata := make([]byte, 4+32+32)
+	copy(calldata[0:4], []byte{0xa9, 0x05, 0x9c, 0xbb}) // transfer(address,uint256)
+	copy(calldata[4+12:4+32], testRecipient.Bytes())
+	testAmount.FillBytes(calldata[4+32:])
+	
+	t.Logf("   Testing with base EVM: transfer %s to %s", testAmount.String(), testRecipient.Hex())
+	ret := executeTransaction(t, testEVM, usdtAddr, calldata, 10000000)
+	t.Logf("   Base EVM result: %x (len=%d)", ret, len(ret))
+}
+
 func getTokenBalance(t *testing.T, evm *vm.EVM, account common.Address) *big.Int {
 	// Prepare calldata
 	calldata := make([]byte, 0, 36)
@@ -352,7 +377,7 @@ func getTokenBalance(t *testing.T, evm *vm.EVM, account common.Address) *big.Int
 
 func performIndividualTransfersWithConfig(t *testing.T, evm *vm.EVM, numTransfers int64, gasLimit uint64) time.Duration {
 	startRecipient := common.HexToAddress("0x3000000000000000000000000000000000000001")
-	amountPerTransfer := big.NewInt(1000000000000000000) // 1 token
+	amountPerTransfer := big.NewInt(1000000) // 1 token (USDT uses 6 decimals, not 18)
 
 	t.Logf("🔄 Starting individual transfers with %d transfers, gas limit per transfer: %d", numTransfers, gasLimit/uint64(numTransfers))
 

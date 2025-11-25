@@ -659,6 +659,11 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 	// Set current contract for the pre-installed hook
 	adapter.currentContract = contract
 
+	// 🔧 FIX: Clear MIR instruction results cache at the start of each call
+	// This prevents stale cached values from previous calls (e.g., balanceOf's KECCAK256 result
+	// being incorrectly reused by transfer call)
+	adapter.mirInterpreter.ClearResultsCache()
+
 	// Save current env state before modifying it (for nested calls)
 	env := adapter.mirInterpreter.GetEnv()
 	if env == nil {

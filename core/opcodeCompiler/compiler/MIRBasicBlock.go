@@ -2,7 +2,9 @@ package compiler
 
 import (
 	"bytes"
-	"github.com/ethereum/go-ethereum/crypto"
+	"fmt"
+	"os"
+	// "github.com/ethereum/go-ethereum/crypto" // Temporarily unused after disabling KECCAK256 precomputation
 	"github.com/holiman/uint256"
 )
 
@@ -185,6 +187,21 @@ func (b *MIRBasicBlock) appendMIR(mir *MIR) *MIR {
 		mir.opConst = make([]*uint256.Int, len(mir.operands))
 		mir.opDefIdx = make([]int, len(mir.operands))
 		for i, v := range mir.operands {
+			// ✅ SAFETY CHECK: Ensure no Lazy values leak into MIR operands
+			if v != nil && v.kind == Lazy {
+				fmt.Fprintf(os.Stderr, "❌ [LAZY-LEAK] Lazy value leaked to MIR! op=%s, evmPC=%d, operand[%d]\n",
+					mir.op.String(), mir.evmPC, i)
+				fmt.Fprintf(os.Stderr, "   This indicates a bug: shallow operations should be used for stack ops (SWAP/DUP)\n")
+				// Force resolve to prevent runtime crash
+				if v.Lazy != nil {
+					resolved := v.Lazy()
+					if resolved != nil {
+						v = resolved
+						mir.operands[i] = resolved
+					}
+				}
+			}
+			
 			if v == nil {
 				mir.opKinds[i] = 2
 				continue
@@ -308,7 +325,13 @@ func (b *MIRBasicBlock) CreateBinOpMIRWithMA(op MirOperation, stack *ValueStack,
 	if op == MirKECCAK256 {
 		// operands: [offset, size] -> (opnd2, opnd1)
 		mir := newBinaryOpMIR(op, &opnd2, &opnd1, stack)
-		// If the memory accessor knows the exact slice content (constant), precompute hash
+		// 🔧 DISABLED: KECCAK256 precomputation causes incorrect results when memory content
+		// depends on runtime data (e.g., CALLER address vs calldata parameters).
+		// The MemoryAccessor tracks static writes during CFG generation, but cannot distinguish
+		// between different call contexts (balanceOf vs transfer).
+		//
+		// TODO: Re-enable with proper call-context isolation or runtime-only evaluation.
+		/*
 		if accessor != nil && opnd2.kind == Konst && opnd1.kind == Konst {
 			offU := uint256.NewInt(0).SetBytes(opnd2.payload)
 			szU := uint256.NewInt(0).SetBytes(opnd1.payload)
@@ -318,6 +341,7 @@ func (b *MIRBasicBlock) CreateBinOpMIRWithMA(op MirOperation, stack *ValueStack,
 				mir.meta = h
 			}
 		}
+		*/
 		opnd2.use = append(opnd2.use, mir)
 		opnd1.use = append(opnd1.use, mir)
 		stack.push(mir.Result())

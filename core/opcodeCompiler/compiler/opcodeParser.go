@@ -6,6 +6,7 @@ import (
 	"os"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/holiman/uint256"
 )
 
 // debugDumpBB logs a basic block and its MIR instructions for diagnostics.
@@ -956,6 +957,21 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 	if code == nil || len(code) == 0 {
 		return fmt.Errorf("empty code for basic block")
 	}
+	
+	// 🔍 DEBUG: Track Block 858, 880, 2026, 2322, 2440 CFG generation
+	if curBB.firstPC == 858 || curBB.firstPC == 880 || curBB.firstPC == 2026 || curBB.firstPC == 2322 || curBB.firstPC == 2440 {
+		fmt.Fprintf(os.Stderr, "\n🏗️  [CFG-BUILD] ===== Building Block %d (rebuild #%d) =====\n", 
+			curBB.firstPC, curBB.rebuildCount)
+		fmt.Fprintf(os.Stderr, "   Parents: %d\n", len(curBB.Parents()))
+		for idx, p := range curBB.Parents() {
+			fmt.Fprintf(os.Stderr, "   Parent[%d]: Block %d", idx, p.firstPC)
+			if p.exitStack != nil {
+				fmt.Fprintf(os.Stderr, " (exitStack size=%d)", len(p.exitStack))
+			}
+			fmt.Fprintf(os.Stderr, "\n")
+		}
+		fmt.Fprintf(os.Stderr, "   ValueStack size before reset: %d\n", valueStack.size())
+	}
 
 	// Start processing from the basic block's firstPC position
 	i := int(curBB.firstPC)
@@ -1063,6 +1079,8 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 						}
 						if v == nil {
 							// Resolution failed up the chain?
+							fmt.Fprintf(os.Stderr, "⚠️  [PHI-DEBUG] Lazy resolve failed: curBB.PC=%d, slot=%d, parent.PC=%d\n",
+								curBB.firstPC, capturedSlot, p.firstPC)
 							continue // treat as missing
 						}
 						vv := *v         // copy
@@ -1070,16 +1088,25 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 						ops = append(ops, &vv)
 					} else {
 						// Missing (stack too short)
+						fmt.Fprintf(os.Stderr, "⚠️  [PHI-DEBUG] Stack too short: curBB.PC=%d, slot=%d, parent.PC=%d, stackSize=%d\n",
+							curBB.firstPC, capturedSlot, p.firstPC, len(st))
 					}
 				}
 
 				if len(ops) == 0 {
 					// Resolution failed: no operands
+					fmt.Fprintf(os.Stderr, "❌ [PHI-DEBUG] No operands! curBB.PC=%d, slot=%d, parents=%d\n",
+						curBB.firstPC, capturedSlot, len(curBB.Parents()))
 					return nil
 				}
 
-				// Simplify
+				// ✅ Simplify ONLY if single parent
+				// 🔑 KEY CHANGE: Multi-parent blocks MUST create real PHI nodes
+				//    even if all operands are identical, because different paths
+				//    may have different runtime stack states (length/values)
 				simplified := false
+				numParents := len(curBB.Parents())
+				
 				if len(ops) > 1 {
 					uniq := make([]*Value, 0, len(ops))
 					for _, o := range ops {
@@ -1096,28 +1123,34 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 					}
 					ops = uniq
 				}
-				if len(ops) == 1 {
+				
+				// ✅ NEW LOGIC: Only simplify if:
+				//    1. Single operand after deduplication, AND
+				//    2. Single parent (or zero/one parents)
+				if len(ops) == 1 && numParents <= 1 {
 					cached = ops[0]
 					simplified = true
+					fmt.Fprintf(os.Stderr, "✅ [PHI-SIMPLIFY] Single parent: curBB.PC=%d, slot=%d, value=%s\n",
+						curBB.firstPC, capturedSlot, ops[0].DebugString())
+				} else if len(ops) == 1 && numParents > 1 {
+					// Multi-parent with single operand: DO NOT SIMPLIFY
+					fmt.Fprintf(os.Stderr, "🔧 [PHI-NO-SIMPLIFY] Multi-parent (%d) with single operand: curBB.PC=%d, slot=%d → CREATE PHI\n",
+						numParents, curBB.firstPC, capturedSlot)
+					simplified = false
 				} else if len(ops) > 1 {
-					// Check if all are same (redundant with above logic, but double check)
-					base := ops[0]
-					equalAll := true
-					for k := 1; k < len(ops); k++ {
-						if !equalValueForFlow(base, ops[k]) {
-							equalAll = false
-							break
-						}
-					}
-					if equalAll {
-						cached = base
-						simplified = true
-					}
+					// Multiple different operands: always create PHI
+					fmt.Fprintf(os.Stderr, "🔧 [PHI-NO-SIMPLIFY] Multiple operands (%d): curBB.PC=%d, slot=%d → CREATE PHI\n",
+						len(ops), curBB.firstPC, capturedSlot)
+					simplified = false
 				}
 
 				if simplified {
 					return cached
 				}
+				
+				// Creating PHI node
+				fmt.Fprintf(os.Stderr, "🔧 [PHI-DEBUG] Creating PHI: curBB.PC=%d, slot=%d, ops=%d\n",
+					curBB.firstPC, capturedSlot, len(ops))
 
 				// Create PHI
 				// Note: We are inside a closure called during buildBasicBlock (or later).
@@ -1159,6 +1192,18 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 		valueStack.resetTo(lazyStack)
 		depth = maxH
 		depthKnown = true
+		
+		// 🔍 DEBUG: Log Block 858 entryStack after Lazy PHI setup
+		if curBB.firstPC == 858 {
+			fmt.Fprintf(os.Stderr, "   ✅ Lazy PHI setup: entryStack size=%d (maxH=%d)\n", len(lazyStack), maxH)
+			for i, v := range lazyStack {
+				fmt.Fprintf(os.Stderr, "      [%d] kind=%d", i, v.kind)
+				if v.kind == Lazy {
+					fmt.Fprintf(os.Stderr, ", Lazy (will be resolved on demand)")
+				}
+				fmt.Fprintf(os.Stderr, "\n")
+			}
+		}
 
 	} else if es := curBB.EntryStack(); es != nil {
 		valueStack.resetTo(es)
@@ -1181,6 +1226,12 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 		// Record EVM location for MIR mapping
 		currentEVMBuildPC = uint(i)
 		currentEVMBuildOp = byte(op)
+		
+		// 🔍 DEBUG: Track every instruction in Block 858
+		if curBB.firstPC == 858 && op != JUMPDEST {
+			fmt.Fprintf(os.Stderr, "   🔧 [OP] PC=%d, op=0x%02x, stack before=%d", 
+				i, byte(op), valueStack.size())
+		}
 
 		// Handle PUSH operations
 		if op >= PUSH1 && op <= PUSH32 {
@@ -1188,7 +1239,16 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 			if i+size >= len(code) {
 				return fmt.Errorf("invalid PUSH operation at position %d", i)
 			}
-			_ = curBB.CreatePushMIR(size, code[i+1:i+1+size], valueStack)
+			pushData := code[i+1:i+1+size]
+			_ = curBB.CreatePushMIR(size, pushData, valueStack)
+			
+			// 🔍 DEBUG: Log PUSH operations in Block 858
+			if curBB.firstPC == 858 {
+				val := new(uint256.Int).SetBytes(pushData)
+				fmt.Fprintf(os.Stderr, "   📥 [PUSH%d] PC=%d, value=0x%x, stack size=%d\n", 
+					size, i, val.Bytes(), valueStack.size())
+			}
+			
 			depth++
 			depthKnown = true
 			i += size + 1 // +1 for the opcode itself
@@ -1201,6 +1261,9 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 		case STOP:
 			mir = curBB.CreateVoidMIR(MirSTOP)
 			curBB.SetLastPC(uint(i))
+			if curBB.firstPC == 858 {
+				fmt.Fprintf(os.Stderr, ", stack after=%d [BLOCK END - STOP]\n", valueStack.size())
+			}
 			return nil
 		case ADD:
 			mir = curBB.CreateBinOpMIR(MirADD, valueStack)
@@ -1208,6 +1271,9 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 				depth--
 			} else {
 				depth = 0
+			}
+			if curBB.firstPC == 858 {
+				fmt.Fprintf(os.Stderr, ", stack after=%d\n", valueStack.size())
 			}
 		case MUL:
 			mir = curBB.CreateBinOpMIR(MirMUL, valueStack)
@@ -1385,9 +1451,49 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 			depth++
 			depthKnown = true
 		case CALLER:
+			// 🔍 DEBUG: Log Block 2440 before CALLER
+			if curBB.firstPC == 2440 {
+				fmt.Fprintf(os.Stderr, "\n📍 [BLOCK-2440-CFG] Before CALLER (PC=%d):\n", i)
+				fmt.Fprintf(os.Stderr, "   ValueStack size: %d\n", valueStack.size())
+				for idx := 0; idx < valueStack.size() && idx < 5; idx++ {
+					v := valueStack.shallowPeek(idx)
+					if v != nil {
+						fmt.Fprintf(os.Stderr, "   stack[%d from top]: kind=%d", idx, v.kind)
+						if v.kind == Lazy {
+							fmt.Fprintf(os.Stderr, " (Lazy PHI)")
+						} else if v.def != nil {
+							fmt.Fprintf(os.Stderr, " (def=%s@%d)", v.def.op.String(), v.def.evmPC)
+						} else if v.u != nil {
+							fmt.Fprintf(os.Stderr, " (const=0x%x)", v.u.Bytes())
+						}
+						fmt.Fprintf(os.Stderr, "\n")
+					}
+				}
+			}
+			
 			mir = curBB.CreateBlockInfoMIR(MirCALLER, valueStack)
 			depth++
 			depthKnown = true
+			
+			// 🔍 DEBUG: Log Block 2440 after CALLER
+			if curBB.firstPC == 2440 {
+				fmt.Fprintf(os.Stderr, "📍 [BLOCK-2440-CFG] After CALLER (PC=%d):\n", i)
+				fmt.Fprintf(os.Stderr, "   ValueStack size: %d\n", valueStack.size())
+				for idx := 0; idx < valueStack.size() && idx < 5; idx++ {
+					v := valueStack.shallowPeek(idx)
+					if v != nil {
+						fmt.Fprintf(os.Stderr, "   stack[%d from top]: kind=%d", idx, v.kind)
+						if v.kind == Lazy {
+							fmt.Fprintf(os.Stderr, " (Lazy PHI)")
+						} else if v.def != nil {
+							fmt.Fprintf(os.Stderr, " (def=%s@%d)", v.def.op.String(), v.def.evmPC)
+						} else if v.u != nil {
+							fmt.Fprintf(os.Stderr, " (const=0x%x)", v.u.Bytes())
+						}
+						fmt.Fprintf(os.Stderr, "\n")
+					}
+				}
+			}
 		case CALLVALUE:
 			mir = curBB.CreateBlockInfoMIR(MirCALLVALUE, valueStack)
 			depth++
@@ -1473,14 +1579,15 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 			mir = curBB.CreateBlockOpMIR(MirBASEFEE, valueStack)
 			depth++
 		case POP:
-			_ = valueStack.pop()
-			// Emit NOP to account for POP base gas (CreateVoidMIR already appends)
-			mir = curBB.CreateVoidMIR(MirNOP)
+			// ✅ F2+F3 OPTIMIZATION: Execute POP at CFG build time using shallow operations
+			_ = valueStack.shallowPop()  // Remove without resolving Lazy
 			if depth > 0 {
 				depth--
 			} else {
 				depth = 0
 			}
+			i++
+			continue  // ⚠️ Skip MIR generation - POP executed at compile time
 		case MLOAD:
 			mir = curBB.CreateMemoryOpMIR(MirMLOAD, valueStack, memoryAccessor)
 		case MSTORE:
@@ -1507,8 +1614,56 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 				depth = 0
 			}
 		case JUMP:
+			// 🔍 DEBUG: Log Block 2440 before JUMP (before pop)
+			if curBB.firstPC == 2440 {
+				fmt.Fprintf(os.Stderr, "\n📍 [BLOCK-2440-CFG] Before JUMP (PC=%d), before pop:\n", i)
+				fmt.Fprintf(os.Stderr, "   ValueStack size: %d\n", valueStack.size())
+				for idx := 0; idx < valueStack.size() && idx < 5; idx++ {
+					v := valueStack.shallowPeek(idx)
+					if v != nil {
+						fmt.Fprintf(os.Stderr, "   stack[%d from top]: kind=%d", idx, v.kind)
+						if v.kind == Lazy {
+							fmt.Fprintf(os.Stderr, " (Lazy PHI)")
+						} else if v.def != nil {
+							fmt.Fprintf(os.Stderr, " (def=%s@%d)", v.def.op.String(), v.def.evmPC)
+						} else if v.u != nil {
+							fmt.Fprintf(os.Stderr, " (const=0x%x)", v.u.Bytes())
+						}
+						fmt.Fprintf(os.Stderr, "\n")
+					}
+				}
+			}
+			
 			mir = curBB.CreateJumpMIR(MirJUMP, valueStack, nil)
 			parserDebugWarn("==buildBasicBlock== MIR JUMP", "bb", curBB.blockNum, "pc", i, "stackSize", valueStack.size(), "mir.operands", len(mir.operands))
+			
+			// Debug: Check JUMP operand
+			if mir != nil && len(mir.operands) > 0 && mir.operands[0] != nil {
+				operand := mir.operands[0]
+				
+				// 🔍 DEBUG: Detailed log for Block 2440 JUMP operand
+				if curBB.firstPC == 2440 {
+					fmt.Fprintf(os.Stderr, "📍 [BLOCK-2440-CFG] JUMP operand (after pop):\n")
+					fmt.Fprintf(os.Stderr, "   operand.kind=%d", operand.kind)
+					if operand.kind == Lazy {
+						fmt.Fprintf(os.Stderr, " (Lazy PHI - THIS IS WRONG!)")
+					} else if operand.def != nil {
+						fmt.Fprintf(os.Stderr, " (def=%s@%d)", operand.def.op.String(), operand.def.evmPC)
+					} else if operand.u != nil {
+						fmt.Fprintf(os.Stderr, " (const=0x%x)", operand.u.Bytes())
+					}
+					fmt.Fprintf(os.Stderr, "\n")
+				}
+				
+				fmt.Fprintf(os.Stderr, "🎯 [JUMP-DEBUG] PC=%d, operand.kind=%v, operand=%s\n",
+					i, operand.kind, operand.DebugString())
+				if operand.kind == Unknown {
+					fmt.Fprintf(os.Stderr, "❌ [JUMP-DEBUG] JUMP has Unknown operand at PC=%d!\n", i)
+				}
+			} else {
+				fmt.Fprintf(os.Stderr, "❌ [JUMP-DEBUG] JUMP has no operand at PC=%d!\n", i)
+			}
+			
 			if depth >= 1 {
 				depth--
 			} else {
@@ -1555,6 +1710,25 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 							// Conservative end: no children, record exit
 							exitSt := valueStack.clone()
 							curBB.SetExitStack(exitSt)
+							
+							// 🔍 DEBUG: Log Block 858 exitStack
+							if curBB.firstPC == 858 {
+								fmt.Fprintf(os.Stderr, "   📤 [EXIT-STACK-1] Block 858 (unknown JUMP target), size=%d\n", len(exitSt))
+								for i, v := range exitSt {
+									fmt.Fprintf(os.Stderr, "      [%d] kind=%d", i, v.kind)
+									if v.def != nil {
+										fmt.Fprintf(os.Stderr, ", def.op=%s, def.evmPC=%d", v.def.op.String(), v.def.evmPC)
+									}
+									if v.u != nil {
+										fmt.Fprintf(os.Stderr, ", u=0x%x", v.u.Bytes())
+									}
+									if len(v.payload) > 0 {
+										fmt.Fprintf(os.Stderr, ", payload=0x%x", v.payload)
+									}
+									fmt.Fprintf(os.Stderr, "\n")
+								}
+							}
+							
 							return nil
 						}
 						// Build children for each constant target
@@ -1595,13 +1769,51 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 							}
 						}
 						if len(children) == 0 {
-							curBB.SetExitStack(valueStack.clone())
+							exitSt := valueStack.clone()
+							curBB.SetExitStack(exitSt)
+							
+							// 🔍 DEBUG: Log Block 858 exitStack
+							if curBB.firstPC == 858 {
+								fmt.Fprintf(os.Stderr, "   📤 [EXIT-STACK-2] Block 858 (no children), size=%d\n", len(exitSt))
+								for i, v := range exitSt {
+									fmt.Fprintf(os.Stderr, "      [%d] kind=%d", i, v.kind)
+									if v.def != nil {
+										fmt.Fprintf(os.Stderr, ", def.op=%s, def.evmPC=%d", v.def.op.String(), v.def.evmPC)
+									}
+									if v.u != nil {
+										fmt.Fprintf(os.Stderr, ", u=0x%x", v.u.Bytes())
+									}
+									if len(v.payload) > 0 {
+										fmt.Fprintf(os.Stderr, ", payload=0x%x", v.payload)
+									}
+									fmt.Fprintf(os.Stderr, "\n")
+								}
+							}
+							
 							return nil
 						}
 						curBB.SetChildren(children)
 						oldExit := curBB.ExitStack()
 						exitSt := valueStack.clone()
 						curBB.SetExitStack(exitSt)
+						
+						// 🔍 DEBUG: Log Block 858 exitStack
+						if curBB.firstPC == 858 {
+							fmt.Fprintf(os.Stderr, "   📤 [EXIT-STACK-3] Block 858 (with children), size=%d\n", len(exitSt))
+							for i, v := range exitSt {
+								fmt.Fprintf(os.Stderr, "      [%d] kind=%d", i, v.kind)
+								if v.def != nil {
+									fmt.Fprintf(os.Stderr, ", def.op=%s, def.evmPC=%d", v.def.op.String(), v.def.evmPC)
+								}
+								if v.u != nil {
+									fmt.Fprintf(os.Stderr, ", u=0x%x", v.u.Bytes())
+								}
+								if len(v.payload) > 0 {
+									fmt.Fprintf(os.Stderr, ", payload=0x%x", v.payload)
+								}
+								fmt.Fprintf(os.Stderr, "\n")
+							}
+						}
 
 						for _, ch := range children {
 							ch.SetParents([]*MIRBasicBlock{curBB})
@@ -1740,7 +1952,27 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 							fallthroughBB := c.createBB(uint(i+1), curBB)
 							fallthroughBB.SetInitDepthMax(depth)
 							curBB.SetChildren([]*MIRBasicBlock{fallthroughBB})
-							curBB.SetExitStack(valueStack.clone())
+							exitSt := valueStack.clone()
+							curBB.SetExitStack(exitSt)
+							
+							// 🔍 DEBUG: Log Block 858 exitStack at JUMPI (PHI unknown)
+							if curBB.firstPC == 858 {
+								fmt.Fprintf(os.Stderr, "   📤 [JUMPI-EXIT-PHI-UNKNOWN] Block 858, exitStack size=%d\n", len(exitSt))
+								for idx, v := range exitSt {
+									fmt.Fprintf(os.Stderr, "      [%d] kind=%d", idx, v.kind)
+									if v.def != nil {
+										fmt.Fprintf(os.Stderr, ", def.op=%s, def.evmPC=%d", v.def.op.String(), v.def.evmPC)
+									}
+									if v.u != nil {
+										fmt.Fprintf(os.Stderr, ", u=0x%x", v.u.Bytes())
+									}
+									if len(v.payload) > 0 {
+										fmt.Fprintf(os.Stderr, ", payload=0x%x", v.payload)
+									}
+									fmt.Fprintf(os.Stderr, "\n")
+								}
+							}
+							
 							fallthroughBB.SetParents([]*MIRBasicBlock{curBB})
 							prev := fallthroughBB.IncomingStacks()[curBB]
 							if prev == nil || !stacksEqual(prev, curBB.ExitStack()) {
@@ -1805,7 +2037,27 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 							}
 						}
 						curBB.SetChildren(children)
-						curBB.SetExitStack(valueStack.clone())
+						exitSt := valueStack.clone()
+						curBB.SetExitStack(exitSt)
+						
+						// 🔍 DEBUG: Log Block 858 exitStack at JUMPI (PHI with targets)
+						if curBB.firstPC == 858 {
+							fmt.Fprintf(os.Stderr, "   📤 [JUMPI-EXIT-PHI-TARGETS] Block 858, exitStack size=%d\n", len(exitSt))
+							for idx, v := range exitSt {
+								fmt.Fprintf(os.Stderr, "      [%d] kind=%d", idx, v.kind)
+								if v.def != nil {
+									fmt.Fprintf(os.Stderr, ", def.op=%s, def.evmPC=%d", v.def.op.String(), v.def.evmPC)
+								}
+								if v.u != nil {
+									fmt.Fprintf(os.Stderr, ", u=0x%x", v.u.Bytes())
+								}
+								if len(v.payload) > 0 {
+									fmt.Fprintf(os.Stderr, ", payload=0x%x", v.payload)
+								}
+								fmt.Fprintf(os.Stderr, "\n")
+							}
+						}
+						
 						for _, ch := range children {
 							ch.SetParents([]*MIRBasicBlock{curBB})
 							prevIn := ch.IncomingStacks()[curBB]
@@ -1869,7 +2121,26 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 								fallthroughBB := c.createBB(uint(i+1), curBB)
 								fallthroughBB.SetInitDepthMax(depth)
 								curBB.SetChildren([]*MIRBasicBlock{fallthroughBB})
-								curBB.SetExitStack(valueStack.clone())
+								exitSt := valueStack.clone()
+								curBB.SetExitStack(exitSt)
+								
+								// 🔍 DEBUG: Log Block 858 exitStack at JUMPI (invalid target)
+								if curBB.firstPC == 858 {
+									fmt.Fprintf(os.Stderr, "   📤 [JUMPI-EXIT-INVALID] Block 858, exitStack size=%d\n", len(exitSt))
+									for idx, v := range exitSt {
+										fmt.Fprintf(os.Stderr, "      [%d] kind=%d", idx, v.kind)
+										if v.def != nil {
+											fmt.Fprintf(os.Stderr, ", def.op=%s, def.evmPC=%d", v.def.op.String(), v.def.evmPC)
+										}
+										if v.u != nil {
+											fmt.Fprintf(os.Stderr, ", u=0x%x", v.u.Bytes())
+										}
+										if len(v.payload) > 0 {
+											fmt.Fprintf(os.Stderr, ", payload=0x%x", v.payload)
+										}
+										fmt.Fprintf(os.Stderr, "\n")
+									}
+								}
 								prev := fallthroughBB.IncomingStacks()[curBB]
 								if prev == nil || !stacksEqual(prev, curBB.ExitStack()) {
 									fallthroughBB.AddIncomingStack(curBB, curBB.ExitStack())
@@ -1890,7 +2161,28 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 							fallthroughBB.SetInitDepthMax(depth)
 							curBB.SetChildren([]*MIRBasicBlock{targetBB, fallthroughBB})
 							// Record exit stack and add as incoming to both successors
-							curBB.SetExitStack(valueStack.clone())
+							exitSt := valueStack.clone()
+							curBB.SetExitStack(exitSt)
+							
+							// 🔍 DEBUG: Log Block 858, 880, 2026, 2322, 2440 exitStack at JUMPI
+							if curBB.firstPC == 858 || curBB.firstPC == 880 || curBB.firstPC == 2026 || curBB.firstPC == 2322 || curBB.firstPC == 2440 {
+								fmt.Fprintf(os.Stderr, "   📤 [JUMPI-EXIT-NORMAL] Block %d, exitStack size=%d, targetPC=%d, fallthroughPC=%d\n", 
+									curBB.firstPC, len(exitSt), targetBB.firstPC, fallthroughBB.firstPC)
+								for idx, v := range exitSt {
+									fmt.Fprintf(os.Stderr, "      [%d] kind=%d", idx, v.kind)
+									if v.def != nil {
+										fmt.Fprintf(os.Stderr, ", def.op=%s, def.evmPC=%d", v.def.op.String(), v.def.evmPC)
+									}
+									if v.u != nil {
+										fmt.Fprintf(os.Stderr, ", u=0x%x", v.u.Bytes())
+									}
+									if len(v.payload) > 0 {
+										fmt.Fprintf(os.Stderr, ", payload=0x%x", v.payload)
+									}
+									fmt.Fprintf(os.Stderr, "\n")
+								}
+							}
+							
 							targetBB.AddIncomingStack(curBB, curBB.ExitStack())
 							prevFall := fallthroughBB.IncomingStacks()[curBB]
 							if prevFall == nil || !stacksEqual(prevFall, curBB.ExitStack()) {
@@ -2488,9 +2780,23 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 				debugWriteDOTIfRequested(debugDumpAncestryDOT(curBB), "dup")
 				parserDebugWarn("----------- MIR DUP depth underflow---------------------")
 			}
-			mir = curBB.CreateStackOpMIR(MirOperation(0x80+byte(n-1)), valueStack)
-			if depth >= n {
-				depth++
+			
+			// ✅ F2+F3 OPTIMIZATION: Execute DUP at CFG build time using shallow operations
+			// This avoids triggering Lazy PHI resolution for pure stack operations
+			src := valueStack.shallowPeek(n - 1)
+			if src != nil {
+				valueStack.shallowPush(*src)  // Duplicate without resolving Lazy
+				if depth >= n {
+					depth++
+				}
+				i++
+				continue  // ⚠️ Skip MIR generation - DUP executed at compile time
+			} else {
+				// Fallback: if stack is too shallow, create NOP MIR
+				mir = curBB.CreateStackOpMIR(MirOperation(0x80+byte(n-1)), valueStack)
+				if depth >= n {
+					depth++
+				}
 			}
 			// Stack operations - SWAP1 to SWAP16 (fail CFG build if stack too shallow)
 		case SWAP1, SWAP2, SWAP3, SWAP4, SWAP5, SWAP6, SWAP7, SWAP8, SWAP9, SWAP10, SWAP11, SWAP12, SWAP13, SWAP14, SWAP15, SWAP16:
@@ -2502,7 +2808,58 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 				debugDumpAncestors(curBB, make(map[*MIRBasicBlock]bool), curBB.blockNum)
 				debugWriteDOTIfRequested(debugDumpAncestryDOT(curBB), "swap")
 			}
-			mir = curBB.CreateStackOpMIR(MirOperation(0x90+byte(n-1)), valueStack)
+			
+			// 🔍 DEBUG: Log Block 2440 before SWAP
+			if curBB.firstPC == 2440 {
+				fmt.Fprintf(os.Stderr, "📍 [BLOCK-2440-CFG] Before SWAP%d (PC=%d):\n", n, i)
+				fmt.Fprintf(os.Stderr, "   ValueStack size: %d\n", valueStack.size())
+				for idx := 0; idx < valueStack.size() && idx < 5; idx++ {
+					v := valueStack.shallowPeek(idx)
+					if v != nil {
+						fmt.Fprintf(os.Stderr, "   stack[%d from top]: kind=%d", idx, v.kind)
+						if v.kind == Lazy {
+							fmt.Fprintf(os.Stderr, " (Lazy PHI)")
+						} else if v.def != nil {
+							fmt.Fprintf(os.Stderr, " (def=%s@%d)", v.def.op.String(), v.def.evmPC)
+						} else if v.u != nil {
+							fmt.Fprintf(os.Stderr, " (const=0x%x)", v.u.Bytes())
+						}
+						fmt.Fprintf(os.Stderr, "\n")
+					}
+				}
+			}
+			
+			// ✅ F2+F3 OPTIMIZATION: Execute SWAP at CFG build time using shallow operations
+			// This avoids triggering Lazy PHI resolution for pure stack operations
+			if valueStack.size() > n {
+				valueStack.shallowSwap(0, n)  // Swap without resolving Lazy
+				
+				// 🔍 DEBUG: Log Block 2440 after SWAP
+				if curBB.firstPC == 2440 {
+					fmt.Fprintf(os.Stderr, "📍 [BLOCK-2440-CFG] After SWAP%d (PC=%d):\n", n, i)
+					fmt.Fprintf(os.Stderr, "   ValueStack size: %d\n", valueStack.size())
+					for idx := 0; idx < valueStack.size() && idx < 5; idx++ {
+						v := valueStack.shallowPeek(idx)
+						if v != nil {
+							fmt.Fprintf(os.Stderr, "   stack[%d from top]: kind=%d", idx, v.kind)
+							if v.kind == Lazy {
+								fmt.Fprintf(os.Stderr, " (Lazy PHI)")
+							} else if v.def != nil {
+								fmt.Fprintf(os.Stderr, " (def=%s@%d)", v.def.op.String(), v.def.evmPC)
+							} else if v.u != nil {
+								fmt.Fprintf(os.Stderr, " (const=0x%x)", v.u.Bytes())
+							}
+							fmt.Fprintf(os.Stderr, "\n")
+						}
+					}
+				}
+				
+				i++
+				continue  // ⚠️ Skip MIR generation - SWAP executed at compile time
+			} else {
+				// Fallback: if stack is too shallow, create NOP MIR
+				mir = curBB.CreateStackOpMIR(MirOperation(0x90+byte(n-1)), valueStack)
+			}
 		// EOF operations
 		case DATALOAD:
 			mir = curBB.CreateBlockInfoMIR(MirDATALOAD, valueStack)
