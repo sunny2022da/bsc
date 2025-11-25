@@ -154,3 +154,92 @@ func TestMIRUSDT_Transfer_EVMvsMIR_Single(t *testing.T) {
 		t.Fatalf("returndata mismatch base=%x mir=%x", retB, retM)
 	}
 }
+
+// TestMIRUSDT_Name_EVMvsMIR_Single: install USDT runtime and call name() once under base and once under MIR.
+func TestMIRUSDT_Name_EVMvsMIR_Single(t *testing.T) {
+	// Enable MIR opcode parsing
+	compiler.EnableOpcodeParse()
+	// Optional debug logs (env var)
+	if os.Getenv("MIR_DEBUG") == "1" {
+		compiler.EnableMIRDebugLogs(true)
+		h := ethlog.NewTerminalHandlerWithLevel(os.Stdout, ethlog.LevelWarn, false)
+		ethlog.SetDefault(ethlog.NewLogger(h))
+	}
+
+	compatBlock := new(big.Int).Set(params.BSCChainConfig.LondonBlock)
+
+	// Load USDT runtime bytecode (same source as parity tests)
+	code, err := hex.DecodeString(usdtHex[2:])
+	if err != nil {
+		t.Fatalf("decode USDT runtime hex failed: %v", err)
+	}
+
+	base := &runtime.Config{
+		ChainConfig: params.BSCChainConfig,
+		GasLimit:    10_000_000,
+		Origin:      common.Address{},
+		BlockNumber: compatBlock,
+		Value:       big.NewInt(0),
+		EVMConfig:   vm.Config{EnableOpcodeOptimizations: false},
+	}
+	mir := &runtime.Config{
+		ChainConfig: params.BSCChainConfig,
+		GasLimit:    10_000_000,
+		Origin:      common.Address{},
+		BlockNumber: compatBlock,
+		Value:       big.NewInt(0),
+		EVMConfig: vm.Config{
+			EnableOpcodeOptimizations: true,
+			EnableMIR:                 true,
+			EnableMIRInitcode:         false,
+			MIRStrictNoFallback:       true,
+		},
+	}
+	if base.State == nil {
+		base.State, _ = state.New(types.EmptyRootHash, state.NewDatabaseForTesting())
+	}
+	if mir.State == nil {
+		mir.State, _ = state.New(types.EmptyRootHash, state.NewDatabaseForTesting())
+	}
+
+	// Install code
+	addr := common.BytesToAddress([]byte("contract_usdt_name_single"))
+	evmB := runtime.NewEnv(base)
+	evmM := runtime.NewEnv(mir)
+	evmB.StateDB.CreateAccount(addr)
+	evmM.StateDB.CreateAccount(addr)
+	evmB.StateDB.SetCode(addr, code)
+	evmM.StateDB.SetCode(addr, code)
+
+	// calldata: name() selector 0x06fdde03
+	input := []byte{0x06, 0xfd, 0xde, 0x03}
+
+	// Base call
+	senderB := vm.AccountRef(base.Origin)
+	retB, leftB, errB := evmB.Call(senderB, addr, input, base.GasLimit, uint256.MustFromBig(base.Value))
+
+	// MIR call (enable parsing right before run)
+	compiler.EnableOpcodeParse()
+	senderM := vm.AccountRef(mir.Origin)
+	retM, leftM, errM := evmM.Call(senderM, addr, input, mir.GasLimit, uint256.MustFromBig(mir.Value))
+
+	// Parity on error/no-error
+	if (errB != nil) != (errM != nil) {
+		t.Fatalf("error mismatch base=%v mir=%v", errB, errM)
+	}
+	// If both errored (unexpected for name()), skip rest but report mismatch
+	if errB != nil && errM != nil {
+		t.Fatalf("both errored for name(): base=%v mir=%v", errB, errM)
+	}
+	// Success path: parity on gas and returndata
+	if leftB != leftM {
+		t.Fatalf("gas leftover mismatch base=%d mir=%d", leftB, leftM)
+	}
+	if !bytes.Equal(retB, retM) {
+		t.Fatalf("returndata mismatch base=%x mir=%x", retB, retM)
+	}
+	// Basic sanity: name() returns a dynamic bytes string ABI, non-empty expected
+	if len(retB) == 0 {
+		t.Fatalf("empty return from base for name()")
+	}
+}
