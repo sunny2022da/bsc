@@ -1806,6 +1806,9 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 					if hasCorrectChild {
 						// Already has the correct child, just set LastPC and return
 						curBB.SetLastPC(uint(i - 1))
+						if curBB.ExitStack() == nil {
+							curBB.SetExitStack(valueStack.clone())
+						}
 						return nil
 					}
 				}
