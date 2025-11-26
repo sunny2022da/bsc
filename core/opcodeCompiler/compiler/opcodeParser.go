@@ -3,6 +3,7 @@ package compiler
 import (
 	"fmt"
 	"os"
+	"sort"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/holiman/uint256"
@@ -379,126 +380,110 @@ func GenerateMIRCFG(hash common.Hash, code []byte) (*CFG, error) {
 	// stateAccessor is global but we analyze it in processor granularity
 	var stateAccessor *StateAccessor = cfg.getStateAccessor()
 
-	entryBB := cfg.createEntryBB()
-	startBB := cfg.createBB(0, entryBB)
-	valueStack := ValueStack{}
 	// generate CFG.
-	unprcessedBBs := MIRBasicBlockStack{}
-	unprcessedBBs.Push(startBB)
-
-	// Guard against pathological CFG explosions in large contracts.
-	// Adapt the budget to the contract size: set to raw bytecode length.
-	// This keeps analysis proportional to program size and avoids premature truncation.
-	maxBasicBlocks := len(code)
-	if maxBasicBlocks <= 0 {
-		maxBasicBlocks = 1
+	// Phase 1, Pass 2: Stack Height Analysis
+	heights, err := cfg.analyzeStackHeights()
+	if err != nil {
+		return nil, fmt.Errorf("stack analysis failed: %w", err)
 	}
-	processedUnique := 0
 
-	// Guard map to limit repeated rebuild-triggered enqueues for the same block
-	rebuildCounts := make(map[*MIRBasicBlock]int)
-	for unprcessedBBs.Size() != 0 {
-		if processedUnique >= maxBasicBlocks {
-			parserDebugWarn("MIR CFG build budget reached", "blocks", processedUnique)
-			break
+	// Phase 1, Pass 3: MIR Generation
+	// We iterate in PC order for determinism
+
+	// Collect blocks in order
+	var bbs []*MIRBasicBlock
+	for _, bb := range cfg.pcToBlock {
+		// Check reachability
+		if _, ok := heights[bb]; ok {
+			bbs = append(bbs, bb)
 		}
-		curBB := unprcessedBBs.Pop()
-		if curBB == nil {
+	}
+	// Sort by PC
+	sort.Slice(bbs, func(i, j int) bool {
+		return bbs[i].FirstPC() < bbs[j].FirstPC()
+	})
+
+	// Initialize PHIs and build
+	for _, bb := range bbs {
+		h := heights[bb]
+
+		// Check if block starts with JUMPDEST and emit it first
+		if int(bb.FirstPC()) < len(cfg.rawCode) && ByteCode(cfg.rawCode[bb.FirstPC()]) == JUMPDEST {
+			mir := bb.CreateVoidMIR(MirJUMPDEST)
+			if mir != nil {
+				mir.genStackDepth = h
+			}
+		}
+
+		// Create PHIs for entry stack
+		entryStack := ValueStack{}
+		for i := 0; i < h; i++ {
+			// Create PHI
+			phi := &MIR{
+				op:            MirPHI,
+				phiStackIndex: i,
+			}
+			bb.appendMIR(phi)
+
+			val := Value{
+				kind:   Variable,
+				def:    phi,
+				liveIn: true, // Marked as live-in
+			}
+			entryStack.push(&val)
+		}
+		bb.SetEntryStack(entryStack.clone())
+
+		// Run buildBasicBlock
+		// We pass 'nil' for unprcessedBBs to disable rebuild loop.
+		// buildBasicBlock will use our entryStack and generate MIR.
+		// It will NOT try to merge PHIs because EntryStack is already set.
+		valStack := ValueStack{data: entryStack.clone()}
+		err := cfg.buildBasicBlock(bb, &valStack, memoryAccessor, stateAccessor, nil)
+		if err != nil {
+			return nil, fmt.Errorf("build basic block %d failed: %w", bb.blockNum, err)
+		}
+		bb.built = true
+	}
+
+	// Phase 1, Pass 4: Link PHI Operands
+	for _, bb := range bbs {
+		if len(bb.Parents()) == 0 {
 			continue
 		}
-		parserDebugWarn("==GenerateMIRCFG== unprcessedBBs.Pop", "curBB", curBB.blockNum, "curBB.built", curBB.built, "firstPC", curBB.firstPC,
-			"lastPC", curBB.lastPC, "parents", len(curBB.parents),
-			"children", len(curBB.children))
-		// Track unique blocks processed
-		if !curBB.built {
-			processedUnique++
+
+		// Map of PHI index -> PHI instruction
+		phis := make(map[int]*MIR)
+		for _, instr := range bb.Instructions() {
+			if instr.op == MirPHI {
+				phis[instr.phiStackIndex] = instr
+			}
 		}
-		// Seed entry stack for this block. If it has recorded entry snapshot, use it; else, if it
-		// has exactly one parent with an exit snapshot, inherit it; if multiple parents, ensure
-		// PHI nodes are materialized in buildBasicBlock.
-		if es := curBB.EntryStack(); es != nil {
-			valueStack.resetTo(es)
-			// Entry snapshot is a logical copy; not a parent live-in set.
-		} else if len(curBB.Parents()) == 1 {
-			parent := curBB.Parents()[0]
-			if ps := parent.ExitStack(); ps != nil {
-				valueStack.resetTo(ps)
-				// Mark inherited parent values as live-ins for this block
-				valueStack.markAllLiveIn()
-			} else {
-				// Parent has no ExitStack (likely being rebuilt). Try to use incoming stack from this parent.
-				if incomingStacks := curBB.IncomingStacks(); incomingStacks != nil {
-					if incomingStack := incomingStacks[parent]; incomingStack != nil {
-						valueStack.resetTo(incomingStack)
-						valueStack.markAllLiveIn()
-					} else {
-						valueStack.resetTo(nil)
-					}
-				} else {
-					valueStack.resetTo(nil)
-				}
-			}
-		} else {
-			// No known entry; clear stack to start fresh and let PHI creation fill in
-			valueStack.resetTo(nil)
+
+		if len(phis) == 0 {
+			continue
 		}
-		// Only rebuild if necessary. We now rebuild whenever a block is dequeued (new parent/incoming)
-		// or if it hasn't been built yet. Entry height alone is not sufficient because incomingStacks
-		// may change across enqueues even if height stays constant.
-		if !curBB.built || curBB.queued {
-			// Snapshot previous exit to detect changes after rebuild
-			prevExit := curBB.ExitStack()
-			// Also snapshot each child's previous incoming snapshot from this parent to avoid
-			// comparing against the just-updated value set during edge creation in this rebuild.
-			prevIncomingByChild := make(map[*MIRBasicBlock][]Value)
-			for _, ch := range curBB.Children() {
-				if ch == nil {
-					continue
-				}
-				prevIncomingByChild[ch] = ch.IncomingStacks()[curBB]
+
+		for _, parent := range bb.Parents() {
+			// Parent must have exit stack
+			ps := parent.ExitStack()
+			if ps == nil {
+				continue
 			}
-			// Clear any previously generated MIR for this block to avoid duplications when
-			// the entry stack height has changed and we need to rebuild.
-			curBB.ResetForRebuild(true)
-			err := cfg.buildBasicBlock(curBB, &valueStack, memoryAccessor, stateAccessor, &unprcessedBBs)
 
-			parserDebugWarn("==GenerateMIRCFG== buildBasicBlock exit", "curBB", curBB.blockNum, "firstPC", curBB.firstPC, "lastPC", curBB.lastPC,
-				"parents", len(curBB.parents), "children", len(curBB.children))
-
-			if err != nil {
-				parserDebugError(err.Error())
-				return nil, err
-			}
-			curBB.built = true
-
-			curBB.queued = false
-			// If exit changed, propagate to children and enqueue them
-			newExit := curBB.ExitStack()
-			if !stacksEqual(prevExit, newExit) {
-				rebuildCounts[curBB]++
-				if rebuildCounts[curBB] > 16 {
-					// Suppress further enqueues to break potential oscillation; runtime backfill will handle unresolved edges.
-					parserDebugWarn("MIR CFG: suppressing child enqueue due to repeated exit oscillation", "bb", curBB.blockNum, "firstPC", curBB.firstPC, "count", rebuildCounts[curBB])
-				} else {
-					for _, ch := range curBB.Children() {
-						if ch == nil {
-							continue
-						}
-						prevIncoming := prevIncomingByChild[ch]
-						if !stacksEqual(prevIncoming, newExit) {
-							ch.AddIncomingStack(curBB, newExit)
-							// update snapshot to avoid immediate re-enqueue due to stale prev
-							prevIncomingByChild[ch] = newExit
-							if !ch.queued {
-								ch.queued = true
-								unprcessedBBs.Push(ch)
-							}
-						}
-					}
+			for idx, phi := range phis {
+				// Stack grows up. index 0 is bottom.
+				// ValueStack data: [bottom ... top]
+				if idx < len(ps) {
+					val := ps[idx]
+					// We need to store a POINTER to the value
+					v := val
+					phi.operands = append(phi.operands, &v)
 				}
 			}
 		}
 	}
+
 	// Fix entry block (firstPC == 0) to ensure it falls through to PC:2 if it's JUMPDEST
 	// This fixes cases where the entry block should end after PUSH1 and fall through to the loop block
 	cfg.buildPCIndex()
@@ -690,9 +675,18 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 			// Record EVM mapping for JUMPDEST and emit it as the first instruction in the block
 			currentEVMBuildPC = uint(i)
 			currentEVMBuildOp = byte(entryOp)
-			mir := curBB.CreateVoidMIR(MirJUMPDEST)
-			if mir != nil {
-				mir.genStackDepth = valueStack.size()
+
+			// Only emit JUMPDEST if not already present (e.g. inserted by GenerateMIRCFG)
+			alreadyPresent := false
+			if insts := curBB.Instructions(); len(insts) > 0 && insts[0].op == MirJUMPDEST {
+				alreadyPresent = true
+			}
+
+			if !alreadyPresent {
+				mir := curBB.CreateVoidMIR(MirJUMPDEST)
+				if mir != nil {
+					mir.genStackDepth = valueStack.size()
+				}
 			}
 
 			// Advance past JUMPDEST so PHIs (if any) are appended after it and we don't re-emit it below
