@@ -1621,6 +1621,7 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 							// Conservative end: no children, record exit
 							exitSt := valueStack.clone()
 							curBB.SetExitStack(exitSt)
+							curBB.SetLastPC(uint(i))
 							return nil
 						}
 						// Build children for each constant target
@@ -1662,6 +1663,7 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 						}
 						if len(children) == 0 {
 							curBB.SetExitStack(valueStack.clone())
+							curBB.SetLastPC(uint(i))
 							return nil
 						}
 						curBB.SetChildren(children)
@@ -1677,6 +1679,7 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 							}
 						}
 						_ = oldExit
+						curBB.SetLastPC(uint(i))
 						return nil
 					}
 					// Fallback: direct constant destination in operand payload
@@ -1709,6 +1712,7 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 									errM.meta = []byte{code[targetPC]}
 								}
 								curBB.SetExitStack(valueStack.clone())
+								curBB.SetLastPC(uint(i))
 								return nil
 							}
 							curBB.SetChildren([]*MIRBasicBlock{targetBB})
@@ -1753,15 +1757,18 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 									unprcessedBBs.Push(targetBB)
 								}
 							}
+							curBB.SetLastPC(uint(i))
 							return nil
 						}
 						// Unknown/indirect destination value
 						parserDebugWarn("MIR JUMP unknown target at build time", "bb", curBB.blockNum, "pc", i, "stackDepth", valueStack.size())
 						curBB.SetExitStack(valueStack.clone())
+						curBB.SetLastPC(uint(i))
 						return nil
 					}
 				}
 			}
+			curBB.SetLastPC(uint(i))
 			return nil
 		case JUMPI:
 			mir = curBB.CreateJumpMIR(MirJUMPI, valueStack, nil)
@@ -1830,6 +1837,7 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 									unprcessedBBs.Push(fallthroughBB)
 								}
 							}
+							curBB.SetLastPC(uint(i))
 							return nil
 						}
 						// Build target and fallthrough edges
@@ -1992,6 +2000,7 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 									unprcessedBBs.Push(fallthroughBB)
 								}
 							}
+							curBB.SetLastPC(uint(i))
 							return nil
 						}
 						// Unknown/indirect target: still create fallthrough edge conservatively
@@ -2023,6 +2032,7 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 								unprcessedBBs.Push(fallthroughBB)
 							}
 						}
+						curBB.SetLastPC(uint(i))
 						return nil
 					}
 					// Interpret payload as big-endian integer of arbitrary length
@@ -2082,6 +2092,7 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 									unprcessedBBs.Push(fallthroughBB)
 								}
 							}
+							curBB.SetLastPC(uint(i))
 							return nil
 						}
 						fallthroughBB := c.createBB(uint(i+1), curBB)
@@ -2113,6 +2124,7 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 								unprcessedBBs.Push(fallthroughBB)
 							}
 						}
+						curBB.SetLastPC(uint(i))
 						return nil
 					}
 				} else {
@@ -2145,9 +2157,11 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 							unprcessedBBs.Push(fallthroughBB)
 						}
 					}
+					curBB.SetLastPC(uint(i))
 					return nil
 				}
 			}
+			curBB.SetLastPC(uint(i))
 			return nil
 		case RJUMP:
 			// Not implemented yet; tolerate by skipping to keep tests functional
