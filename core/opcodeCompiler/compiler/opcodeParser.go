@@ -2,6 +2,7 @@ package compiler
 
 import (
 	"fmt"
+	"github.com/holiman/uint256"
 	"os"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -92,6 +93,105 @@ func debugDumpMIR(m *MIR) {
 		fields = append(fields, "ops", ops)
 	}
 	parserDebugWarn("  MIR op", fields...)
+}
+
+// tryResolveUint64ConstPC attempts to resolve a Value into a constant uint64 by
+// recursively evaluating a small subset of MIR operations when all inputs are constants.
+// This is used in the builder to conservatively identify PHI-derived JUMP/JUMPI targets.
+// The evaluation is bounded by 'budget' to avoid pathological recursion.
+func tryResolveUint64ConstPC(v *Value, budget int) (uint64, bool) {
+	if v == nil || budget <= 0 {
+		return 0, false
+	}
+	if v.kind == Konst {
+		if v.u != nil {
+			u, _ := v.u.Uint64WithOverflow()
+			return u, true
+		}
+		// Fallback to payload
+		tmp := uint256.NewInt(0).SetBytes(v.payload)
+		u, _ := tmp.Uint64WithOverflow()
+		return u, true
+	}
+	if v.kind != Variable || v.def == nil {
+		return 0, false
+	}
+	// Helper to eval operand k
+	evalOp := func(k int) (*uint256.Int, bool) {
+		if k < 0 || k >= len(v.def.operands) || v.def.operands[k] == nil {
+			return nil, false
+		}
+		if u64, ok := tryResolveUint64ConstPC(v.def.operands[k], budget-1); ok {
+			return uint256.NewInt(0).SetUint64(u64), true
+		}
+		return nil, false
+	}
+	switch v.def.op {
+	case MirPHI:
+		// PHI itself is a constant only if all alternatives resolve to the same constant
+		var have bool
+		var out uint64
+		for _, alt := range v.def.operands {
+			if alt == nil {
+				return 0, false
+			}
+			u, ok := tryResolveUint64ConstPC(alt, budget-1)
+			if !ok {
+				return 0, false
+			}
+			if !have {
+				out = u
+				have = true
+			} else if out != u {
+				return 0, false
+			}
+		}
+		if have {
+			return out, true
+		}
+		return 0, false
+	case MirAND, MirOR, MirXOR, MirADD, MirSUB, MirSHL, MirSHR, MirSAR, MirBYTE:
+		// Binary ops with constant operands
+		a, okA := evalOp(0)
+		b, okB := evalOp(1)
+		if !okA || !okB {
+			return 0, false
+		}
+		tmp := uint256.NewInt(0)
+		switch v.def.op {
+		case MirAND:
+			tmp.And(a, b)
+		case MirOR:
+			tmp.Or(a, b)
+		case MirXOR:
+			tmp.Xor(a, b)
+		case MirADD:
+			tmp.Add(a, b)
+		case MirSUB:
+			tmp.Sub(a, b)
+		case MirSHL:
+			shift, _ := b.Uint64WithOverflow()
+			tmp.Lsh(a, uint(shift))
+		case MirSHR, MirSAR:
+			shift, _ := b.Uint64WithOverflow()
+			tmp.Rsh(a, uint(shift))
+		case MirBYTE:
+			// byte(n, x) extracts the nth byte from big-endian x (EVM semantics).
+			n, _ := a.Uint64WithOverflow()
+			if n >= 32 {
+				tmp.Clear()
+			} else {
+				buf := a.Bytes32()
+				// EVM byte index 0 = most significant byte
+				byteVal := buf[n]
+				tmp.SetUint64(uint64(byteVal))
+			}
+		}
+		u, _ := tmp.Uint64WithOverflow()
+		return u, true
+	default:
+		return 0, false
+	}
 }
 
 // debugDumpBBFull logs a BB header and all MIRs with operand stack values.
@@ -781,6 +881,8 @@ func GenerateMIRCFG(hash common.Hash, code []byte) (*CFG, error) {
 					prevIncoming := prevIncomingByChild[ch]
 					if !stacksEqual(prevIncoming, newExit) {
 						ch.AddIncomingStack(curBB, newExit)
+						// update snapshot to avoid immediate re-enqueue due to stale prev
+						prevIncomingByChild[ch] = newExit
 						if !ch.queued {
 							ch.queued = true
 							unprcessedBBs.Push(ch)
@@ -1503,7 +1605,13 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 								} else if ov.kind == Variable && ov.def != nil && ov.def.op == MirPHI {
 									visitPhi(ov.def)
 								} else {
-									unknown = true
+									// Try a conservative constant evaluation of this operand
+									if tpc, ok := tryResolveUint64ConstPC(ov, 16); ok {
+										parserDebugWarn("==buildBasicBlock== phi.target.eval", "pc", tpc)
+										targetSet[tpc] = true
+									} else {
+										unknown = true
+									}
 								}
 							}
 						}
@@ -1611,8 +1719,11 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 							// Ensure the linear fallthrough block (i+1) is created and queued for processing,
 							// so its pc is mapped even if no edge comes from this JUMP (useful for future targets).
 							if _, ok := c.pcToBlock[uint(i+1)]; !ok {
-								fall := c.createBB(uint(i+1), nil)
+								fall := c.createBB(uint(i+1), curBB)
 								fall.SetInitDepthMax(depth)
+								// Seed modeling so building this block later doesn't underflow on DUP/SWAP
+								fall.SetParents([]*MIRBasicBlock{curBB})
+								fall.AddIncomingStack(curBB, curBB.ExitStack())
 								if !fall.queued {
 									fall.queued = true
 									parserDebugWarn("==buildBasicBlock== MIR JUMP fallthrough BB queued", "curbb", curBB.blockNum, "curBB.firstPC", curBB.firstPC,
@@ -1622,6 +1733,9 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 							} else {
 								if fall, ok2 := c.pcToBlock[uint(i+1)]; ok2 {
 									fall.SetInitDepthMax(depth)
+									// Likewise, seed parent/incoming stack to avoid orphan modeling
+									fall.SetParents([]*MIRBasicBlock{curBB})
+									fall.AddIncomingStack(curBB, curBB.ExitStack())
 									if !fall.queued {
 										fall.queued = true
 										parserDebugWarn("==buildBasicBlock== MIR JUMP fallthrough BB queued", "curbb", curBB.blockNum, "curBB.firstPC", curBB.firstPC,
@@ -1678,8 +1792,14 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 								parserDebugWarn("==buildBasicBlock== MIR JUMPI target is PHI", "bb", curBB.blockNum, "pc", i, "targetpc", tpc)
 								targetSet[tpc] = true
 							} else {
-								unknown = true
-								break
+								// Attempt a small constant evaluation; if fails, mark unknown
+								if tpc, ok := tryResolveUint64ConstPC(ov, 16); ok {
+									parserDebugWarn("==buildBasicBlock== MIR JUMPI target eval", "bb", curBB.blockNum, "pc", i, "targetpc", tpc)
+									targetSet[tpc] = true
+								} else {
+									unknown = true
+									break
+								}
 							}
 						}
 						if unknown || len(targetSet) == 0 {

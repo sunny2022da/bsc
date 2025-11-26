@@ -2801,18 +2801,39 @@ func (it *MIRInterpreter) EnsureMemorySize(size uint64) {
 
 func (it *MIRInterpreter) readMem(off, sz *uint256.Int) []byte {
 	o := off.Uint64()
-	s := sz.Uint64()
-	it.ensureMemSize(o + s)
-	return append([]byte(nil), it.memory[o:o+s]...)
+	sReq := sz.Uint64()
+	memLen := uint64(len(it.memory))
+	// Compute high index safely (detect overflow)
+	hi := o + sReq
+	if hi < o {
+		hi = memLen
+	}
+	if hi > memLen {
+		hi = memLen
+	}
+	if o > hi {
+		return nil
+	}
+	return append([]byte(nil), it.memory[o:hi]...)
 }
 
 // readMemView returns a view (subslice) of the internal memory without allocating.
 // The returned slice is only valid until the next memory growth.
 func (it *MIRInterpreter) readMemView(off, sz *uint256.Int) []byte {
 	o := off.Uint64()
-	s := sz.Uint64()
-	it.ensureMemSize(o + s)
-	return it.memory[o : o+s]
+	sReq := sz.Uint64()
+	memLen := uint64(len(it.memory))
+	hi := o + sReq
+	if hi < o {
+		hi = memLen
+	}
+	if hi > memLen {
+		hi = memLen
+	}
+	if o > hi {
+		return nil
+	}
+	return it.memory[o:hi]
 }
 
 func (it *MIRInterpreter) readMem32(off *uint256.Int) []byte {
@@ -2850,8 +2871,28 @@ func (it *MIRInterpreter) memCopy(dest, src, length *uint256.Int) {
 // readMemCopy allocates a new buffer of size sz and copies from memory at off
 func (it *MIRInterpreter) readMemCopy(off, sz *uint256.Int) []byte {
 	o := off.Uint64()
-	s := sz.Uint64()
-	it.ensureMemSize(o + s)
+	sReq := sz.Uint64()
+	// Clamp copy length to available memory to avoid oversize allocations/slicing
+	memLen := uint64(len(it.memory))
+	var s uint64
+	if o >= memLen {
+		s = 0
+	} else {
+		rem := memLen - o
+		if sReq < rem {
+			s = sReq
+		} else {
+			s = rem
+		}
+	}
+	// Hard-cap to a reasonable bound to avoid pathological allocations
+	const maxCopy = 64 * 1024 * 1024 // 64 MiB
+	if s > maxCopy {
+		s = maxCopy
+	}
+	if s == 0 {
+		return nil
+	}
 	out := make([]byte, s)
 	copy(out, it.memory[o:o+s])
 	return out
