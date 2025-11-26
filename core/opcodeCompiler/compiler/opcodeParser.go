@@ -1,7 +1,6 @@
 package compiler
 
 import (
-	"encoding/binary"
 	"fmt"
 	"os"
 
@@ -49,8 +48,6 @@ func debugFormatValue(v *Value) string {
 			return fmt.Sprintf("var:def@%d", v.def.idx)
 		}
 		return "var"
-	case Lazy:
-		return "lazy"
 	default:
 		return "unknown"
 	}
@@ -996,24 +993,16 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 		}
 	}
 
+	// ==============================================================================
+	// PHASE 2: Use inferred height if Phase 1 was applied
+	// ==============================================================================
+
 	// If this block has multiple parents and recorded incoming stacks, insert PHI nodes to form a unified
 	// entry stack and seed the current stack accordingly.
 	if len(curBB.Parents()) > 1 && len(curBB.IncomingStacks()) > 0 {
-		// Capture snapshot of incoming stacks for the thunks
-		incomingSnapshot := make(map[*MIRBasicBlock][]Value)
-		for p, st := range curBB.IncomingStacks() {
-			if st != nil {
-				incomingSnapshot[p] = st
-			}
-		}
-
 		var maxH int
 
-		// ==============================================================================
-		// PHASE 2: Use inferred height if Phase 1 was applied
-		// ==============================================================================
 		if curBB.inferredHeight > 0 {
-			// Use the fixed height from Phase 1 analysis (方案1 Phase 2)
 			maxH = curBB.inferredHeight
 		} else {
 			// Fallback to original strategy if Phase 1 not yet applied
@@ -1027,137 +1016,107 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 			}
 		}
 
-		// Initialize valueStack with Lazy Thunks for each slot
-		lazyStack := make([]Value, maxH)
-		for i := 0; i < maxH; i++ {
-			// ValueStack order: [Bottom, ..., Top].
-			// i=0 -> Bottom (Deepest). Slot index from top: maxH - 1
-			// i=maxH-1 -> Top. Slot index from top: 0
-
-			slotFromTop := maxH - 1 - i
-
-			// Define the thunk closure
-			// IMPORTANT: Capture slotFromTop in closure, NOT 'i' which changes in loop
-			capturedSlot := slotFromTop
-
-			// Cache result to ensure stable identity once resolved
-			var cached *Value
-
-			thunk := func() *Value {
-				if cached != nil {
-					return cached
+		// Build PHIs from bottom to top so the last pushed corresponds to top-of-stack
+		tmp := ValueStack{}
+		for i := maxH - 1; i >= 0; i-- {
+			// Collect ith from top across parents if available
+			var ops []*Value
+			for _, p := range curBB.Parents() {
+				st := curBB.IncomingStacks()[p]
+				if st != nil && len(st) > i {
+					// stack top is end; index from top
+					v := st[len(st)-1-i]
+					vv := v          // copy
+					vv.liveIn = true // mark incoming as live-in so interpreter prefers globalResults
+					ops = append(ops, &vv)
 				}
-
-				// Collect operands from parents
-				var ops []*Value
-				for _, p := range curBB.Parents() {
-					st := incomingSnapshot[p] // Use SNAPSHOT, not curBB.IncomingStacks()
-					// st is [Bottom...Top].
-					// We want 'capturedSlot' from Top.
-					// Index = len(st) - 1 - capturedSlot.
-					if st != nil && len(st) > capturedSlot {
-						v := &st[len(st)-1-capturedSlot]
-						// Resolve if the operand is itself lazy
-						if v.kind == Lazy && v.Lazy != nil {
-							v = resolveValue(v)
-						}
-						if v == nil {
-							// Resolution failed up the chain?
-							continue // treat as missing
-						}
-						vv := *v         // copy
-						vv.liveIn = true // mark incoming as live-in
-						ops = append(ops, &vv)
-					} else {
-						// Missing (stack too short)
-					}
-				}
-
-				if len(ops) == 0 {
-					// Resolution failed: no operands
-					return nil
-				}
-
-				// Simplify
-				simplified := false
-				if len(ops) > 1 {
-					uniq := make([]*Value, 0, len(ops))
-					for _, o := range ops {
-						dup := false
-						for _, u := range uniq {
-							if equalValueForFlow(o, u) {
-								dup = true
-								break
-							}
-						}
-						if !dup {
-							uniq = append(uniq, o)
+			}
+			// Simplify: if all operands are equal, avoid PHI and push the value directly
+			simplified := false
+			// First, deduplicate equal operands within this PHI slot
+			if len(ops) > 1 {
+				uniq := make([]*Value, 0, len(ops))
+				for _, o := range ops {
+					dup := false
+					for _, u := range uniq {
+						if equalValueForFlow(o, u) {
+							dup = true
+							break
 						}
 					}
-					ops = uniq
+					if !dup {
+						uniq = append(uniq, o)
+					}
 				}
-				if len(ops) == 1 {
-					cached = ops[0]
-					simplified = true
-				} else if len(ops) > 1 {
-					// Check if all are same (redundant with above logic, but double check)
-					base := ops[0]
+				ops = uniq
+			}
+			if len(ops) > 0 {
+				base := ops[0]
+				if base != nil && base.kind != Unknown {
 					equalAll := true
 					for k := 1; k < len(ops); k++ {
-						if !equalValueForFlow(base, ops[k]) {
+						if ops[k] == nil || ops[k].kind == Unknown || !equalValueForFlow(base, ops[k]) {
 							equalAll = false
 							break
 						}
 					}
 					if equalAll {
-						cached = base
+						// Push the representative value and continue
+						tmp.push(base)
 						simplified = true
 					}
 				}
-
-				if simplified {
-					return cached
+			}
+			if simplified {
+				continue
+			}
+			// If a PHI for this slot already exists, merge new operands and reuse it
+			var existing *MIR
+			for _, m := range curBB.Instructions() {
+				if m != nil && m.op == MirPHI && (m.phiStackIndex == i) {
+					existing = m
+					break
 				}
-
-				// Create PHI
-				// Note: We are inside a closure called during buildBasicBlock (or later).
-				// We assume curBB is the block we are building.
-				// BUT: curBB might be finished?
-				// No, we execute instructions sequentially. We only resolve when we need the value.
-				// So we are actively building curBB.
-				// Using 'curBB' from closure scope is correct.
-
-				// Check if existing PHI matches? (Might be hard if we are generating on fly)
-				// We just create a new one.
-
-				// DO NOT PUSH result to stack (the thunk IS the stack item).
-				// We append instruction to block.
-				mir := new(MIR)
-				mir.op = MirPHI
-				mir.operands = ops
-				mir.phiStackIndex = capturedSlot
-
-				mir = curBB.appendMIR(mir)
-
-				res := mir.Result()
-				cached = res
-				return cached
 			}
-
-			payload := make([]byte, 2)
-			binary.BigEndian.PutUint16(payload, uint16(slotFromTop))
-
-			val := Value{
-				kind:    Lazy,
-				Lazy:    thunk,
-				payload: payload,
+			if existing != nil {
+				// Merge incoming operands and deduplicate
+				merged := append(append([]*Value{}, existing.operands...), ops...)
+				uniq := make([]*Value, 0, len(merged))
+				for _, o := range merged {
+					dup := false
+					for _, u := range uniq {
+						if equalValueForFlow(o, u) {
+							dup = true
+							break
+						}
+					}
+					if !dup {
+						uniq = append(uniq, o)
+					}
+				}
+				existing.operands = uniq
+				// If only one unique operand remains, bypass PHI
+				if len(uniq) == 1 {
+					tmp.push(uniq[0])
+				} else {
+					tmp.push(existing.Result())
+				}
+			} else {
+				// If only one operand after dedup, avoid creating PHI
+				if len(ops) == 1 {
+					tmp.push(ops[0])
+					continue
+				}
+				phi := curBB.CreatePhiMIR(ops, &tmp)
+				if phi != nil {
+					phi.phiStackIndex = i
+				}
 			}
-			lazyStack[i] = val
 		}
-
-		curBB.SetEntryStack(lazyStack)
-		valueStack.resetTo(lazyStack)
-		depth = maxH
+		// tmp now has values bottom-to-top; assign as entry
+		curBB.SetEntryStack(tmp.clone())
+		valueStack.resetTo(curBB.EntryStack())
+		depth = len(curBB.EntryStack())
 		depthKnown = true
 
 	} else if es := curBB.EntryStack(); es != nil {
@@ -1168,7 +1127,6 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 		// Single-parent path with inherited stack seeded by the caller.
 		// Align local depth tracker with the actual entry stack to avoid
 		// spurious DUP/SWAP underflow warnings and ensure exact EVM parity.
-		// Note: Inherited stack might contain Lazy Thunks. This is desired (Pass-Through).
 		depth = valueStack.size()
 		depthKnown = true
 	}

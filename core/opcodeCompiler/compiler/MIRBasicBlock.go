@@ -1,7 +1,6 @@
 package compiler
 
 import (
-	"bytes"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/holiman/uint256"
 )
@@ -916,7 +915,6 @@ func stacksEqual(a, b []Value) bool {
 // - Konst: compare numeric equality (uint256)
 // - Variable: if both have defs, compare def.op, def.evmPC and def.phiStackIndex; else require both nil
 // - Arguments/Unknown: equal if kinds match
-// - Lazy: compare payload (slot index)
 func equalValueForFlow(a, b *Value) bool {
 	if a == nil || b == nil {
 		return a == b
@@ -953,9 +951,6 @@ func equalValueForFlow(a, b *Value) bool {
 			return false
 		}
 		return true
-	case Lazy:
-		// Compare payload (slot index)
-		return bytes.Equal(a.payload, b.payload)
 	case Arguments, Unknown:
 		return true
 	default:
