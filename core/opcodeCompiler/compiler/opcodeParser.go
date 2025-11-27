@@ -758,17 +758,9 @@ func GenerateMIRCFG(hash common.Hash, code []byte) (*CFG, error) {
 
 		// Log progress every 1000 iterations
 		if iterationCount-lastLogIteration >= 1000 {
-			// Find the most frequently rebuilt blocks
-			maxCount := 0
-			var maxPC uint64
-			for pc, count := range blockIterationCount {
-				if count > maxCount {
-					maxCount = count
-					maxPC = pc
-				}
-			}
-			fmt.Fprintf(os.Stderr, "🔄 CFG iteration=%d, unique=%d/%d, queue=%d, hottestBlock=PC%d(x%d)\n",
-				iterationCount, processedUnique, maxBasicBlocks, unprcessedBBs.Size(), maxPC, maxCount)
+			// Removed map iteration to test determinism
+			fmt.Fprintf(os.Stderr, "🔄 CFG iteration=%d, unique=%d/%d, queue=%d\n",
+				iterationCount, processedUnique, maxBasicBlocks, unprcessedBBs.Size())
 			lastLogIteration = iterationCount
 		}
 		if processedUnique >= maxBasicBlocks {

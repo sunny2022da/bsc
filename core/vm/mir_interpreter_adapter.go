@@ -631,6 +631,7 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 	// Check if we have MIR-optimized code
 	if !contract.HasMIRCode() {
 		// Fallback to regular EVM interpreter
+		fmt.Printf("[FALLBACK_1] No MIR code, using base EVM interpreter\n")
 		return adapter.evm.Interpreter().Run(contract, input, readOnly)
 	}
 	// Reset JUMPDEST de-dup guard per top-level run
@@ -652,6 +653,7 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 	cfg, ok := cfgInterface.(*compiler.CFG)
 	if !ok || cfg == nil {
 		// Fallback if no valid MIR CFG available
+		fmt.Printf("[FALLBACK_2] Invalid CFG, using base EVM interpreter\n")
 		log.Error("MIR fallback: invalid CFG, using EVM interpreter", "addr", contract.Address(), "codehash", contract.CodeHash)
 		return adapter.evm.Interpreter().Run(contract, input, readOnly)
 	}
@@ -1486,6 +1488,7 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 					// Strict mode: do not fallback; surface the error for debugging.
 					return nil, fmt.Errorf("MIR strict mode: no fallback (reason=%w)", err)
 				}
+				fmt.Printf("[FALLBACK_3] MIR interpreter requested fallback, using base EVM\n")
 				log.Error("MIR fallback requested by interpreter, using EVM interpreter", "addr", contract.Address(), "pc", 0)
 				return adapter.evm.baseInterpreter.Run(contract, input, readOnly)
 			}
@@ -1499,12 +1502,14 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 		// If MIR executed without error, return whatever returndata was produced.
 		// An empty result (e.g., STOP) should not trigger fallback; mirror EVM semantics
 		// where a STOP simply returns empty bytes.
+		fmt.Printf("[MIR_SUCCESS] MIR execution completed successfully, returning %d bytes\n", len(result))
 		return result, nil
 	}
 	// If nothing returned from the entry, fallback to EVM to preserve semantics
 	if adapter.evm.Config.MIRStrictNoFallback {
 		return nil, fmt.Errorf("MIR strict mode: entry block produced no result")
 	}
+	fmt.Printf("[FALLBACK_4] Entry block produced no result, using base EVM\n")
 	log.Error("MIR fallback: entry block produced no result, using EVM interpreter", "addr", contract.Address())
 	return adapter.evm.Interpreter().Run(contract, input, readOnly)
 }

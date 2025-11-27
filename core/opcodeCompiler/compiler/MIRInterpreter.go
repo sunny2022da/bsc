@@ -473,6 +473,8 @@ func (it *MIRInterpreter) publishLiveOut(block *MIRBasicBlock) {
 
 // RunCFGWithResolver sets up a resolver backed by the given CFG and runs from entry block
 func (it *MIRInterpreter) RunCFGWithResolver(cfg *CFG, entry *MIRBasicBlock) ([]byte, error) {
+	fmt.Printf("[MIR_RUN_START] Starting MIR execution, entry block=%d, firstPC=%d\n", entry.blockNum, entry.firstPC)
+	
 	// Record the active CFG for possible runtime backfill of dynamic targets
 	it.cfg = cfg
 	// Reset global caches at the start of each execution to avoid stale values
@@ -1968,6 +1970,16 @@ func mirHandleJUMPI(it *MIRInterpreter, m *MIR) error {
 
 // mirHandlePHI sets the result to the first available incoming value.
 func mirHandlePHI(it *MIRInterpreter, m *MIR) error {
+	// Debug: Track critical PHI nodes to confirm MIR execution
+	if m != nil && m.evmPC == 2026 && (m.idx == 10 || m.idx == 11) {
+		prevBBNum := uint(0)
+		if it.prevBB != nil {
+			prevBBNum = it.prevBB.blockNum
+		}
+		fmt.Printf("[MIR_PHI_2026] idx=%d phiStackIdx=%d prevBB=%d (Block 79 executing in MIR)\n", 
+			m.idx, m.phiStackIndex, prevBBNum)
+	}
+	
 	// If we can, take the exact value from the immediate predecessor's exit stack
 	if it.prevBB != nil {
 		exit := it.prevBB.ExitStack()
