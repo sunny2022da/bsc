@@ -392,6 +392,9 @@ func (it *MIRInterpreter) RunMIR(block *MIRBasicBlock) ([]byte, error) {
 				return it.returndata, nil
 			case errREVERT:
 				return it.returndata, err
+			case errJUMP:
+				// Jump signal is normal control flow, pass it up
+				return nil, err
 			default:
 				// Don't fallback - expose the error so we can fix it
 				mirDebugWarn("RunMIR: Instruction error (not falling back)", "evmPC", ins.evmPC, "op", ins.op.String(), "err", err)
@@ -2249,7 +2252,7 @@ func mirHandleEQ(it *MIRInterpreter, m *MIR) error {
 }
 func mirHandleLT(it *MIRInterpreter, m *MIR) error {
 	a, b, err := mirLoadAB(it, m)
-	//log.Warn("MIR LT", "a", a, "< b", b)
+	mirDebugWarn("MIR LT", "a", a.Hex(), "b", b.Hex())
 	if err != nil {
 		return err
 	}

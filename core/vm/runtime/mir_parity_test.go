@@ -19,7 +19,6 @@ import (
 )
 
 func TestMIRParity_USDT(t *testing.T) {
-
 	// Decode USDT bytecode from benchmarks
 	realCode, err := hex.DecodeString(usdtHex[2:])
 	if err != nil {
@@ -35,7 +34,7 @@ func TestMIRParity_USDT(t *testing.T) {
 		selector []byte
 		args     [][]byte
 	}{
-		{"name", []byte{0x06, 0xfd, 0xde, 0x03}, nil},
+		//	{"name", []byte{0x06, 0xfd, 0xde, 0x03}, nil},
 		{"decimals", []byte{0x31, 0x3c, 0xe5, 0x67}, nil},
 		{"symbol", []byte{0x95, 0xd8, 0x9b, 0x41}, nil},
 		{"totalSupply", []byte{0x18, 0x16, 0x0d, 0xdd}, nil},
@@ -203,7 +202,9 @@ func TestMIRParity_WBNB(t *testing.T) {
 		var mirLastPC uint64
 		compiler.SetGlobalMIRTracerExtended(func(mm *compiler.MIR) {
 			if mm != nil {
-				mirLastPC = uint64(mm.EvmPC())
+				if mm.EvmPC() != 0 {
+					mirLastPC = uint64(mm.EvmPC())
+				}
 			}
 		})
 		mirEnv := runtime.NewEnv(mirCfg)

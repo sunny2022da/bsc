@@ -377,6 +377,9 @@ type MIRBasicBlockStack struct {
 }
 
 func (s *MIRBasicBlockStack) Push(ptr *MIRBasicBlock) {
+	if s == nil {
+		return
+	}
 	s.data = append(s.data, ptr)
 }
 

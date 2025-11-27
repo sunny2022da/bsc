@@ -9,6 +9,59 @@ import (
 	"github.com/holiman/uint256"
 )
 
+// scanForBlockStarts scans the bytecode to identify all potential basic block start PCs.
+// Block starts are: PC 0, JUMPDESTs, and instructions immediately following terminators or branches.
+// Also creates the MIRBasicBlock stub for each start PC.
+func (c *CFG) preScanBlocks() error {
+	// Ensure entry block exists
+	if _, ok := c.pcToBlock[0]; !ok {
+		c.createBB(0, nil)
+	}
+
+	code := c.rawCode
+	i := 0
+	for i < len(code) {
+		op := ByteCode(code[i])
+
+		// JUMPDEST is always a block start
+		if op == JUMPDEST {
+			if _, ok := c.pcToBlock[uint(i)]; !ok {
+				c.createBB(uint(i), nil)
+			}
+		}
+
+		// If previous instruction was a terminator or branch, this is a block start
+		// (handled by the look-ahead below)
+
+		// Check if current op causes the NEXT op to be a block start
+		var nextPC int
+		isTerminatorOrBranch := false
+
+		if op >= PUSH1 && op <= PUSH32 {
+			size := int(op - PUSH1 + 1)
+			nextPC = i + 1 + size
+		} else {
+			nextPC = i + 1
+
+			if op == STOP || op == RETURN || op == REVERT || op == INVALID || op == SELFDESTRUCT {
+				isTerminatorOrBranch = true
+			} else if op == JUMP || op == JUMPI {
+				isTerminatorOrBranch = true
+			}
+		}
+
+		if isTerminatorOrBranch && nextPC < len(code) {
+			// The instruction following a terminator/branch is a block start (fallthrough or dead code entry)
+			if _, ok := c.pcToBlock[uint(nextPC)]; !ok {
+				c.createBB(uint(nextPC), nil)
+			}
+		}
+
+		i = nextPC
+	}
+	return nil
+}
+
 // debugDumpBB logs a basic block and its MIR instructions for diagnostics.
 func debugDumpBB(prefix string, bb *MIRBasicBlock) {
 	if bb == nil {
@@ -367,6 +420,12 @@ func (c *CFG) createBB(pc uint, parent *MIRBasicBlock) *MIRBasicBlock {
 func (c *CFG) reachEndBB() {
 }
 
+// preScanBlocks performs a linear scan of the bytecode to identify all potential
+// basic block boundaries (entry, jumpdests, and fallthroughs after terminators/branches).
+// It pre-creates MIRBasicBlock stubs for them in pcToBlock.
+// (Redundant implementation removed)
+// func (c *CFG) preScanBlocks() { ... }
+
 // GenerateMIRCFG generates a MIR Control Flow Graph for the given bytecode
 func GenerateMIRCFG(hash common.Hash, code []byte) (*CFG, error) {
 	if len(code) == 0 {
@@ -381,11 +440,16 @@ func GenerateMIRCFG(hash common.Hash, code []byte) (*CFG, error) {
 	var stateAccessor *StateAccessor = cfg.getStateAccessor()
 
 	// generate CFG.
+	// Phase 1, Pass 1: Discovery
+	cfg.preScanBlocks()
+
 	// Phase 1, Pass 2: Stack Height Analysis
 	heights, err := cfg.analyzeStackHeights()
 	if err != nil {
+		fmt.Println("Stack analysis failed:", err)
 		return nil, fmt.Errorf("stack analysis failed: %w", err)
 	}
+	// fmt.Println("Stack analysis done, reachable blocks:", len(heights))
 
 	// Phase 1, Pass 3: MIR Generation
 	// We iterate in PC order for determinism
@@ -398,6 +462,7 @@ func GenerateMIRCFG(hash common.Hash, code []byte) (*CFG, error) {
 			bbs = append(bbs, bb)
 		}
 	}
+	// fmt.Println("Building MIR for", len(bbs), "blocks")
 	// Sort by PC
 	sort.Slice(bbs, func(i, j int) bool {
 		return bbs[i].FirstPC() < bbs[j].FirstPC()
@@ -409,6 +474,8 @@ func GenerateMIRCFG(hash common.Hash, code []byte) (*CFG, error) {
 
 		// Check if block starts with JUMPDEST and emit it first
 		if int(bb.FirstPC()) < len(cfg.rawCode) && ByteCode(cfg.rawCode[bb.FirstPC()]) == JUMPDEST {
+			currentEVMBuildPC = bb.FirstPC()
+			currentEVMBuildOp = byte(JUMPDEST)
 			mir := bb.CreateVoidMIR(MirJUMPDEST)
 			if mir != nil {
 				mir.genStackDepth = h
@@ -419,10 +486,17 @@ func GenerateMIRCFG(hash common.Hash, code []byte) (*CFG, error) {
 		entryStack := ValueStack{}
 		for i := 0; i < h; i++ {
 			// Create PHI
+			// Note: MIRInterpreter interprets phiStackIndex as index FROM TOP.
+			// Our loop i goes from 0 (bottom) to h-1 (top).
+			// So index from top = (h-1) - i.
 			phi := &MIR{
 				op:            MirPHI,
-				phiStackIndex: i,
+				phiStackIndex: h - 1 - i,
 			}
+			// Ensure MIR instruction has correct PC context (start of block)
+			currentEVMBuildPC = bb.FirstPC()
+			// PHI doesn't map to a specific EVM op, but belongs to the block start
+			currentEVMBuildOp = 0
 			bb.appendMIR(phi)
 
 			val := Value{
@@ -1249,7 +1323,9 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 									targetBB.queued = true
 									parserDebugWarn("==buildBasicBlock== MIR targetBB queued", "curbb", curBB.blockNum, "cruBB.firstPC", curBB.firstPC, "targetbb", targetBB.blockNum,
 										"targetbbfirstpc", targetBB.firstPC, "targetBBPC", targetBB.FirstPC(), "targetBBLastPC", targetBB.LastPC())
-									unprcessedBBs.Push(targetBB)
+									if unprcessedBBs != nil {
+										unprcessedBBs.Push(targetBB)
+									}
 								}
 							}
 						}
@@ -1309,28 +1385,17 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 							parserDebugWarn("MIR JUMP targetBB", "curBB", curBB.blockNum, "curBB.firstPC", curBB.firstPC, "targetBB.firstPC", targetBB.firstPC, "targetBBPC", targetBB.FirstPC(), "targetBBLastPC", targetBB.LastPC())
 							// Ensure the linear fallthrough block (i+1) is created and queued for processing,
 							// so its pc is mapped even if no edge comes from this JUMP (useful for future targets).
+							// Important: we must LINK it as a child of current block if we want correct stack propagation?
+							// Wait, Unconditional JUMP does NOT fall through.
+							// But we might need the block to exist for other jumps.
+							// And if it's already created, we just ensure it's built.
+							// We should NOT link it as a child of curBB.
 							if _, ok := c.pcToBlock[uint(i+1)]; !ok {
-								fall := c.createBB(uint(i+1), curBB)
-								fall.SetInitDepthMax(depth)
-								// Seed modeling so building this block later doesn't underflow on DUP/SWAP
-								fall.SetParents([]*MIRBasicBlock{curBB})
-								fall.AddIncomingStack(curBB, curBB.ExitStack())
+								fall := c.createBB(uint(i+1), nil) // No parent linkage
+								// Don't set stack or parents from here, just ensure existence.
 								if !fall.queued {
 									fall.queued = true
-									parserDebugWarn("==buildBasicBlock== MIR JUMP fallthrough BB queued", "curbb", curBB.blockNum, "curBB.firstPC", curBB.firstPC,
-										"targetbb", fall.blockNum, "targetbbfirstpc", fall.firstPC, "targetBBPC", fall.FirstPC(), "targetBBLastPC", fall.LastPC())
-									unprcessedBBs.Push(fall)
-								}
-							} else {
-								if fall, ok2 := c.pcToBlock[uint(i+1)]; ok2 {
-									fall.SetInitDepthMax(depth)
-									// Likewise, seed parent/incoming stack to avoid orphan modeling
-									fall.SetParents([]*MIRBasicBlock{curBB})
-									fall.AddIncomingStack(curBB, curBB.ExitStack())
-									if !fall.queued {
-										fall.queued = true
-										parserDebugWarn("==buildBasicBlock== MIR JUMP fallthrough BB queued", "curbb", curBB.blockNum, "curBB.firstPC", curBB.firstPC,
-											"targetbb", fall.blockNum, "targetbbfirstpc", fall.firstPC, "targetBBPC", fall.FirstPC(), "targetBBLastPC", fall.LastPC())
+									if unprcessedBBs != nil {
 										unprcessedBBs.Push(fall)
 									}
 								}
@@ -1341,7 +1406,9 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 									parserDebugWarn("==buildBasicBlock== MIR targetBB queued", "curbb", curBB.blockNum, "curBB.firstPC", curBB.firstPC,
 										"targetbb", targetBB.blockNum, "targetbbfirstpc", targetBB.firstPC, "targetBBPC", targetBB.FirstPC(),
 										"targetBBLastPC", targetBB.LastPC())
-									unprcessedBBs.Push(targetBB)
+									if unprcessedBBs != nil {
+										unprcessedBBs.Push(targetBB)
+									}
 								}
 							}
 							return nil
@@ -1418,7 +1485,9 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 							if !fallExists || (fallExists && !hadFallParentBefore) {
 								if !fallthroughBB.queued {
 									fallthroughBB.queued = true
-									unprcessedBBs.Push(fallthroughBB)
+									if unprcessedBBs != nil {
+										unprcessedBBs.Push(fallthroughBB)
+									}
 								}
 							}
 							return nil
@@ -1469,7 +1538,9 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 									parserDebugWarn("==buildBasicBlock== MIR JUMPI target BB queued", "curbb", curBB.blockNum, "curBB.firstPC", curBB.firstPC,
 										"targetbb", targetBB.blockNum, "targetbbfirstpc", targetBB.firstPC, "targetBBPC", targetBB.FirstPC(),
 										"targetBBLastPC", targetBB.LastPC())
-									unprcessedBBs.Push(targetBB)
+									if unprcessedBBs != nil {
+										unprcessedBBs.Push(targetBB)
+									}
 								}
 							}
 						}
@@ -1485,10 +1556,9 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 						if !fallExists || (fallExists && !hadFallParentBefore) {
 							if !fallthroughBB.queued {
 								fallthroughBB.queued = true
-								parserDebugWarn("==buildBasicBlock== MIR JUMPI fallthrough BB queued", "curbb", curBB.blockNum, "curBB.firstPC", curBB.firstPC,
-									"targetbb", fallthroughBB.blockNum, "targetbbfirstpc", fallthroughBB.firstPC, "targetBBPC", fallthroughBB.FirstPC(),
-									"targetBBLastPC", fallthroughBB.LastPC())
-								unprcessedBBs.Push(fallthroughBB)
+								if unprcessedBBs != nil {
+									unprcessedBBs.Push(fallthroughBB)
+								}
 							}
 						}
 						return nil
@@ -1546,14 +1616,14 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 								if !fallExists || (fallExists && !hadFallParentBefore) {
 									if !fallthroughBB.queued {
 										fallthroughBB.queued = true
-										parserDebugWarn("==buildBasicBlock== MIR JUMPI fallthrough BB queued", "curbb", curBB.blockNum, "curBB.firstPC", curBB.firstPC,
-											"targetbb", fallthroughBB.blockNum, "targetbbfirstpc", fallthroughBB.firstPC, "targetBBPC", fallthroughBB.FirstPC(),
-											"targetBBLastPC", fallthroughBB.LastPC())
-										unprcessedBBs.Push(fallthroughBB)
+										if unprcessedBBs != nil {
+											unprcessedBBs.Push(fallthroughBB)
+										}
 									}
 								}
 								return nil
 							}
+							// JUMPI: create both target and fallthrough blocks
 							fallthroughBB := c.createBB(uint(i+1), curBB)
 							targetBB.SetInitDepthMax(depth)
 							fallthroughBB.SetInitDepthMax(depth)
@@ -1568,19 +1638,17 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 							if !targetExists || (targetExists && !hadTargetParentBefore) {
 								if !targetBB.queued {
 									targetBB.queued = true
-									parserDebugWarn("==buildBasicBlock== MIR JUMPI target BB queued", "curbb", curBB.blockNum, "curBB.firstPC", curBB.firstPC,
-										"targetbb", targetBB.blockNum, "targetbbfirstpc", targetBB.firstPC, "targetBBPC", targetBB.FirstPC(),
-										"targetBBLastPC", targetBB.LastPC())
-									unprcessedBBs.Push(targetBB)
+									if unprcessedBBs != nil {
+										unprcessedBBs.Push(targetBB)
+									}
 								}
 							}
 							if !fallExists || (fallExists && !hadFallParentBefore) {
 								if !fallthroughBB.queued {
 									fallthroughBB.queued = true
-									parserDebugWarn("==buildBasicBlock== MIR JUMPI fallthrough BB queued", "curbb", curBB.blockNum, "curBB.firstPC", curBB.firstPC,
-										"targetbb", fallthroughBB.blockNum, "targetbbfirstpc", fallthroughBB.firstPC, "targetBBPC", fallthroughBB.FirstPC(),
-										"targetBBLastPC", fallthroughBB.LastPC())
-									unprcessedBBs.Push(fallthroughBB)
+									if unprcessedBBs != nil {
+										unprcessedBBs.Push(fallthroughBB)
+									}
 								}
 							}
 							return nil
@@ -1608,10 +1676,9 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 						if !fallExists || (fallExists && !hadFallParentBefore) {
 							if !fallthroughBB.queued {
 								fallthroughBB.queued = true
-								parserDebugWarn("==buildBasicBlock== MIR JUMPI fallthrough BB queued", "curbb", curBB.blockNum, "curBB.firstPC", curBB.firstPC,
-									"targetbb", fallthroughBB.blockNum, "targetbbfirstpc", fallthroughBB.firstPC, "targetBBPC", fallthroughBB.FirstPC(),
-									"targetBBLastPC", fallthroughBB.LastPC())
-								unprcessedBBs.Push(fallthroughBB)
+								if unprcessedBBs != nil {
+									unprcessedBBs.Push(fallthroughBB)
+								}
 							}
 						}
 						return nil
@@ -1667,10 +1734,9 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 							if !fallExists || (fallExists && !hadFallParentBefore) {
 								if !fallthroughBB.queued {
 									fallthroughBB.queued = true
-									parserDebugWarn("==buildBasicBlock== MIR JUMPI fallthrough BB queued", "curbb", curBB.blockNum, "curBB.firstPC", curBB.firstPC,
-										"targetbb", fallthroughBB.blockNum, "targetbbfirstpc", fallthroughBB.firstPC, "targetBBPC", fallthroughBB.FirstPC(),
-										"targetBBLastPC", fallthroughBB.LastPC())
-									unprcessedBBs.Push(fallthroughBB)
+									if unprcessedBBs != nil {
+										unprcessedBBs.Push(fallthroughBB)
+									}
 								}
 							}
 							return nil
@@ -1689,19 +1755,17 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 						if !targetExists || (targetExists && !hadTargetParentBefore) {
 							if !targetBB.queued {
 								targetBB.queued = true
-								parserDebugWarn("==buildBasicBlock== MIR JUMPI target BB queued", "curbb", curBB.blockNum, "curBB.firstPC", curBB.firstPC,
-									"targetbb", targetBB.blockNum, "targetbbfirstpc", targetBB.firstPC, "targetBBPC", targetBB.FirstPC(),
-									"targetBBLastPC", targetBB.LastPC())
-								unprcessedBBs.Push(targetBB)
+								if unprcessedBBs != nil {
+									unprcessedBBs.Push(targetBB)
+								}
 							}
 						}
 						if !fallExists || (fallExists && !hadFallParentBefore) {
 							if !fallthroughBB.queued {
 								fallthroughBB.queued = true
-								parserDebugWarn("==buildBasicBlock== MIR JUMPI fallthrough BB queued", "curbb", curBB.blockNum, "curBB.firstPC", curBB.firstPC,
-									"targetbb", fallthroughBB.blockNum, "targetbbfirstpc", fallthroughBB.firstPC, "targetBBPC", fallthroughBB.FirstPC(),
-									"targetBBLastPC", fallthroughBB.LastPC())
-								unprcessedBBs.Push(fallthroughBB)
+								if unprcessedBBs != nil {
+									unprcessedBBs.Push(fallthroughBB)
+								}
 							}
 						}
 						return nil
@@ -1729,10 +1793,9 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 						if !fallExists || (fallExists && !hadFallParentBefore) {
 							if !fallthroughBB.queued {
 								fallthroughBB.queued = true
-								parserDebugWarn("==buildBasicBlock== MIR JUMPI fallthrough BB queued", "curbb", curBB.blockNum, "curBB.firstPC", curBB.firstPC,
-									"targetbb", fallthroughBB.blockNum, "targetbbfirstpc", fallthroughBB.firstPC, "targetBBPC", fallthroughBB.FirstPC(),
-									"targetBBLastPC", fallthroughBB.LastPC())
-								unprcessedBBs.Push(fallthroughBB)
+								if unprcessedBBs != nil {
+									unprcessedBBs.Push(fallthroughBB)
+								}
 							}
 						}
 						return nil
@@ -1764,7 +1827,9 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 							parserDebugWarn("==buildBasicBlock== MIR JUMPI fallthrough BB queued", "curbb", curBB.blockNum, "curBB.firstPC", curBB.firstPC,
 								"targetbb", fallthroughBB.blockNum, "targetbbfirstpc", fallthroughBB.firstPC, "targetBBPC", fallthroughBB.FirstPC(),
 								"targetBBLastPC", fallthroughBB.LastPC())
-							unprcessedBBs.Push(fallthroughBB)
+							if unprcessedBBs != nil {
+								unprcessedBBs.Push(fallthroughBB)
+							}
 						}
 					}
 					return nil
@@ -1832,7 +1897,9 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 					}
 					if !exists {
 						parserDebugWarn("=== JUMPDEST ==== MIR targetBB queued", "curbb", curBB.blockNum, "targetbb", newBB.blockNum, "targetbbfirstpc", newBB.firstPC, "targetBBPC", newBB.FirstPC(), "targetBBLastPC", newBB.LastPC())
-						unprcessedBBs.Push(newBB)
+						if unprcessedBBs != nil {
+							unprcessedBBs.Push(newBB)
+						}
 					}
 				}
 				// Always set LastPC and exit stack to ensure block ends correctly
@@ -1950,7 +2017,9 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 			fallthroughBB := c.createBB(uint(i+1), curBB)
 			curBB.SetChildren([]*MIRBasicBlock{fallthroughBB})
 			parserDebugWarn("MIR CREATE targetBB queued", "curbb", curBB.blockNum, "targetbb", fallthroughBB.blockNum, "targetbbfirstpc", fallthroughBB.firstPC, "targetBBPC", fallthroughBB.FirstPC(), "targetBBLastPC", fallthroughBB.LastPC())
-			unprcessedBBs.Push(fallthroughBB)
+			if unprcessedBBs != nil {
+				unprcessedBBs.Push(fallthroughBB)
+			}
 			curBB.SetExitStack(valueStack.clone())
 			fallthroughBB.AddIncomingStack(curBB, curBB.ExitStack())
 			if depth >= 3 {
@@ -1979,7 +2048,9 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 			fallthroughBB := c.createBB(uint(i+1), curBB)
 			curBB.SetChildren([]*MIRBasicBlock{fallthroughBB})
 			parserDebugWarn("MIR CREATE2 targetBB queued", "curbb", curBB.blockNum, "targetbb", fallthroughBB.blockNum, "targetbbfirstpc", fallthroughBB.firstPC, "targetBBPC", fallthroughBB.FirstPC(), "targetBBLastPC", fallthroughBB.LastPC())
-			unprcessedBBs.Push(fallthroughBB)
+			if unprcessedBBs != nil {
+				unprcessedBBs.Push(fallthroughBB)
+			}
 			curBB.SetExitStack(valueStack.clone())
 			fallthroughBB.AddIncomingStack(curBB, curBB.ExitStack())
 			if depth >= 4 {
@@ -2012,7 +2083,9 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 			fallthroughBB := c.createBB(uint(i+1), curBB)
 			curBB.SetChildren([]*MIRBasicBlock{fallthroughBB})
 			parserDebugWarn("MIR CALL targetBB queued", "curbb", curBB.blockNum, "targetbb", fallthroughBB.blockNum, "targetbbfirstpc", fallthroughBB.firstPC, "targetBBPC", fallthroughBB.FirstPC(), "targetBBLastPC", fallthroughBB.LastPC())
-			unprcessedBBs.Push(fallthroughBB)
+			if unprcessedBBs != nil {
+				unprcessedBBs.Push(fallthroughBB)
+			}
 			curBB.SetExitStack(valueStack.clone())
 			fallthroughBB.AddIncomingStack(curBB, curBB.ExitStack())
 			if depth >= 7 {
@@ -2045,7 +2118,9 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 			fallthroughBB := c.createBB(uint(i+1), curBB)
 			curBB.SetChildren([]*MIRBasicBlock{fallthroughBB})
 			parserDebugWarn("MIR CALLCODE targetBB queued", "curbb", curBB.blockNum, "targetbb", fallthroughBB.blockNum, "targetbbfirstpc", fallthroughBB.firstPC, "targetBBPC", fallthroughBB.FirstPC(), "targetBBLastPC", fallthroughBB.LastPC())
-			unprcessedBBs.Push(fallthroughBB)
+			if unprcessedBBs != nil {
+				unprcessedBBs.Push(fallthroughBB)
+			}
 			curBB.SetExitStack(valueStack.clone())
 			fallthroughBB.AddIncomingStack(curBB, curBB.ExitStack())
 			if depth >= 7 {
@@ -2096,7 +2171,9 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 			fallthroughBB := c.createBB(uint(i+1), curBB)
 			curBB.SetChildren([]*MIRBasicBlock{fallthroughBB})
 			parserDebugWarn("MIR DELEGATECALL targetBB queued", "curbb", curBB.blockNum, "targetbb", fallthroughBB.blockNum, "targetbbfirstpc", fallthroughBB.firstPC, "targetBBPC", fallthroughBB.FirstPC(), "targetBBLastPC", fallthroughBB.LastPC())
-			unprcessedBBs.Push(fallthroughBB)
+			if unprcessedBBs != nil {
+				unprcessedBBs.Push(fallthroughBB)
+			}
 			curBB.SetExitStack(valueStack.clone())
 			fallthroughBB.AddIncomingStack(curBB, curBB.ExitStack())
 			if depth >= 6 {
@@ -2128,7 +2205,9 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 			fallthroughBB := c.createBB(uint(i+1), curBB)
 			curBB.SetChildren([]*MIRBasicBlock{fallthroughBB})
 			parserDebugWarn("MIR STATICCALL targetBB queued", "curbb", curBB.blockNum, "targetbb", fallthroughBB.blockNum, "targetbbfirstpc", fallthroughBB.firstPC, "targetBBPC", fallthroughBB.FirstPC(), "targetBBLastPC", fallthroughBB.LastPC())
-			unprcessedBBs.Push(fallthroughBB)
+			if unprcessedBBs != nil {
+				unprcessedBBs.Push(fallthroughBB)
+			}
 			curBB.SetExitStack(valueStack.clone())
 			fallthroughBB.AddIncomingStack(curBB, curBB.ExitStack())
 			if depth >= 6 {
@@ -2230,7 +2309,9 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 			fallthroughBB.SetInitDepth(depth)
 			curBB.SetChildren([]*MIRBasicBlock{fallthroughBB})
 			parserDebugWarn("MIR CALLF targetBB queued", "curbb", curBB.blockNum, "targetbb", fallthroughBB.blockNum, "targetbbfirstpc", fallthroughBB.firstPC, "targetBBPC", fallthroughBB.FirstPC(), "targetBBLastPC", fallthroughBB.LastPC())
-			unprcessedBBs.Push(fallthroughBB)
+			if unprcessedBBs != nil {
+				unprcessedBBs.Push(fallthroughBB)
+			}
 			curBB.SetExitStack(valueStack.clone())
 			fallthroughBB.AddIncomingStack(curBB, curBB.ExitStack())
 			return nil
@@ -2269,7 +2350,9 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 			fallthroughBB.SetInitDepth(depth)
 			curBB.SetChildren([]*MIRBasicBlock{fallthroughBB})
 			parserDebugWarn("MIR EOFCREATE targetBB queued", "curbb", curBB.blockNum, "targetbb", fallthroughBB.blockNum, "targetbbfirstpc", fallthroughBB.firstPC, "targetBBPC", fallthroughBB.FirstPC(), "targetBBLastPC", fallthroughBB.LastPC())
-			unprcessedBBs.Push(fallthroughBB)
+			if unprcessedBBs != nil {
+				unprcessedBBs.Push(fallthroughBB)
+			}
 			curBB.SetExitStack(valueStack.clone())
 			fallthroughBB.AddIncomingStack(curBB, curBB.ExitStack())
 			return nil
@@ -2301,7 +2384,9 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 			fallthroughBB := c.createBB(uint(i+1), curBB)
 			curBB.SetChildren([]*MIRBasicBlock{fallthroughBB})
 			parserDebugWarn("MIR EXTCALL targetBB queued", "curbb", curBB.blockNum, "targetbb", fallthroughBB.blockNum, "targetbbfirstpc", fallthroughBB.firstPC, "targetBBPC", fallthroughBB.FirstPC(), "targetBBLastPC", fallthroughBB.LastPC())
-			unprcessedBBs.Push(fallthroughBB)
+			if unprcessedBBs != nil {
+				unprcessedBBs.Push(fallthroughBB)
+			}
 			curBB.SetExitStack(valueStack.clone())
 			fallthroughBB.AddIncomingStack(curBB, curBB.ExitStack())
 			return nil
@@ -2327,7 +2412,9 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 			fallthroughBB := c.createBB(uint(i+1), curBB)
 			curBB.SetChildren([]*MIRBasicBlock{fallthroughBB})
 			parserDebugWarn("MIR EXTDELEGATECALL targetBB queued", "curbb", curBB.blockNum, "targetbb", fallthroughBB.blockNum, "targetbbfirstpc", fallthroughBB.firstPC, "targetBBPC", fallthroughBB.FirstPC(), "targetBBLastPC", fallthroughBB.LastPC())
-			unprcessedBBs.Push(fallthroughBB)
+			if unprcessedBBs != nil {
+				unprcessedBBs.Push(fallthroughBB)
+			}
 			curBB.SetExitStack(valueStack.clone())
 			fallthroughBB.AddIncomingStack(curBB, curBB.ExitStack())
 			return nil
@@ -2353,7 +2440,9 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 			fallthroughBB := c.createBB(uint(i+1), curBB)
 			curBB.SetChildren([]*MIRBasicBlock{fallthroughBB})
 			parserDebugWarn("MIR EXTSTATICCALL targetBB queued", "curbb", curBB.blockNum, "targetbb", fallthroughBB.blockNum, "targetbbfirstpc", fallthroughBB.firstPC, "targetBBPC", fallthroughBB.FirstPC(), "targetBBLastPC", fallthroughBB.LastPC())
-			unprcessedBBs.Push(fallthroughBB)
+			if unprcessedBBs != nil {
+				unprcessedBBs.Push(fallthroughBB)
+			}
 			curBB.SetExitStack(valueStack.clone())
 			fallthroughBB.AddIncomingStack(curBB, curBB.ExitStack())
 			return nil
@@ -2413,7 +2502,9 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 			}
 			if !exists {
 				fallthroughBB.queued = true
-				unprcessedBBs.Push(fallthroughBB)
+				if unprcessedBBs != nil {
+					unprcessedBBs.Push(fallthroughBB)
+				}
 			}
 			curBB.SetLastPC(1) // Entry block ends at PC:1 (after PUSH1 0x03)
 			parserDebugWarn("==buildBasicBlock== Fixed entry block fallthrough to PC:2", "curbb", curBB.blockNum)
@@ -2457,7 +2548,9 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 				}
 				if !exists {
 					fallthroughBB.queued = true
-					unprcessedBBs.Push(fallthroughBB)
+					if unprcessedBBs != nil {
+						unprcessedBBs.Push(fallthroughBB)
+					}
 				}
 				curBB.SetLastPC(uint(i - 1))
 				parserDebugWarn("==buildBasicBlock== Fixed fallthrough to JUMPDEST", "curbb", curBB.blockNum, "curBB_firstPC", curBB.firstPC, "nextPC", i)

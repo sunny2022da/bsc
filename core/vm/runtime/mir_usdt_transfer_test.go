@@ -16,7 +16,6 @@ import (
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/tracing"
 	"github.com/ethereum/go-ethereum/core/vm"
-	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/triedb"
 	"github.com/holiman/uint256"
@@ -176,11 +175,11 @@ func TestMIRUSDTTransfer(t *testing.T) {
 
 	vmConfig := vm.Config{
 		EnableOpcodeOptimizations: true,
-		EnableMIR:                 false,
-		EnableMIRInitcode:         false,
+		EnableMIR:                 true,
+		EnableMIRInitcode:         true,
 		MIRStrictNoFallback:       true,
 	}
-	t.Log("✅ EVM configuration created (Base EVM for both runtime and constructor; probing behavior)")
+	t.Log("✅ EVM configuration created (MIR enabled for both runtime and constructor)")
 
 	compiler.EnableOpcodeParse()
 
@@ -212,19 +211,6 @@ func TestMIRUSDTTransfer(t *testing.T) {
 	t.Log("📦 Deploying USDT contract...")
 	deployContract(t, evm, usdtBytecode)
 
-	// 手工预置Alice的大额余额到balances映射，绕过构造器初始化限制
-	{
-		t.Log("🧩 Pre-seeding Alice balance in storage mapping for runtime-only testing")
-		// 计算 keccak256(pad(address) ++ pad(slotIndex))
-		keyBuf := make([]byte, 64)
-		copy(keyBuf[12:32], aliceAddr.Bytes())
-		// slot index at the tail 32 bytes already zero-initialized
-		hash := crypto.Keccak256Hash(keyBuf)
-		preseed := new(big.Int).SetUint64(0)
-		preseed.SetString("1000000000000000000000000", 10) // 1e24
-		statedb.SetState(globalUsdtContract, hash, common.BigToHash(preseed))
-	}
-
 	t.Log("💰 USDT contract constructor already gave tokens to Alice")
 
 	// Verify Alice's balance
@@ -233,8 +219,8 @@ func TestMIRUSDTTransfer(t *testing.T) {
 	t.Logf("✅ Alice's balance: %s tokens", new(big.Int).Div(aliceTokenBalance, big.NewInt(1000000000000000000)).String())
 
 	// Optional: ensure Alice has spendable balance by minting additional tokens if supported
-	t.Log("🪙 Minting 1 token to Alice (if contract supports mint)...")
-	mintTokens(t, evm, big.NewInt(1000000000000000000))
+	// t.Log("🪙 Minting 1 token to Alice (if contract supports mint)...")
+	// mintTokens(t, evm, big.NewInt(1000000000000000000))
 
 	// Perform individual transfers
 	t.Log("🔄 Performing individual transfers...")
@@ -248,7 +234,7 @@ func TestMIRUSDTTransfer(t *testing.T) {
 
 	// Verify some recipient balances
 	t.Log("🔍 Verifying transfers...")
-	startRecipient := common.HexToAddress("0x3000000000000000000000000000000000000001")
+	startRecipient := common.HexToAddress("0x1111111111111111111111111111111111111234")
 	for i := 0; i < 3; i++ {
 		recipient := common.BigToAddress(new(big.Int).Add(startRecipient.Big(), big.NewInt(int64(i))))
 		balance := getTokenBalance(t, evm, recipient)
