@@ -302,6 +302,7 @@ func (it *MIRInterpreter) RunMIR(block *MIRBasicBlock) ([]byte, error) {
 	// Track current block for PHI resolution
 	it.currentBB = block
 	// Pre-size and pre-initialize results slots for this block to avoid per-op allocations on first writes
+	// CRITICAL: Clear old values to prevent stale results from previous blocks interfering
 	if n := len(block.instructions); n > 0 {
 		if n > len(it.results) {
 			grown := make([]*uint256.Int, n)
@@ -314,6 +315,8 @@ func (it *MIRInterpreter) RunMIR(block *MIRBasicBlock) ([]byte, error) {
 		for i := 0; i < n; i++ {
 			if it.results[i] == nil {
 				it.results[i] = new(uint256.Int)
+			} else {
+				it.results[i].Clear() // Clear stale value from previous block
 			}
 		}
 	}
@@ -475,6 +478,9 @@ func (it *MIRInterpreter) publishLiveOut(block *MIRBasicBlock) {
 func (it *MIRInterpreter) RunCFGWithResolver(cfg *CFG, entry *MIRBasicBlock) ([]byte, error) {
 	// Record the active CFG for possible runtime backfill of dynamic targets
 	it.cfg = cfg
+	// Reset execution state for clean PHI resolution
+	it.prevBB = nil
+	it.currentBB = nil
 	// Reset global caches at the start of each execution to avoid stale values
 	// This ensures values from previous executions or different paths don't pollute the current run
 	if it.globalResultsBySig != nil {
@@ -496,6 +502,16 @@ func (it *MIRInterpreter) RunCFGWithResolver(cfg *CFG, entry *MIRBasicBlock) ([]
 	if it.phiResultsBySig != nil {
 		for k := range it.phiResultsBySig {
 			delete(it.phiResultsBySig, k)
+		}
+	}
+	if it.phiLastPred != nil {
+		for k := range it.phiLastPred {
+			delete(it.phiLastPred, k)
+		}
+	}
+	if it.phiLastPredBySig != nil {
+		for k := range it.phiLastPredBySig {
+			delete(it.phiLastPredBySig, k)
 		}
 	}
 	if it.env != nil && it.env.ResolveBB == nil && cfg != nil {
@@ -2226,7 +2242,6 @@ func mirHandleLT(it *MIRInterpreter, m *MIR) error {
 }
 func mirHandleGT(it *MIRInterpreter, m *MIR) error {
 	a, b, err := mirLoadAB(it, m)
-	//log.Warn("MIR GT", "a", a, "> b", b)
 	if err != nil {
 		return err
 	}
@@ -2627,7 +2642,46 @@ func (it *MIRInterpreter) evalValue(v *Value) *uint256.Int {
 	case Variable, Arguments:
 		// If this value is marked as live-in from a parent, prefer global cross-BB map first
 		if v.def != nil {
-			// For PHI definitions, prefer predecessor-sensitive cache
+			// CRITICAL FIX: For live-in values, ALWAYS check global caches FIRST
+			// This prevents stale values from it.results polluting PHI resolution
+			if v.liveIn {
+				// Try signature-based cache first (evmPC, idx) - most reliable
+				if v.def.evmPC != 0 {
+					if byPC := it.globalResultsBySig[uint64(v.def.evmPC)]; byPC != nil {
+						if val, ok := byPC[v.def.idx]; ok && val != nil {
+							return val
+						}
+					}
+				}
+				// Fallback to pointer-based cache
+				if it.globalResults != nil {
+					if r, ok := it.globalResults[v.def]; ok && r != nil {
+						return r
+					}
+				}
+				// For live-in PHI values, also check phiResults
+				if v.def.op == MirPHI {
+					if it.phiResults != nil {
+						if preds, ok := it.phiResults[v.def]; ok {
+							if it.prevBB != nil {
+								if val, ok2 := preds[it.prevBB]; ok2 && val != nil {
+									return val
+								}
+							}
+							if last := it.phiLastPred[v.def]; last != nil {
+								if val, ok2 := preds[last]; ok2 && val != nil {
+									return val
+								}
+							}
+						}
+					}
+				}
+				// Live-in value not found - return zero
+				mirDebugWarn("MIR evalValue: live-in value not found",
+					"evmPC", v.def.evmPC, "idx", v.def.idx, "liveIn", v.liveIn)
+				return it.zeroConst
+			}
+			// For PHI definitions (non-live-in), prefer predecessor-sensitive cache
 			if v.def.op == MirPHI {
 				// Use last known predecessor for this PHI if available, else immediate prevBB
 				if it.phiResults != nil {
@@ -2666,8 +2720,7 @@ func (it *MIRInterpreter) evalValue(v *Value) *uint256.Int {
 					}
 				}
 			}
-			// First try local per-block result (most recent, most accurate)
-			// But only if the instruction is actually in the current block
+			// For non-live-in values, try local per-block result
 			// Check if current block contains this instruction
 			defInCurrentBlock := false
 			if it.currentBB != nil && v.def != nil {
@@ -2683,8 +2736,8 @@ func (it *MIRInterpreter) evalValue(v *Value) *uint256.Int {
 					return r
 				}
 			}
-			// Then try global cache for live-in values (only if not found locally)
-			if v.liveIn {
+			// Finally, try global cache for non-live-in values
+			if !v.liveIn {
 				// PURE APPROACH 1: Always use signature-based cache (evmPC, idx)
 				// This is simpler, more maintainable, and absolutely correct for loops
 				if v.def.evmPC != 0 {
@@ -2801,18 +2854,39 @@ func (it *MIRInterpreter) EnsureMemorySize(size uint64) {
 
 func (it *MIRInterpreter) readMem(off, sz *uint256.Int) []byte {
 	o := off.Uint64()
-	s := sz.Uint64()
-	it.ensureMemSize(o + s)
-	return append([]byte(nil), it.memory[o:o+s]...)
+	sReq := sz.Uint64()
+	memLen := uint64(len(it.memory))
+	// Compute high index safely (detect overflow)
+	hi := o + sReq
+	if hi < o {
+		hi = memLen
+	}
+	if hi > memLen {
+		hi = memLen
+	}
+	if o > hi {
+		return nil
+	}
+	return append([]byte(nil), it.memory[o:hi]...)
 }
 
 // readMemView returns a view (subslice) of the internal memory without allocating.
 // The returned slice is only valid until the next memory growth.
 func (it *MIRInterpreter) readMemView(off, sz *uint256.Int) []byte {
 	o := off.Uint64()
-	s := sz.Uint64()
-	it.ensureMemSize(o + s)
-	return it.memory[o : o+s]
+	sReq := sz.Uint64()
+	memLen := uint64(len(it.memory))
+	hi := o + sReq
+	if hi < o {
+		hi = memLen
+	}
+	if hi > memLen {
+		hi = memLen
+	}
+	if o > hi {
+		return nil
+	}
+	return it.memory[o:hi]
 }
 
 func (it *MIRInterpreter) readMem32(off *uint256.Int) []byte {
@@ -2850,8 +2924,28 @@ func (it *MIRInterpreter) memCopy(dest, src, length *uint256.Int) {
 // readMemCopy allocates a new buffer of size sz and copies from memory at off
 func (it *MIRInterpreter) readMemCopy(off, sz *uint256.Int) []byte {
 	o := off.Uint64()
-	s := sz.Uint64()
-	it.ensureMemSize(o + s)
+	sReq := sz.Uint64()
+	// Clamp copy length to available memory to avoid oversize allocations/slicing
+	memLen := uint64(len(it.memory))
+	var s uint64
+	if o >= memLen {
+		s = 0
+	} else {
+		rem := memLen - o
+		if sReq < rem {
+			s = sReq
+		} else {
+			s = rem
+		}
+	}
+	// Hard-cap to a reasonable bound to avoid pathological allocations
+	const maxCopy = 64 * 1024 * 1024 // 64 MiB
+	if s > maxCopy {
+		s = maxCopy
+	}
+	if s == 0 {
+		return nil
+	}
 	out := make([]byte, s)
 	copy(out, it.memory[o:o+s])
 	return out

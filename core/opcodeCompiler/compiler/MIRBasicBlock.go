@@ -62,8 +62,13 @@ type MIRBasicBlock struct {
 	// Precomputed live-outs: definitions (MIR) whose values are live at block exit
 	liveOutDefs []*MIR
 	// Build bookkeeping
-	built  bool // set true after first successful build
-	queued bool // true if currently enqueued for (re)build
+	built        bool // set true after first successful build
+	queued       bool // true if currently enqueued for (re)build
+	rebuildCount int  // number of times this block has been rebuilt
+	// Stack analysis
+	staticStackDelta int  // net stack change from executing this block once
+	isLoopHeader     bool // true if this block is a loop header
+	inferredHeight   int  // inferred stack height from Phase 1 analysis
 }
 
 func (b *MIRBasicBlock) Size() uint {
@@ -774,7 +779,13 @@ func (b *MIRBasicBlock) CreateBlockInfoMIR(op MirOperation, stack *ValueStack) *
 		// leave operands empty for any not explicitly handled
 	}
 
-	stack.push(mir.Result())
+	// Only push result for producer operations; copy operations are void (no stack output)
+	switch op {
+	case MirCALLDATACOPY, MirCODECOPY, MirEXTCODECOPY, MirRETURNDATACOPY, MirDATACOPY:
+		// Void operations - do not push any result
+	default:
+		stack.push(mir.Result())
+	}
 	mir = b.appendMIR(mir)
 	mir.genStackDepth = stack.size()
 	// noisy generation logging removed

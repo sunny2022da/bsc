@@ -2,7 +2,6 @@ package compiler
 
 import (
 	"fmt"
-
 	"github.com/holiman/uint256"
 )
 
@@ -59,6 +58,7 @@ func (s *ValueStack) peek(n int) *Value {
 	}
 	// Stack grows from left to right, so top is at the end
 	index := len(s.data) - 1 - n
+
 	return &s.data[index]
 }
 
