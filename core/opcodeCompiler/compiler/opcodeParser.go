@@ -1121,6 +1121,7 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 
 		// Build PHIs from bottom to top so the last pushed corresponds to top-of-stack
 		tmp := ValueStack{}
+
 		for i := maxH - 1; i >= 0; i-- {
 			// Collect ith from top across parents if available
 			var ops []*Value

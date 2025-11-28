@@ -1,6 +1,8 @@
 package compiler
 
 import (
+	"sort"
+
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/holiman/uint256"
 )
@@ -145,6 +147,12 @@ func (b *MIRBasicBlock) SetParents(parents []*MIRBasicBlock) {
 			b.parents = append(b.parents, parent)
 		}
 	}
+	// DETERMINISM FIX: Sort parents by blockNum to ensure stable PHI operand collection order
+	if len(b.parents) > 1 {
+		sort.Slice(b.parents, func(i, j int) bool {
+			return b.parents[i].blockNum < b.parents[j].blockNum
+		})
+	}
 }
 
 func (b *MIRBasicBlock) Children() []*MIRBasicBlock {
@@ -157,6 +165,13 @@ func (b *MIRBasicBlock) SetChildren(children []*MIRBasicBlock) {
 			b.childrenBitmap.set1(uint64(child.blockNum))
 			b.children = append(b.children, child)
 		}
+	}
+	// DETERMINISM FIX: Sort children by blockNum to ensure stable ordering
+	// This prevents non-deterministic behavior in CFG traversal and PHI construction
+	if len(b.children) > 1 {
+		sort.Slice(b.children, func(i, j int) bool {
+			return b.children[i].blockNum < b.children[j].blockNum
+		})
 	}
 }
 
@@ -779,7 +794,13 @@ func (b *MIRBasicBlock) CreateBlockInfoMIR(op MirOperation, stack *ValueStack) *
 		// leave operands empty for any not explicitly handled
 	}
 
-	stack.push(mir.Result())
+	// Only push result for producer operations; copy operations are void (no stack output)
+	switch op {
+	case MirCALLDATACOPY, MirCODECOPY, MirEXTCODECOPY, MirRETURNDATACOPY, MirDATACOPY:
+		// Void operations - do not push any result
+	default:
+		stack.push(mir.Result())
+	}
 	mir = b.appendMIR(mir)
 	mir.genStackDepth = stack.size()
 	// noisy generation logging removed

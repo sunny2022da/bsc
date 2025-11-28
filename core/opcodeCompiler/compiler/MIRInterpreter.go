@@ -3,6 +3,7 @@ package compiler
 import (
 	"errors"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/ethereum/go-ethereum/crypto"
@@ -1984,6 +1985,9 @@ func mirHandleJUMPI(it *MIRInterpreter, m *MIR) error {
 
 // mirHandlePHI sets the result to the first available incoming value.
 func mirHandlePHI(it *MIRInterpreter, m *MIR) error {
+	// DEBUG: Track PHI resolution for Block 38
+	debugPhi := false // Disabled for now
+
 	// If we can, take the exact value from the immediate predecessor's exit stack
 	if it.prevBB != nil {
 		exit := it.prevBB.ExitStack()
@@ -1997,6 +2001,22 @@ func mirHandlePHI(it *MIRInterpreter, m *MIR) error {
 
 				val := it.evalValue(&src)
 
+				if debugPhi {
+					srcDefPC := uint(0)
+					srcDefIdx := 0
+					srcDefOp := "nil"
+					if src.def != nil {
+						srcDefPC = src.def.evmPC
+						srcDefIdx = src.def.idx
+						srcDefOp = src.def.op.String()
+					}
+					// Only log phiStackIdx 1 and 2 for brevity
+					if m.phiStackIndex == 1 || m.phiStackIndex == 2 {
+						fmt.Fprintf(os.Stderr, "[PHI_RT] PC=%d idx=%d phiStackIdx=%d prevBB=%d exitLen=%d srcDef(PC=%d,idx=%d,op=%s) val=%s\n",
+							m.evmPC, m.idx, m.phiStackIndex, it.prevBB.blockNum, len(exit), srcDefPC, srcDefIdx, srcDefOp, val.Hex())
+					}
+				}
+
 				it.setResult(m, val)
 				// Record PHI result with predecessor sensitivity for future uses
 				if m != nil {
@@ -2006,19 +2026,44 @@ func mirHandlePHI(it *MIRInterpreter, m *MIR) error {
 					if val != nil {
 						it.phiResults[m][it.prevBB] = new(uint256.Int).Set(val)
 						it.phiLastPred[m] = it.prevBB
-						// Signature caches
+						// Signature caches - use BOTH idx and phiStackIndex as keys for lookup flexibility
 						if m.evmPC != 0 {
 							if it.phiResultsBySig[uint64(m.evmPC)] == nil {
 								it.phiResultsBySig[uint64(m.evmPC)] = make(map[int]map[*MIRBasicBlock]*uint256.Int)
 							}
+							// Store with idx key
 							if it.phiResultsBySig[uint64(m.evmPC)][m.idx] == nil {
 								it.phiResultsBySig[uint64(m.evmPC)][m.idx] = make(map[*MIRBasicBlock]*uint256.Int)
 							}
 							it.phiResultsBySig[uint64(m.evmPC)][m.idx][it.prevBB] = new(uint256.Int).Set(val)
+
+							// STABLE KEY FIX: Also store with phiStackIndex as a stable key (negative to distinguish)
+							if m.phiStackIndex >= 0 {
+								stableKey := -(m.phiStackIndex + 1) // -1 for stackIdx 0, -2 for stackIdx 1, etc.
+								if it.phiResultsBySig[uint64(m.evmPC)][stableKey] == nil {
+									it.phiResultsBySig[uint64(m.evmPC)][stableKey] = make(map[*MIRBasicBlock]*uint256.Int)
+								}
+								it.phiResultsBySig[uint64(m.evmPC)][stableKey][it.prevBB] = new(uint256.Int).Set(val)
+							}
+
 							if it.phiLastPredBySig[uint64(m.evmPC)] == nil {
 								it.phiLastPredBySig[uint64(m.evmPC)] = make(map[int]*MIRBasicBlock)
 							}
 							it.phiLastPredBySig[uint64(m.evmPC)][m.idx] = it.prevBB
+							if m.phiStackIndex >= 0 {
+								stableKey := -(m.phiStackIndex + 1)
+								it.phiLastPredBySig[uint64(m.evmPC)][stableKey] = it.prevBB
+							}
+						}
+
+						// CRITICAL: Also publish to globalResultsBySig with stable key
+						// This ensures evalValue can find PHI values using phiStackIndex
+						if m.evmPC != 0 && m.phiStackIndex >= 0 {
+							stableKey := -(m.phiStackIndex + 1)
+							if it.globalResultsBySig[uint64(m.evmPC)] == nil {
+								it.globalResultsBySig[uint64(m.evmPC)] = make(map[int]*uint256.Int)
+							}
+							it.globalResultsBySig[uint64(m.evmPC)][stableKey] = new(uint256.Int).Set(val)
 						}
 					}
 				}
@@ -2242,7 +2287,6 @@ func mirHandleLT(it *MIRInterpreter, m *MIR) error {
 }
 func mirHandleGT(it *MIRInterpreter, m *MIR) error {
 	a, b, err := mirLoadAB(it, m)
-	//log.Warn("MIR GT", "a", a, "> b", b)
 	if err != nil {
 		return err
 	}
@@ -2684,6 +2728,33 @@ func (it *MIRInterpreter) evalValue(v *Value) *uint256.Int {
 			}
 			// For PHI definitions (non-live-in), prefer predecessor-sensitive cache
 			if v.def.op == MirPHI {
+				// STABLE KEY FIX: Try phiStackIndex-based lookup first (most stable across CFG rebuilds)
+				if v.def.evmPC != 0 && v.def.phiStackIndex >= 0 {
+					stableKey := -(v.def.phiStackIndex + 1)
+					if byPC := it.globalResultsBySig[uint64(v.def.evmPC)]; byPC != nil {
+						if val, ok := byPC[stableKey]; ok && val != nil {
+							return val
+						}
+					}
+					// Also try phiResultsBySig with stable key
+					if m := it.phiResultsBySig[uint64(v.def.evmPC)]; m != nil {
+						if preds := m[stableKey]; preds != nil {
+							if it.prevBB != nil {
+								if val := preds[it.prevBB]; val != nil {
+									return val
+								}
+							}
+							if lastm := it.phiLastPredBySig[uint64(v.def.evmPC)]; lastm != nil {
+								if last := lastm[stableKey]; last != nil {
+									if val := preds[last]; val != nil {
+										return val
+									}
+								}
+							}
+						}
+					}
+				}
+
 				// Use last known predecessor for this PHI if available, else immediate prevBB
 				if it.phiResults != nil {
 					// Prefer exact predecessor mapping
