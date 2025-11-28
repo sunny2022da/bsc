@@ -2,8 +2,9 @@ package compiler
 
 import (
 	"fmt"
-	"github.com/holiman/uint256"
 	"os"
+
+	"github.com/holiman/uint256"
 
 	"github.com/ethereum/go-ethereum/common"
 )

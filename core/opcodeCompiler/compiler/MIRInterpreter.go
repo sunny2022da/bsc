@@ -302,6 +302,7 @@ func (it *MIRInterpreter) RunMIR(block *MIRBasicBlock) ([]byte, error) {
 	// Track current block for PHI resolution
 	it.currentBB = block
 	// Pre-size and pre-initialize results slots for this block to avoid per-op allocations on first writes
+	// CRITICAL: Clear old values to prevent stale results from previous blocks interfering
 	if n := len(block.instructions); n > 0 {
 		if n > len(it.results) {
 			grown := make([]*uint256.Int, n)
@@ -314,6 +315,8 @@ func (it *MIRInterpreter) RunMIR(block *MIRBasicBlock) ([]byte, error) {
 		for i := 0; i < n; i++ {
 			if it.results[i] == nil {
 				it.results[i] = new(uint256.Int)
+			} else {
+				it.results[i].Clear() // Clear stale value from previous block
 			}
 		}
 	}
@@ -475,6 +478,9 @@ func (it *MIRInterpreter) publishLiveOut(block *MIRBasicBlock) {
 func (it *MIRInterpreter) RunCFGWithResolver(cfg *CFG, entry *MIRBasicBlock) ([]byte, error) {
 	// Record the active CFG for possible runtime backfill of dynamic targets
 	it.cfg = cfg
+	// Reset execution state for clean PHI resolution
+	it.prevBB = nil
+	it.currentBB = nil
 	// Reset global caches at the start of each execution to avoid stale values
 	// This ensures values from previous executions or different paths don't pollute the current run
 	if it.globalResultsBySig != nil {
@@ -496,6 +502,16 @@ func (it *MIRInterpreter) RunCFGWithResolver(cfg *CFG, entry *MIRBasicBlock) ([]
 	if it.phiResultsBySig != nil {
 		for k := range it.phiResultsBySig {
 			delete(it.phiResultsBySig, k)
+		}
+	}
+	if it.phiLastPred != nil {
+		for k := range it.phiLastPred {
+			delete(it.phiLastPred, k)
+		}
+	}
+	if it.phiLastPredBySig != nil {
+		for k := range it.phiLastPredBySig {
+			delete(it.phiLastPredBySig, k)
 		}
 	}
 	if it.env != nil && it.env.ResolveBB == nil && cfg != nil {
@@ -2627,7 +2643,46 @@ func (it *MIRInterpreter) evalValue(v *Value) *uint256.Int {
 	case Variable, Arguments:
 		// If this value is marked as live-in from a parent, prefer global cross-BB map first
 		if v.def != nil {
-			// For PHI definitions, prefer predecessor-sensitive cache
+			// CRITICAL FIX: For live-in values, ALWAYS check global caches FIRST
+			// This prevents stale values from it.results polluting PHI resolution
+			if v.liveIn {
+				// Try signature-based cache first (evmPC, idx) - most reliable
+				if v.def.evmPC != 0 {
+					if byPC := it.globalResultsBySig[uint64(v.def.evmPC)]; byPC != nil {
+						if val, ok := byPC[v.def.idx]; ok && val != nil {
+							return val
+						}
+					}
+				}
+				// Fallback to pointer-based cache
+				if it.globalResults != nil {
+					if r, ok := it.globalResults[v.def]; ok && r != nil {
+						return r
+					}
+				}
+				// For live-in PHI values, also check phiResults
+				if v.def.op == MirPHI {
+					if it.phiResults != nil {
+						if preds, ok := it.phiResults[v.def]; ok {
+							if it.prevBB != nil {
+								if val, ok2 := preds[it.prevBB]; ok2 && val != nil {
+									return val
+								}
+							}
+							if last := it.phiLastPred[v.def]; last != nil {
+								if val, ok2 := preds[last]; ok2 && val != nil {
+									return val
+								}
+							}
+						}
+					}
+				}
+				// Live-in value not found - return zero
+				mirDebugWarn("MIR evalValue: live-in value not found",
+					"evmPC", v.def.evmPC, "idx", v.def.idx, "liveIn", v.liveIn)
+				return it.zeroConst
+			}
+			// For PHI definitions (non-live-in), prefer predecessor-sensitive cache
 			if v.def.op == MirPHI {
 				// Use last known predecessor for this PHI if available, else immediate prevBB
 				if it.phiResults != nil {
@@ -2666,8 +2721,7 @@ func (it *MIRInterpreter) evalValue(v *Value) *uint256.Int {
 					}
 				}
 			}
-			// First try local per-block result (most recent, most accurate)
-			// But only if the instruction is actually in the current block
+			// For non-live-in values, try local per-block result
 			// Check if current block contains this instruction
 			defInCurrentBlock := false
 			if it.currentBB != nil && v.def != nil {
@@ -2683,8 +2737,8 @@ func (it *MIRInterpreter) evalValue(v *Value) *uint256.Int {
 					return r
 				}
 			}
-			// Then try global cache for live-in values (only if not found locally)
-			if v.liveIn {
+			// Finally, try global cache for non-live-in values
+			if !v.liveIn {
 				// PURE APPROACH 1: Always use signature-based cache (evmPC, idx)
 				// This is simpler, more maintainable, and absolutely correct for loops
 				if v.def.evmPC != 0 {

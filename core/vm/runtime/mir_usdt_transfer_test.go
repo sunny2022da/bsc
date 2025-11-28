@@ -182,7 +182,7 @@ func TestMIRUSDTTransfer(t *testing.T) {
 		EnableOpcodeOptimizations: true,
 		EnableMIR:                 true,
 		EnableMIRInitcode:         useMIRForConstructor,
-		MIRStrictNoFallback:       useMIRForConstructor,
+		MIRStrictNoFallback:       true, // STRICT: No fallback allowed
 	}
 
 	if useMIRForConstructor {
