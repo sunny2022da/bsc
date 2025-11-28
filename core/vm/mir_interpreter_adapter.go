@@ -1778,8 +1778,8 @@ func (adapter *MIRInterpreterAdapter) setupExecutionEnvironment(contract *Contra
 
 	// Set call value for CALLVALUE op
 	if contract != nil && contract.Value() != nil {
-		// MIR will clone when reading
-		env.CallValue = contract.Value()
+		// MIR will clone when reading, but we also clone here to insulate from Contract mutation
+		env.CallValue = new(uint256.Int).Set(contract.Value())
 	} else {
 		env.CallValue = uint256.NewInt(0)
 	}

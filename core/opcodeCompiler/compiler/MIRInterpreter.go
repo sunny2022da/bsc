@@ -422,9 +422,6 @@ func (it *MIRInterpreter) publishLiveOut(block *MIRBasicBlock) {
 		return
 	}
 
-	// DEBUG
-	fmt.Printf("DEBUG: publishLiveOut called for bb=%d ptr=%p exitStackLen=%d\n", block.blockNum, block, len(block.ExitStack()))
-
 	defs := block.LiveOutDefs()
 
 	//log.Warn("MIR publishLiveOut", "block", block.blockNum, "size", len(block.instructions), "defs", defs, "it.results", it.results, "block.exitStack", block.ExitStack())
@@ -445,10 +442,6 @@ func (it *MIRInterpreter) publishLiveOut(block *MIRBasicBlock) {
 		// Remove !inBlock check to ensure we publish ALL exit stack values,
 		// even if defined in the current block, as they are needed by successors.
 		if v != nil && v.kind == Variable && v.def != nil {
-			if v.def.evmPC == 330 {
-				val := it.evalValue(v)
-				fmt.Printf("DEBUG: publishLiveOut bb=%d saving def@%d (pc=330) val=%x\n", block.blockNum, v.def.idx, val)
-			}
 			// Check signature-based cache
 			var hasInSigCache bool
 			if v.def.evmPC != 0 {
@@ -530,18 +523,9 @@ func (it *MIRInterpreter) RunCFGWithResolver(cfg *CFG, entry *MIRBasicBlock) ([]
 				mirDebugWarn("MIR RunCFGWithResolver: cfg or pcToBlock is nil", "pc", pc)
 				return nil
 			}
-			if pc == 1359 {
-				fmt.Printf("==ResolveBB== resolving pc=1359\n")
-			}
 			if bb, ok := cfg.pcToBlock[uint(pc)]; ok {
-				if pc == 1359 {
-					fmt.Printf("==ResolveBB== found bb=%d firstPC=%d\n", bb.blockNum, bb.firstPC)
-				}
 				mirDebugWarn("MIR RunCFGWithResolver: found bb", "pc", pc, "bb", bb.blockNum)
 				return bb
-			}
-			if pc == 1359 {
-				fmt.Printf("==ResolveBB== NOT found bb for 1359\n")
 			}
 			mirDebugWarn("MIR RunCFGWithResolver: not found bb", "pc", pc)
 			return nil
@@ -588,39 +572,6 @@ func (it *MIRInterpreter) RunCFGWithResolver(cfg *CFG, entry *MIRBasicBlock) ([]
 			// Call hook for block entry gas charging
 			if err := it.beforeOp(ctx); err != nil {
 				return nil, err
-			}
-		}
-		if bb.blockNum == 143 || bb.blockNum == 155 {
-			fmt.Printf("DEBUG: RunMIR entering bb=%d. prevBB=%p\n", bb.blockNum, it.prevBB)
-			if it.prevBB != nil {
-				fmt.Printf("DEBUG: prevBB num=%d firstPC=%d\n", it.prevBB.BlockNum(), it.prevBB.FirstPC())
-			}
-			fmt.Printf("DEBUG: bb=%d parents len=%d\n", bb.blockNum, len(bb.Parents()))
-			for i, p := range bb.Parents() {
-				fmt.Printf("DEBUG: parent[%d] ptr=%p num=%d firstPC=%d\n", i, p, p.BlockNum(), p.FirstPC())
-			}
-			for i, instr := range bb.Instructions() {
-				ops := ""
-				if instr.op == MirPHI {
-					ops = fmt.Sprintf("phiIdx=%d operands=%d", instr.phiStackIndex, len(instr.operands))
-					for j, op := range instr.operands {
-						if op != nil {
-							ops += fmt.Sprintf(" op[%d]=%s", j, op.DebugString())
-						} else {
-							ops += fmt.Sprintf(" op[%d]=nil", j)
-						}
-					}
-				} else if instr.op == MirJUMP {
-					ops = fmt.Sprintf("operands=%d", len(instr.operands))
-					for j, op := range instr.operands {
-						if op != nil {
-							ops += fmt.Sprintf(" op[%d]=%s", j, op.DebugString())
-						} else {
-							ops += fmt.Sprintf(" op[%d]=nil", j)
-						}
-					}
-				}
-				fmt.Printf("DEBUG: bb=%d instr[%d] op=%s %s\n", bb.blockNum, i, instr.Op().String(), ops)
 			}
 		}
 		_, err := it.RunMIR(bb)
@@ -744,11 +695,6 @@ func (it *MIRInterpreter) RunCFGWithResolver(cfg *CFG, entry *MIRBasicBlock) ([]
 		}
 		switch err {
 		case errJUMP:
-			if it.nextBB != nil {
-				fmt.Printf("DEBUG: JUMP landed at bb=%d firstPC=%d\n", it.nextBB.blockNum, it.nextBB.firstPC)
-			} else {
-				fmt.Printf("DEBUG: JUMP landed at nil bb\n")
-			}
 			bb = it.nextBB
 			continue
 		case errSTOP:
@@ -957,9 +903,6 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 				off := ctx.Operands[0].Uint64()
 				ln := ctx.Operands[1].Uint64()
 				ctx.MemorySize = off + ln
-				fmt.Printf("DEBUG: MirREVERT memory calc: off=%d ln=%d newSize=%d\n", off, ln, ctx.MemorySize)
-			} else {
-				fmt.Printf("DEBUG: MirREVERT memory calc skipped: len(operands)=%d\n", len(ctx.Operands))
 			}
 		case MirLOG0, MirLOG1, MirLOG2, MirLOG3, MirLOG4:
 			if len(ctx.Operands) >= 2 {
@@ -1200,9 +1143,12 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 		off := it.evalValue(m.operands[0])
 		val := it.evalValue(m.operands[2])
 		if off.Uint64() == 0x40 {
-			fmt.Printf("DEBUG: MIR MSTORE(0x40) = %x\n", val.Bytes())
+			fmt.Printf("DEBUG: MIR MSTORE(0x40) = %x evmPC=%d env=%p env.CallValue=%p val=%v\n", val.Bytes(), m.evmPC, it.env, it.env.CallValue, it.env.CallValue)
 		}
 		it.writeMem32(off, val)
+		if off.Uint64() == 0x40 {
+			fmt.Printf("DEBUG: MSTORE post-write env.CallValue=%v\n", it.env.CallValue)
+		}
 		return nil
 	case MirMSTORE8:
 		if len(m.operands) < 3 {
@@ -1700,9 +1646,11 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 		copy(a20[:], addrV[12:])
 		var value, inOff, inSz, outOff, outSz *uint256.Int
 		if it.preOpOps[2] != nil {
-			value = it.preOpOps[2]
+			// Clone value to prevent shared pointer escape to Contract (it.preOpVals are reused)
+			value = new(uint256.Int).Set(it.preOpOps[2])
 		} else {
-			value = it.evalValue(m.operands[2])
+			// Clone evaluated value as it might be a reuseable temp or result that could be modified later
+			value = new(uint256.Int).Set(it.evalValue(m.operands[2]))
 		}
 		if it.preOpOps[3] != nil {
 			inOff = it.preOpOps[3]
@@ -1759,9 +1707,11 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 		copy(a20[:], addrV[12:])
 		var value, inOff, inSz, outOff, outSz *uint256.Int
 		if it.preOpOps[2] != nil {
-			value = it.preOpOps[2]
+			// Clone value to prevent shared pointer escape to Contract (it.preOpVals are reused)
+			value = new(uint256.Int).Set(it.preOpOps[2])
 		} else {
-			value = it.evalValue(m.operands[2])
+			// Clone evaluated value as it might be a reuseable temp or result that could be modified later
+			value = new(uint256.Int).Set(it.evalValue(m.operands[2]))
 		}
 		if it.preOpOps[3] != nil {
 			inOff = it.preOpOps[3]
@@ -1912,9 +1862,12 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 		if len(m.operands) < 3 {
 			return fmt.Errorf("CREATE missing operands")
 		}
-		value := it.preOpOps[0]
-		if value == nil {
-			value = it.evalValue(m.operands[0])
+		var value *uint256.Int
+		if it.preOpOps[0] != nil {
+			// Clone to avoid shared pointer escape
+			value = new(uint256.Int).Set(it.preOpOps[0])
+		} else {
+			value = new(uint256.Int).Set(it.evalValue(m.operands[0]))
 		}
 		off := it.preOpOps[1]
 		if off == nil {
@@ -1989,9 +1942,12 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 		if len(m.operands) < 4 {
 			return fmt.Errorf("CREATE2 missing operands")
 		}
-		value := it.preOpOps[0]
-		if value == nil {
-			value = it.evalValue(m.operands[0])
+		var value *uint256.Int
+		if it.preOpOps[0] != nil {
+			// Clone to avoid shared pointer escape
+			value = new(uint256.Int).Set(it.preOpOps[0])
+		} else {
+			value = new(uint256.Int).Set(it.evalValue(m.operands[0]))
 		}
 		off := it.preOpOps[1]
 		if off == nil {
@@ -2114,11 +2070,6 @@ func mirHandleJUMPI(it *MIRInterpreter, m *MIR) error {
 		return fmt.Errorf("JUMPI missing operands")
 	}
 	cond := it.evalValue(m.operands[1])
-
-	if m.evmPC == 440 || m.evmPC == 447 || m.evmPC == 374 {
-		target := it.evalValue(m.operands[0])
-		fmt.Printf("DEBUG: JUMPI at %d cond=%s target=%s\n", m.evmPC, cond.Hex(), target.Hex())
-	}
 
 	if cond.IsZero() {
 		// fallthrough: use children[1] which is the fallthrough block for JUMPI
@@ -2265,7 +2216,6 @@ func mirHandlePHI(it *MIRInterpreter, m *MIR) error {
 }
 
 func mirHandleMLOAD(it *MIRInterpreter, m *MIR) error {
-	fmt.Println("DEBUG: mirHandleMLOAD called")
 	if len(m.operands) < 2 {
 		return fmt.Errorf("MLOAD missing operands")
 	}
@@ -2421,11 +2371,7 @@ func mirHandleEQ(it *MIRInterpreter, m *MIR) error {
 	return nil
 }
 func mirHandleLT(it *MIRInterpreter, m *MIR) error {
-	fmt.Printf("DEBUG: mirHandleLT called at PC %d\n", m.evmPC)
 	a, b, err := mirLoadAB(it, m)
-	if m.evmPC == 369 {
-		fmt.Printf("DEBUG: LT at 369: %s < %s\n", a.Hex(), b.Hex())
-	}
 	mirDebugWarn("MIR LT", "a", a.Hex(), "b", b.Hex())
 	if err != nil {
 		return err
@@ -2497,9 +2443,6 @@ func mirHandleMSTORE(it *MIRInterpreter, m *MIR) error {
 		val = it.preOpOps[2]
 	} else {
 		val = it.evalValue(m.operands[2])
-	}
-	if off.Uint64() == 0x40 {
-		fmt.Printf("DEBUG: mirHandleMSTORE(0x40) = %x\n", val.Bytes())
 	}
 	it.writeMem32(off, val)
 	return nil
