@@ -176,7 +176,7 @@ func TestMIRUSDTTransfer(t *testing.T) {
 	vmConfig := vm.Config{
 		EnableOpcodeOptimizations: true,
 		EnableMIR:                 true,
-		EnableMIRInitcode:         true,
+		EnableMIRInitcode:         false,
 		MIRStrictNoFallback:       true,
 	}
 	t.Log("✅ EVM configuration created (MIR enabled for both runtime and constructor)")

@@ -49,6 +49,7 @@ func (c *CFG) analyzeStackHeights() (map[*MIRBasicBlock]int, error) {
 
 		// Determine successors
 		succs := c.getSuccessors(curr, lastOp, stopPC)
+
 		for _, succ := range succs {
 			oldH, seen := heights[succ]
 			if !seen {

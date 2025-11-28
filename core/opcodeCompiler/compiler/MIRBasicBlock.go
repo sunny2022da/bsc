@@ -1,6 +1,8 @@
 package compiler
 
 import (
+	"fmt"
+
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/holiman/uint256"
 )
@@ -68,6 +70,10 @@ type MIRBasicBlock struct {
 
 func (b *MIRBasicBlock) Size() uint {
 	return uint(len(b.instructions))
+}
+
+func (b *MIRBasicBlock) BlockNum() uint {
+	return b.blockNum
 }
 
 // Instructions returns the MIR instructions within this basic block
@@ -235,6 +241,10 @@ func (b *MIRBasicBlock) CreateBinOpMIR(op MirOperation, stack *ValueStack) (mir 
 	opnd2 := stack.pop()
 	mir = newBinaryOpMIR(op, &opnd1, &opnd2, stack)
 
+	if b.blockNum == 144 {
+		parserDebugWarn("DEBUG: CreateBinOpMIR bb=144", "op", op.String(), "left", opnd1.DebugString(), "right", opnd2.DebugString())
+	}
+
 	// Only push result if the operation wasn't optimized away (MirNOP)
 	if mir.op != MirNOP {
 		stack.push(mir.Result())
@@ -401,6 +411,7 @@ func (b *MIRBasicBlock) CreateStackOpMIR(op MirOperation, stack *ValueStack) *MI
 		if stack.size() < n {
 			parserDebugWarn("MIR DUP depth underflow - emitting NOP", "need", n, "have", stack.size(), "bb", b.blockNum, "bbFirst", b.firstPC)
 		}
+		// parserDebugWarn("MIR DUP", "n", n, "stackSize", stack.size(), "bb", b.blockNum)
 		return b.CreateDupMIR(n, stack)
 	}
 
@@ -410,6 +421,8 @@ func (b *MIRBasicBlock) CreateStackOpMIR(op MirOperation, stack *ValueStack) *MI
 		// Diagnostics: stack size before SWAP
 		if stack.size() <= n {
 			parserDebugWarn("MIR SWAP depth underflow - emitting NOP", "need", n+1, "have", stack.size(), "bb", b.blockNum, "bbFirst", b.firstPC)
+		} else {
+			// parserDebugWarn("MIR SWAP", "n", n, "stackSize", stack.size(), "bb", b.blockNum)
 		}
 		return b.CreateSwapMIR(n, stack)
 	}
@@ -428,6 +441,10 @@ func (b *MIRBasicBlock) CreateDupMIR(n int, stack *ValueStack) *MIR {
 	// Stack before: [..., item_n, ..., item_2, item_1]
 	// Stack after:  [..., item_n, ..., item_2, item_1, item_n]
 
+	if b.blockNum == 144 {
+		parserDebugWarn("DEBUG: CreateDupMIR bb=144", "n", n, "stackSize", stack.size())
+	}
+
 	if stack.size() < n {
 		// Depth underflow: no-op emission
 		return nil
@@ -441,6 +458,9 @@ func (b *MIRBasicBlock) CreateDupMIR(n int, stack *ValueStack) *MIR {
 		// If the value to duplicate is a constant, duplicate by pushing same constant
 		optimizedValue := newValue(Konst, nil, nil, dupValue.payload)
 		stack.push(optimizedValue)
+		if b.blockNum == 144 {
+			parserDebugWarn("DEBUG: CreateDupMIR bb=144 pushed const", "val", optimizedValue.DebugString())
+		}
 		// No runtime MIR for DUP; gas handled via per-block opcode counts
 		return nil
 	}
@@ -448,6 +468,10 @@ func (b *MIRBasicBlock) CreateDupMIR(n int, stack *ValueStack) *MIR {
 	// For non-constant values, perform the actual duplication on the stack
 	duplicatedValue := *dupValue // Copy the value
 	stack.push(&duplicatedValue)
+
+	if b.blockNum == 144 {
+		parserDebugWarn("DEBUG: CreateDupMIR bb=144 pushed var", "val", duplicatedValue.DebugString())
+	}
 
 	// No runtime MIR for DUP; gas handled via per-block opcode counts
 	return nil
@@ -457,6 +481,10 @@ func (b *MIRBasicBlock) CreateSwapMIR(n int, stack *ValueStack) *MIR {
 	// SWAPn swaps the top stack item with the nth stack item (1-indexed)
 	// Stack before: [..., item_n+1, item_n, ..., item_2, item_1]
 	// Stack after:  [..., item_n+1, item_1, ..., item_2, item_n]
+
+	if b.blockNum == 144 {
+		parserDebugWarn("DEBUG: CreateSwapMIR bb=144", "n", n, "stackSize", stack.size())
+	}
 
 	if stack.size() <= n {
 		// Depth underflow: no-op emission
@@ -479,6 +507,11 @@ func (b *MIRBasicBlock) CreateSwapMIR(n int, stack *ValueStack) *MIR {
 
 	// For non-constant values, perform the actual swap on the stack
 	stack.swap(0, n)
+	if b.blockNum == 144 {
+		v0 := stack.peek(0)
+		vn := stack.peek(n)
+		parserDebugWarn("DEBUG: CreateSwapMIR bb=144 done", "top", v0.DebugString(), "nth", vn.DebugString())
+	}
 	// Diagnostics: after swap snapshot removed
 	// No runtime MIR for SWAP; gas handled via per-block opcode counts
 	return nil
@@ -500,6 +533,23 @@ func (b *MIRBasicBlock) AddIncomingStack(parent *MIRBasicBlock, values []Value) 
 	if parent == nil || values == nil {
 		return
 	}
+
+	// Check for stack height mismatch if we already have incoming stacks
+	if len(b.incomingStacks) > 0 {
+		for _, s := range b.incomingStacks {
+			if len(s) != len(values) {
+				fmt.Printf("STACK MISMATCH WARNING: bb=%d existing_len=%d new_parent=%d new_len=%d\n", b.blockNum, len(s), parent.blockNum, len(values))
+			}
+			break // Check against one is enough
+		}
+	}
+	// Check against EntryStack if set
+	if b.entryStack != nil {
+		if len(b.entryStack) != len(values) {
+			fmt.Printf("STACK MISMATCH ENTRY WARNING: bb=%d entry_len=%d new_parent=%d new_len=%d\n", b.blockNum, len(b.entryStack), parent.blockNum, len(values))
+		}
+	}
+
 	// Copy to decouple from caller mutations
 	copied := make([]Value, len(values))
 	copy(copied, values)
@@ -559,6 +609,10 @@ func (b *MIRBasicBlock) LiveOutDefs() []*MIR { return b.liveOutDefs }
 func (b *MIRBasicBlock) CreateMemoryOpMIR(op MirOperation, stack *ValueStack, accessor *MemoryAccessor) *MIR {
 	mir := new(MIR)
 	mir.op = op
+
+	if b.blockNum == 144 {
+		parserDebugWarn("DEBUG: CreateMemoryOpMIR bb=144", "op", op.String(), "stackSize", stack.size())
+	}
 
 	// Common sizes
 	size32 := newValue(Konst, nil, nil, []byte{0x20})
@@ -777,7 +831,13 @@ func (b *MIRBasicBlock) CreateBlockInfoMIR(op MirOperation, stack *ValueStack) *
 		// leave operands empty for any not explicitly handled
 	}
 
-	stack.push(mir.Result())
+	// Only push result for producer ops; copy ops do not produce a stack item
+	switch op {
+	case MirCALLDATACOPY, MirCODECOPY, MirEXTCODECOPY, MirRETURNDATACOPY, MirDATACOPY, MirDATALOADN:
+		// no push
+	default:
+		stack.push(mir.Result())
+	}
 	mir = b.appendMIR(mir)
 	mir.genStackDepth = stack.size()
 	// noisy generation logging removed
