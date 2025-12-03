@@ -1017,9 +1017,7 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 	}
 	switch m.op {
 	case MirPHI:
-		if it.currentBB != nil && it.currentBB.blockNum == 143 {
-			fmt.Printf("DEBUG: Exec MirPHI bb=143 phi=%d prevBB=%p operands=%d\n", m.phiStackIndex, it.prevBB, len(m.operands))
-		}
+
 		// Select operand based on actual predecessor block when available; fallback to first.
 		if len(m.operands) == 0 {
 			it.setResult(m, it.zeroConst)
@@ -1028,17 +1026,13 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 		selected := 0
 		if it.currentBB != nil && it.prevBB != nil {
 			parents := it.currentBB.Parents()
-			found := false
 			for i := 0; i < len(parents) && i < len(m.operands); i++ {
 				if parents[i] == it.prevBB {
 					selected = i
-					found = true
 					break
 				}
 			}
-			if it.currentBB.blockNum == 143 {
-				fmt.Printf("DEBUG: MirPHI bb=143 phi=%d prevBB=%p parentsLen=%d found=%v selected=%d\n", m.phiStackIndex, it.prevBB, len(parents), found, selected)
-			}
+
 		}
 		v := it.evalValue(m.operands[selected])
 		it.setResult(m, v)
@@ -1126,9 +1120,7 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 			return nil
 		}
 		it.readMem32Into(off, &it.scratch32)
-		if off.Uint64() == 0x40 {
-			fmt.Printf("DEBUG: MIR MLOAD(0x40) = %x\n", it.scratch32)
-		}
+
 		it.setResult(m, it.tmpA.Clear().SetBytes(it.scratch32[:]))
 		return nil
 	case MirMSIZE:
@@ -1142,13 +1134,9 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 		}
 		off := it.evalValue(m.operands[0])
 		val := it.evalValue(m.operands[2])
-		if off.Uint64() == 0x40 {
-			fmt.Printf("DEBUG: MIR MSTORE(0x40) = %x evmPC=%d env=%p env.CallValue=%p val=%v\n", val.Bytes(), m.evmPC, it.env, it.env.CallValue, it.env.CallValue)
-		}
+
 		it.writeMem32(off, val)
-		if off.Uint64() == 0x40 {
-			fmt.Printf("DEBUG: MSTORE post-write env.CallValue=%v\n", it.env.CallValue)
-		}
+
 		return nil
 	case MirMSTORE8:
 		if len(m.operands) < 3 {
@@ -2110,15 +2098,11 @@ func mirHandleJUMPI(it *MIRInterpreter, m *MIR) error {
 
 // mirHandlePHI sets the result to the first available incoming value.
 func mirHandlePHI(it *MIRInterpreter, m *MIR) error {
-	if it.currentBB != nil && it.currentBB.blockNum == 143 {
-		fmt.Printf("DEBUG: mirHandlePHI bb=143 phi=%d prevBB=%p\n", m.phiStackIndex, it.prevBB)
-	}
+
 	// If we can, take the exact value from the immediate predecessor's exit stack
 	if it.prevBB != nil {
 		exit := it.prevBB.ExitStack()
-		if it.currentBB != nil && it.currentBB.blockNum == 143 {
-			fmt.Printf("DEBUG: mirHandlePHI bb=143 phi=%d prevBB=%d exitStackLen=%d\n", m.phiStackIndex, it.prevBB.BlockNum(), len(exit))
-		}
+
 		if exit != nil && m.phiStackIndex >= 0 {
 			idxFromTop := m.phiStackIndex
 			if idxFromTop < len(exit) {
@@ -2128,9 +2112,6 @@ func mirHandlePHI(it *MIRInterpreter, m *MIR) error {
 				src.liveIn = true
 
 				val := it.evalValue(&src)
-				if it.currentBB != nil && it.currentBB.blockNum == 143 {
-					fmt.Printf("DEBUG: mirHandlePHI bb=143 phi=%d resolved from exitStack val=%s\n", m.phiStackIndex, val.Hex())
-				}
 
 				it.setResult(m, val)
 				// Record PHI result with predecessor sensitivity for future uses
@@ -3007,7 +2988,7 @@ func (it *MIRInterpreter) readMem32Into(off *uint256.Int, dst *[32]byte) {
 	it.ensureMemSize(off.Uint64() + 32)
 	copy(dst[:], it.memory[off.Uint64():off.Uint64()+32])
 	if it.tracerEx != nil || it.tracer != nil {
-		// fmt.Printf("DEBUG: readMem32Into off=%d val=%x\n", off.Uint64(), dst)
+		//
 	}
 }
 

@@ -3,7 +3,6 @@ package runtime_test
 import (
 	"encoding/hex"
 	"math/big"
-	"os"
 	"sort"
 	"testing"
 
@@ -320,9 +319,6 @@ func TestMIRParity_Tiny(t *testing.T) {
 
 // TestMIRGasTrace_USDT_Decimals collects per-op gas traces for EVM and MIR for the USDT decimals selector
 func TestMIRGasTrace_USDT_Decimals(t *testing.T) {
-	if os.Getenv("MIR_PARITY_REAL") != "1" {
-		t.Skip("Skipping real-contract gas trace (set MIR_PARITY_REAL=1 to enable)")
-	}
 	// Decode USDT bytecode
 	code, err := hex.DecodeString(usdtHex[2:])
 	if err != nil {

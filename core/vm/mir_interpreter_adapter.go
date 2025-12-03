@@ -484,10 +484,7 @@ func NewMIRInterpreterAdapter(evm *EVM) *MIRInterpreterAdapter {
 			if ctx.MemorySize > 0 {
 				gas, err := memoryGasCost(adapter.memShadow, ctx.MemorySize)
 				if err != nil {
-					if errors.Is(err, ErrGasUintOverflow) {
-					} else {
-						return err
-					}
+					return err
 				}
 				n := int(evmOp - LOG0)
 				add := gas + uint64(n)*params.LogTopicGas
@@ -532,10 +529,7 @@ func NewMIRInterpreterAdapter(evm *EVM) *MIRInterpreterAdapter {
 				st.push(ctx.Operands[0])
 				gas, err := gasSStore(adapter.evm, contract, st, adapter.memShadow, 0)
 				if err != nil {
-					if errors.Is(err, ErrGasUintOverflow) {
-					} else {
-						return err
-					}
+					return err
 				}
 				if contract.Gas < gas {
 					return ErrOutOfGas
@@ -1116,7 +1110,7 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 		//              opsStr += fmt.Sprintf("%x ", op.Bytes())
 		//          }
 		//      }
-		//      fmt.Printf("DEBUG: innerHook pc=%d op=%v isBlockEntry=%v memSize=%d shadow=%d gas=%d ops=%s\n", ctx.M.EvmPC(), evmOp, ctx.IsBlockEntry, ctx.MemorySize, adapter.memShadow.Len(), contract.Gas, opsStr)
+		//
 		// }
 
 		if isEXP {
@@ -1490,10 +1484,7 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 			if memSize > uint64(adapter.memShadow.Len()) {
 				g, err := memoryGasCost(adapter.memShadow, memSize)
 				if err != nil {
-					if errors.Is(err, ErrGasUintOverflow) {
-					} else {
-						return err
-					}
+					return err
 				}
 				gas = g
 			}
@@ -1552,10 +1543,7 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 					gas, err = gasSStore(adapter.evm, contract, st, adapter.memShadow, 0)
 				}
 				if err != nil {
-					if errors.Is(err, ErrGasUintOverflow) {
-					} else {
-						return err
-					}
+					return err
 				}
 				if contract.Gas < gas {
 					return ErrOutOfGas
@@ -1956,26 +1944,18 @@ func (adapter *MIRInterpreterAdapter) setupExecutionEnvironment(contract *Contra
 
 	// Install jumpdest checker using EVM contract helpers
 	env.CheckJumpdest = func(pc uint64) bool {
-		if pc == 1359 {
-			fmt.Printf("==CheckJumpdest== checking pc=1359\n")
-		}
+
 		// Must be within bounds and at a JUMPDEST and code segment
 		if pc >= uint64(len(contract.Code)) {
-			if pc == 1359 {
-				fmt.Printf("==CheckJumpdest== pc=1359 out of bounds len=%d\n", len(contract.Code))
-			}
+
 			return false
 		}
 		if OpCode(contract.Code[pc]) != JUMPDEST {
-			if pc == 1359 {
-				fmt.Printf("==CheckJumpdest== pc=1359 op=%x != JUMPDEST\n", contract.Code[pc])
-			}
+
 			return false
 		}
 		isC := contract.isCode(pc)
-		if pc == 1359 {
-			fmt.Printf("==CheckJumpdest== pc=1359 isCode=%v\n", isC)
-		}
+
 		return isC
 	}
 }
