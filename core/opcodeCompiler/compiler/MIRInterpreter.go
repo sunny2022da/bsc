@@ -3,6 +3,7 @@ package compiler
 import (
 	"errors"
 	"fmt"
+	"os"
 	"runtime/debug"
 	"time"
 
@@ -321,6 +322,8 @@ func (it *MIRInterpreter) RunMIR(block *MIRBasicBlock) ([]byte, error) {
 		for i := 0; i < n; i++ {
 			if it.results[i] == nil {
 				it.results[i] = new(uint256.Int)
+			} else {
+				it.results[i].Clear() // Clear stale value from previous block
 			}
 		}
 	}
@@ -439,9 +442,8 @@ func (it *MIRInterpreter) publishLiveOut(block *MIRBasicBlock) {
 	exitVals := block.ExitStack()
 	for i := range exitVals {
 		v := &exitVals[i]
-		// Remove !inBlock check to ensure we publish ALL exit stack values,
-		// even if defined in the current block, as they are needed by successors.
-		if v != nil && v.kind == Variable && v.def != nil {
+		// Only publish values NOT defined in current block (live-ins from ancestors)
+		if v != nil && v.kind == Variable && v.def != nil && !inBlock[v.def] {
 			// Check signature-based cache
 			var hasInSigCache bool
 			if v.def.evmPC != 0 {
@@ -475,11 +477,21 @@ func (it *MIRInterpreter) publishLiveOut(block *MIRBasicBlock) {
 						it.globalResultsBySig[uint64(def.evmPC)] = make(map[int]*uint256.Int)
 					}
 					it.globalResultsBySig[uint64(def.evmPC)][def.idx] = new(uint256.Int).Set(r)
+					// DEBUG: Log publish
+					if os.Getenv("MIR_DEBUG_PUBLISH") == "1" {
+						fmt.Fprintf(os.Stderr, "[PUBLISH_DEBUG] block=%d published evmPC=%d idx=%d val=0x%x\n",
+							block.blockNum, def.evmPC, def.idx, r.Bytes())
+					}
 				}
 				// Also update pointer-based cache for mirHandleJUMP compatibility
 				it.globalResults[def] = new(uint256.Int).Set(r)
 			}
 		}
+	}
+	// DEBUG: Log block's live-out defs count
+	if os.Getenv("MIR_DEBUG_PUBLISH") == "1" {
+		fmt.Fprintf(os.Stderr, "[PUBLISH_DEBUG] block=%d firstPC=%d defs_count=%d published\n",
+			block.blockNum, block.firstPC, len(defs))
 	}
 }
 
@@ -514,6 +526,17 @@ func (it *MIRInterpreter) RunCFGWithResolver(cfg *CFG, entry *MIRBasicBlock) ([]
 	if it.phiResultsBySig != nil {
 		for k := range it.phiResultsBySig {
 			delete(it.phiResultsBySig, k)
+		}
+	}
+	// Clear PHI predecessor caches to avoid stale values from previous executions
+	if it.phiLastPred != nil {
+		for k := range it.phiLastPred {
+			delete(it.phiLastPred, k)
+		}
+	}
+	if it.phiLastPredBySig != nil {
+		for k := range it.phiLastPredBySig {
+			delete(it.phiLastPredBySig, k)
 		}
 	}
 	if it.env != nil && it.env.ResolveBB == nil && cfg != nil {
@@ -980,6 +1003,27 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 		}
 		a, b, _ := mirLoadAB(it, m)
 		result := it.tmpA.Clear().Add(a, b)
+		// DEBUG: Log ADD operations to trace value propagation
+		if os.Getenv("MIR_DEBUG_ADD") == "1" {
+			fmt.Fprintf(os.Stderr, "[ADD_DEBUG] PC=%d a=0x%x b=0x%x result=0x%x\n",
+				m.evmPC, a.Bytes(), b.Bytes(), result.Bytes())
+			if len(m.operands) >= 2 {
+				op0Kind := "nil"
+				op1Kind := "nil"
+				op0LiveIn := false
+				op1LiveIn := false
+				if m.operands[0] != nil {
+					op0Kind = fmt.Sprintf("%d", m.operands[0].kind)
+					op0LiveIn = m.operands[0].liveIn
+				}
+				if m.operands[1] != nil {
+					op1Kind = fmt.Sprintf("%d", m.operands[1].kind)
+					op1LiveIn = m.operands[1].liveIn
+				}
+				fmt.Fprintf(os.Stderr, "[ADD_DEBUG]   op0.kind=%s op0.liveIn=%v op1.kind=%s op1.liveIn=%v\n",
+					op0Kind, op0LiveIn, op1Kind, op1LiveIn)
+			}
+		}
 		it.setResult(m, result)
 		return nil
 	case MirMUL:
@@ -1172,6 +1216,33 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 		}
 		key := it.evalValue(m.operands[0])
 		val := it.evalValue(m.operands[1])
+		// DEBUG: Log SSTORE operations to trace storage writes
+		if os.Getenv("MIR_DEBUG_SSTORE") == "1" {
+			fmt.Fprintf(os.Stderr, "[SSTORE_DEBUG] PC=%d key=0x%x val=0x%x\n",
+				m.evmPC, key.Bytes(), val.Bytes())
+			// Log operand details
+			if m.operands[0] != nil {
+				fmt.Fprintf(os.Stderr, "[SSTORE_DEBUG]   key_op: kind=%d liveIn=%v def=%v\n",
+					m.operands[0].kind, m.operands[0].liveIn, m.operands[0].def != nil)
+			}
+			if m.operands[1] != nil {
+				fmt.Fprintf(os.Stderr, "[SSTORE_DEBUG]   val_op: kind=%d liveIn=%v def=%v\n",
+					m.operands[1].kind, m.operands[1].liveIn, m.operands[1].def != nil)
+				if m.operands[1].def != nil {
+					fmt.Fprintf(os.Stderr, "[SSTORE_DEBUG]   val_def: evmPC=%d idx=%d op=%s def_ptr=%p\n",
+						m.operands[1].def.evmPC, m.operands[1].def.idx, m.operands[1].def.op.String(), m.operands[1].def)
+					// Check what's in the cache for this evmPC
+					if it.globalResultsBySig != nil {
+						if byIdx := it.globalResultsBySig[uint64(m.operands[1].def.evmPC)]; byIdx != nil {
+							for idx, v := range byIdx {
+								fmt.Fprintf(os.Stderr, "[SSTORE_DEBUG]   cache[%d][%d]=0x%x\n",
+									m.operands[1].def.evmPC, idx, v.Bytes())
+							}
+						}
+					}
+				}
+			}
+		}
 		it.sstore(key, val)
 		return nil
 
@@ -2268,6 +2339,28 @@ func mirHandleADD(it *MIRInterpreter, m *MIR) error {
 		return err
 	}
 	result := it.tmpA.Clear().Add(a, b)
+	// DEBUG: Log ADD operations to trace value propagation
+	if os.Getenv("MIR_DEBUG_ADD") == "1" {
+		fmt.Fprintf(os.Stderr, "[ADD_DEBUG] PC=%d a=0x%x b=0x%x result=0x%x\n",
+			m.evmPC, a.Bytes(), b.Bytes(), result.Bytes())
+		// Also log operand details
+		if len(m.operands) >= 2 {
+			op0Kind := "nil"
+			op1Kind := "nil"
+			op0LiveIn := false
+			op1LiveIn := false
+			if m.operands[0] != nil {
+				op0Kind = fmt.Sprintf("%d", m.operands[0].kind)
+				op0LiveIn = m.operands[0].liveIn
+			}
+			if m.operands[1] != nil {
+				op1Kind = fmt.Sprintf("%d", m.operands[1].kind)
+				op1LiveIn = m.operands[1].liveIn
+			}
+			fmt.Fprintf(os.Stderr, "[ADD_DEBUG]   op0.kind=%s op0.liveIn=%v op1.kind=%s op1.liveIn=%v\n",
+				op0Kind, op0LiveIn, op1Kind, op1LiveIn)
+		}
+	}
 	it.setResult(m, result)
 	return nil
 }
@@ -2770,7 +2863,77 @@ func (it *MIRInterpreter) evalValue(v *Value) (ret *uint256.Int) {
 	case Variable, Arguments:
 		// If this value is marked as live-in from a parent, prefer global cross-BB map first
 		if v.def != nil {
-			// For PHI definitions, prefer predecessor-sensitive cache
+			// CRITICAL FIX: For live-in values, ALWAYS check global caches FIRST
+			// This prevents stale values from it.results polluting PHI resolution
+			if v.liveIn {
+				// Try signature-based cache first (evmPC, idx) - most reliable
+				if v.def.evmPC != 0 {
+					if byPC := it.globalResultsBySig[uint64(v.def.evmPC)]; byPC != nil {
+						if val, ok := byPC[v.def.idx]; ok && val != nil {
+							return val
+						}
+						// FALLBACK: idx mismatch due to CFG construction differences
+						// Try any value for this evmPC if exact idx not found
+						for _, val := range byPC {
+							if val != nil {
+								return val
+							}
+						}
+					}
+				}
+				// Fallback to pointer-based cache
+				if it.globalResults != nil {
+					if r, ok := it.globalResults[v.def]; ok && r != nil {
+						return r
+					}
+					// FALLBACK: Pointer mismatch - search by evmPC
+					// This handles cases where CFG creates multiple MIR instances for same EVM PC
+					if v.def.evmPC != 0 {
+						for ptr, val := range it.globalResults {
+							if ptr != nil && ptr.evmPC == v.def.evmPC && val != nil {
+								return val
+							}
+						}
+					}
+				}
+				// For live-in PHI values, also check phiResults
+				if v.def.op == MirPHI {
+					if it.phiResults != nil {
+						if preds, ok := it.phiResults[v.def]; ok {
+							if it.prevBB != nil {
+								if val, ok2 := preds[it.prevBB]; ok2 && val != nil {
+									return val
+								}
+							}
+							if last := it.phiLastPred[v.def]; last != nil {
+								if val, ok2 := preds[last]; ok2 && val != nil {
+									return val
+								}
+							}
+						}
+					}
+				}
+				// Live-in value not found - return zero
+				if os.Getenv("MIR_DEBUG_LIVEIN") == "1" {
+					fmt.Fprintf(os.Stderr, "[LIVEIN_DEBUG] NOT FOUND: evmPC=%d idx=%d op=%s\n",
+						v.def.evmPC, v.def.idx, v.def.op.String())
+					fmt.Fprintf(os.Stderr, "[LIVEIN_DEBUG]   currentBB=%d prevBB=%v\n",
+						func() uint { if it.currentBB != nil { return it.currentBB.blockNum } else { return 0 } }(),
+						func() interface{} { if it.prevBB != nil { return it.prevBB.blockNum } else { return "nil" } }())
+					// Dump available global cache keys
+					if it.globalResultsBySig != nil {
+						for pc, byIdx := range it.globalResultsBySig {
+							for idx := range byIdx {
+								fmt.Fprintf(os.Stderr, "[LIVEIN_DEBUG]   globalResultsBySig[%d][%d] exists\n", pc, idx)
+							}
+						}
+					}
+				}
+				mirDebugWarn("MIR evalValue: live-in value not found",
+					"evmPC", v.def.evmPC, "idx", v.def.idx, "liveIn", v.liveIn)
+				return it.zeroConst
+			}
+			// For PHI definitions (non-live-in), prefer predecessor-sensitive cache
 			if v.def.op == MirPHI {
 				// Use last known predecessor for this PHI if available, else immediate prevBB
 				if it.phiResults != nil {
@@ -2809,8 +2972,7 @@ func (it *MIRInterpreter) evalValue(v *Value) (ret *uint256.Int) {
 					}
 				}
 			}
-			// First try local per-block result (most recent, most accurate)
-			// But only if the instruction is actually in the current block
+			// For non-live-in values, try local per-block result
 			// Check if current block contains this instruction
 			defInCurrentBlock := false
 			if it.currentBB != nil && v.def != nil {
@@ -2826,10 +2988,8 @@ func (it *MIRInterpreter) evalValue(v *Value) (ret *uint256.Int) {
 					return r
 				}
 			}
-			// Then try global cache for live-in values (only if not found locally)
-			if v.liveIn {
-				// PURE APPROACH 1: Always use signature-based cache (evmPC, idx)
-				// This is simpler, more maintainable, and absolutely correct for loops
+			// Finally, try global cache for non-live-in values
+			if !v.liveIn {
 				if v.def.evmPC != 0 {
 					if byPC := it.globalResultsBySig[uint64(v.def.evmPC)]; byPC != nil {
 						if val, ok := byPC[v.def.idx]; ok && val != nil {
@@ -2837,26 +2997,10 @@ func (it *MIRInterpreter) evalValue(v *Value) (ret *uint256.Int) {
 						}
 					}
 				}
-
-				// Fallback to pointer-based cache for compatibility (mirHandleJUMP uses it)
 				if it.globalResults != nil {
 					if r, ok := it.globalResults[v.def]; ok && r != nil {
 						return r
 					}
-				}
-			}
-			// Finally, fallback to global map for non-live-in cross-BB defs
-			// Also check globalResultsBySig for non-live-in values (they might still be in the cache)
-			if v.def.evmPC != 0 {
-				if byPC := it.globalResultsBySig[uint64(v.def.evmPC)]; byPC != nil {
-					if val, ok := byPC[v.def.idx]; ok && val != nil {
-						return val
-					}
-				}
-			}
-			if it.globalResults != nil {
-				if r, ok := it.globalResults[v.def]; ok && r != nil {
-					return r
 				}
 			}
 		}
