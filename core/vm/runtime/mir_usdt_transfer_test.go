@@ -181,7 +181,7 @@ func TestMIRUSDTTransfer(t *testing.T) {
 	vmConfig := vm.Config{
 		EnableOpcodeOptimizations: true,
 		EnableMIR:                 true,
-		EnableMIRInitcode:         useMIRForConstructor,
+		EnableMIRInitcode:         true,
 		MIRStrictNoFallback:       true, // STRICT: No fallback allowed
 	}
 

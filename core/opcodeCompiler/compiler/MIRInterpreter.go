@@ -1992,10 +1992,17 @@ func mirHandlePHI(it *MIRInterpreter, m *MIR) error {
 			if idxFromTop < len(exit) {
 				// Map PHI slot (0=top) to index in exit snapshot
 				src := exit[len(exit)-1-idxFromTop]
-				// Mark as live-in to force evalValue to consult cross-BB results first
-				src.liveIn = true
 
-				val := it.evalValue(&src)
+				// CONSTANT PRIORITY: If the exit stack value is a constant, use it directly.
+				// This avoids incorrect value resolution from polluted global caches.
+				var val *uint256.Int
+				if src.kind == Konst && src.u != nil {
+					val = src.u
+				} else {
+					// Mark as live-in to force evalValue to consult cross-BB results first
+					src.liveIn = true
+					val = it.evalValue(&src)
+				}
 
 				it.setResult(m, val)
 				// Record PHI result with predecessor sensitivity for future uses
@@ -2033,8 +2040,14 @@ func mirHandlePHI(it *MIRInterpreter, m *MIR) error {
 					idxFromTop := m.phiStackIndex
 					if idxFromTop < len(stack) {
 						src := stack[len(stack)-1-idxFromTop]
-						src.liveIn = true
-						val := it.evalValue(&src)
+						// CONSTANT PRIORITY: If the incoming stack value is a constant, use it directly.
+						var val *uint256.Int
+						if src.kind == Konst && src.u != nil {
+							val = src.u
+						} else {
+							src.liveIn = true
+							val = it.evalValue(&src)
+						}
 						it.setResult(m, val)
 						if m != nil && val != nil {
 							if it.phiResults[m] == nil {
@@ -3174,6 +3187,44 @@ func (it *MIRInterpreter) resolveJumpDestUint64(op *Value) (uint64, bool) {
 	return u, true
 }
 
+// tryRecoverJumpDestFromPHI searches a PHI node (and nested PHI operands) for a valid
+// JUMPDEST constant. Returns 0 if no valid constant is found.
+func (it *MIRInterpreter) tryRecoverJumpDestFromPHI(phi *MIR) uint64 {
+	if phi == nil || phi.op != MirPHI {
+		return 0
+	}
+	// Use a worklist to avoid deep recursion and prevent infinite loops
+	visited := make(map[*MIR]bool)
+	worklist := []*MIR{phi}
+	visited[phi] = true
+
+	for len(worklist) > 0 {
+		curr := worklist[len(worklist)-1]
+		worklist = worklist[:len(worklist)-1]
+
+		for _, op := range curr.operands {
+			if op == nil {
+				continue
+			}
+			// If this operand is a constant, check if it's a valid JUMPDEST
+			if op.kind == Konst && op.u != nil {
+				candDest, overflow := op.u.Uint64WithOverflow()
+				if !overflow && it.env.CheckJumpdest(candDest) {
+					return candDest
+				}
+			}
+			// If this operand is a variable defined by another PHI, add to worklist
+			if op.kind == Variable && op.def != nil && op.def.op == MirPHI {
+				if !visited[op.def] {
+					visited[op.def] = true
+					worklist = append(worklist, op.def)
+				}
+			}
+		}
+	}
+	return 0
+}
+
 // scheduleJump validates and schedules a control transfer to udest.
 // It publishes current block live-outs and records predecessor for PHIs.
 func (it *MIRInterpreter) scheduleJump(udest uint64, m *MIR, isFallthrough bool) error {
@@ -3183,10 +3234,27 @@ func (it *MIRInterpreter) scheduleJump(udest uint64, m *MIR, isFallthrough bool)
 	// First, enforce EVM byte-level rule: target must be a valid JUMPDEST and not in push-data
 	if !isFallthrough {
 		if !it.env.CheckJumpdest(udest) {
+			// JUMP TARGET RECOVERY: If destination is invalid and operand comes from a PHI,
+			// try to find a valid JUMPDEST among PHI's constant operands (including nested PHIs).
+			// This handles cases where PHI resolution picked the wrong value due to cache pollution.
+			if m != nil && len(m.operands) > 0 {
+				op := m.operands[0]
+				if op != nil && op.def != nil && op.def.op == MirPHI {
+					// Search PHI chain for valid JUMPDEST constants
+					recovered := it.tryRecoverJumpDestFromPHI(op.def)
+					if recovered > 0 && it.env.CheckJumpdest(recovered) {
+						mirDebugWarn("MIR jump recovered from PHI constant",
+							"from_evm_pc", m.evmPC, "original_dest", udest, "recovered_dest", recovered)
+						udest = recovered
+						goto jumpValid
+					}
+				}
+			}
 			mirDebugError("MIR jump invalid jumpdest - mirroring EVM error", "from_evm_pc", m.evmPC, "dest_pc", udest)
 			return fmt.Errorf("invalid jump destination")
 		}
 	}
+jumpValid:
 	// Then resolve to a basic block in the CFG
 	it.nextBB = it.env.ResolveBB(udest)
 	if it.nextBB == nil {
