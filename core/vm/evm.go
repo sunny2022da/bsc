@@ -760,6 +760,8 @@ func (evm *EVM) initNewContract(contract *Contract, address common.Address, valu
 	// but we may run initcode via MIR if enabled.
 	contract.optimized = false
 	useMIR := evm.Config.EnableOpcodeOptimizations && evm.Config.EnableMIR && evm.Config.EnableMIRInitcode && evm.mirInterpreter != nil
+	var ret []byte
+	var err error
 	if useMIR {
 		// Ensure MIR CFG is available for the initcode
 		code := contract.Code
@@ -777,7 +779,11 @@ func (evm *EVM) initNewContract(contract *Contract, address common.Address, valu
 			}
 		}
 		if contract.HasMIRCode() {
-			return evm.mirInterpreter.Run(contract, nil, false)
+			ret, err = evm.mirInterpreter.Run(contract, nil, false)
+			if err != nil {
+				return ret, err
+			}
+			goto postExecution
 		}
 		// If MIR not available, fall back to base interpreter without superinstructions
 		compiler.DisableOptimization()
@@ -789,11 +795,12 @@ func (evm *EVM) initNewContract(contract *Contract, address common.Address, valu
 		}
 	}
 
-	ret, err := evm.interpreter.Run(contract, nil, false)
+	ret, err = evm.interpreter.Run(contract, nil, false)
 	if err != nil {
 		return ret, err
 	}
 
+	postExecution:
 	// After creation, retrieve to optimization
 	if evm.Config.EnableOpcodeOptimizations {
 		compiler.EnableOptimization()
