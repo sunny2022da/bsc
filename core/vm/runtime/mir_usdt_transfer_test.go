@@ -41,21 +41,21 @@ func (a AddressRef) Address() common.Address {
 var (
 	aliceAddr    = common.HexToAddress("0x1000000000000000000000000000000000000001")
 	usdtContract = common.HexToAddress("0x2000000000000000000000000000000000000001")
-	// 全局变量存储实际部署的合约地址
+	// Global variable to store the actual deployed contract address
 	globalUsdtContract common.Address
 	// ContractRef for Alice
 	aliceRef = AddressRef{addr: aliceAddr}
 )
 
-// 设置BSC详细日志
+// Setup BSC detailed logging
 func setupBSCLogging(t *testing.T) {
-	// 设置环境变量启用BSC的详细日志
+	// Set environment variables to enable BSC detailed logging
 	os.Setenv("BSC_LOG_LEVEL", "debug")
 	os.Setenv("ETH_LOG_LEVEL", "debug")
 	os.Setenv("EVM_DEBUG", "true")
 	os.Setenv("BSC_DEBUG", "true")
 
-	// 设置BSC特定的日志环境变量
+	// Set BSC specific log environment variables
 	os.Setenv("GETH_LOG_LEVEL", "debug")
 	os.Setenv("GETH_DEBUG", "true")
 	os.Setenv("VM_DEBUG", "true")
@@ -63,7 +63,7 @@ func setupBSCLogging(t *testing.T) {
 	os.Setenv("TRIE_DEBUG", "true")
 	os.Setenv("STATE_DEBUG", "true")
 
-	// 设置日志输出到控制台
+	// Set log output to console
 	os.Setenv("GETH_LOG_OUTPUT", "console")
 	os.Setenv("BSC_LOG_OUTPUT", "console")
 
@@ -71,62 +71,62 @@ func setupBSCLogging(t *testing.T) {
 	t.Log("📊 Log levels: BSC=debug, ETH=debug, EVM=debug")
 }
 
-// 配置50万次转账测试参数（保守版本）
+// Configure 500K transfer test parameters (conservative version)
 func get500KScaleConfigConservative() (int64, uint64, uint64) {
-	// 50万次转账测试配置（保守版本）
-	numTransfers := int64(500000)          // 50万次转账
+	// 500K transfer test configuration (conservative version)
+	numTransfers := int64(500000)          // 500K transfers
 	batchGasLimit := uint64(100000000000)  // 100B gas for batch transfer
 	blockGasLimit := uint64(1000000000000) // 1T gas limit for block
 
 	return numTransfers, batchGasLimit, blockGasLimit
 }
 
-// 配置50万次转账测试参数
+// Configure 500K transfer test parameters
 func get500KScaleConfig() (int64, uint64, uint64) {
-	// 50万次转账测试配置
-	numTransfers := int64(500000)          // 50万次转账
-	batchGasLimit := uint64(100000000000)  // 100B gas for individual transfers (每次转账约200K gas)
+	// 500K transfer test configuration
+	numTransfers := int64(500000)          // 500K transfers
+	batchGasLimit := uint64(100000000000)  // 100B gas for individual transfers (approximately 200K gas per transfer)
 	blockGasLimit := uint64(1000000000000) // 1T gas limit for block
 
 	return numTransfers, batchGasLimit, blockGasLimit
 }
 
-// 配置大规模测试参数
+// Configure large scale test parameters
 func getLargeScaleConfig() (int64, uint64, uint64) {
-	// 大规模测试配置
-	numTransfers := int64(50000000)         // 5000万次转账
-	batchGasLimit := uint64(1000000000000)  // 1T gas for batch transfer (从100B增加到1T)
-	blockGasLimit := uint64(10000000000000) // 10T gas limit for block (从1T增加到10T)
+	// Large scale test configuration
+	numTransfers := int64(50000000)         // 50 million transfers
+	batchGasLimit := uint64(1000000000000)  // 1T gas for batch transfer (increased from 100B to 1T)
+	blockGasLimit := uint64(10000000000000) // 10T gas limit for block (increased from 1T to 10T)
 
 	return numTransfers, batchGasLimit, blockGasLimit
 }
 
-// 配置中等规模测试参数
+// Configure medium scale test parameters
 func getMediumScaleConfig() (int64, uint64, uint64) {
-	// 中等规模测试配置
-	numTransfers := int64(5000000)        // 500万次转账
+	// Medium scale test configuration
+	numTransfers := int64(5000000)        // 5 million transfers
 	batchGasLimit := uint64(10000000000)  // 10B gas for batch transfer
 	blockGasLimit := uint64(100000000000) // 100B gas limit for block
 
 	return numTransfers, batchGasLimit, blockGasLimit
 }
 
-// 配置小规模测试参数
+// Configure small scale test parameters
 func getSmallScaleConfig() (int64, uint64, uint64) {
-	// 小规模测试配置 - 用于debugging
-	numTransfers := int64(1)             // 只测试1个transfer
-	batchGasLimit := uint64(10000000)    // 10M gas (足够一个transfer)
+	// Small scale test configuration - for debugging
+	numTransfers := int64(1)             // Only test 1 transfer
+	batchGasLimit := uint64(10000000)    // 10M gas (enough for one transfer)
 	blockGasLimit := uint64(10000000000) // 10B gas limit for block
 
 	return numTransfers, batchGasLimit, blockGasLimit
 }
 
 func TestMIRUSDTTransfer(t *testing.T) {
-	// 启用BSC详细日志
+	// Enable BSC detailed logging
 	setupBSCLogging(t)
 
-	// 选择测试规模 - 使用小规模测试避免超时
-	numTransfers, batchGasLimit, blockGasLimit := getSmallScaleConfig() // 5万次转账
+	// Select test scale - use small scale test to avoid timeout
+	numTransfers, batchGasLimit, blockGasLimit := getSmallScaleConfig() // 50K transfers
 
 	t.Logf("🚀 Pure BSC-EVM Benchmark - USDT Token Individual Transfers (Scale: %d transfers)", numTransfers)
 	t.Logf("📊 Gas Configuration - Total: %d, Block: %d", batchGasLimit, blockGasLimit)
@@ -167,16 +167,11 @@ func TestMIRUSDTTransfer(t *testing.T) {
 		PetersburgBlock:     big.NewInt(0),
 		IstanbulBlock:       big.NewInt(0),
 		MuirGlacierBlock:    big.NewInt(0),
-		RamanujanBlock:      big.NewInt(0),          // BSC特有
-		NielsBlock:          big.NewInt(0),          // BSC特有
-		Parlia:              &params.ParliaConfig{}, // BSC的共识机制
+		RamanujanBlock:      big.NewInt(0),          // BSC specific
+		NielsBlock:          big.NewInt(0),          // BSC specific
+		Parlia:              &params.ParliaConfig{}, // BSC consensus mechanism
 	}
 	t.Logf("✅ Chain config created - Chain ID: %d", chainConfig.ChainID)
-
-	// Test mode selection via environment variable
-	// Mode A: MIRStrictNoFallback=false - Use base EVM for constructor, MIR for runtime (working)
-	// Mode B: MIRStrictNoFallback=true  - Use MIR for both constructor and runtime (will hang on initcode CFG)
-	useMIRForConstructor := os.Getenv("MIR_TEST_CONSTRUCTOR") == "true"
 
 	vmConfig := vm.Config{
 		EnableOpcodeOptimizations: true,
@@ -185,16 +180,9 @@ func TestMIRUSDTTransfer(t *testing.T) {
 		MIRStrictNoFallback:       true, // STRICT: No fallback allowed
 	}
 
-	if useMIRForConstructor {
-		t.Log("✅ EVM configuration: Mode B - MIR for both constructor and runtime (strict mode)")
-		t.Log("   ⚠️  WARNING: This mode will hang during initcode CFG generation")
-	} else {
-		t.Log("✅ EVM configuration: Mode A - Base EVM for constructor, MIR for runtime")
-	}
-
 	compiler.EnableOpcodeParse()
 
-	// 🔍 启用 MIR 调试日志
+	// 🔍 Enable MIR debug logs
 	compiler.EnableDebugLogs(true)
 	compiler.EnableMIRDebugLogs(true)
 	compiler.EnableParserDebugLogs(true)
@@ -359,14 +347,14 @@ func performIndividualTransfersWithConfig(t *testing.T, evm *vm.EVM, numTransfer
 	// Measure execution time
 	startTime := time.Now()
 
-	// 为每次转账分配gas
+	// Allocate gas for each transfer
 	gasPerTransfer := gasLimit / uint64(numTransfers)
 
 	for i := 0; i < int(numTransfers); i++ {
-		// 计算接收地址
+		// Calculate recipient address
 		recipient := common.BigToAddress(new(big.Int).Add(startRecipient.Big(), big.NewInt(int64(i))))
 
-		// 准备transfer函数的calldata
+		// Prepare calldata for transfer function
 		calldata := make([]byte, 0, 68)
 		calldata = append(calldata, transferSelector...)
 		calldata = append(calldata, make([]byte, 12)...) // padding for address
@@ -383,10 +371,10 @@ func performIndividualTransfersWithConfig(t *testing.T, evm *vm.EVM, numTransfer
 			t.Logf("   Calldata: %x", calldata)
 		}
 
-		// 执行transfer调用
+		// Execute transfer call
 		executeTransaction(t, evm, globalUsdtContract, calldata, gasPerTransfer)
 
-		// 每10000次转账打印一次进度
+		// Print progress every 10000 transfers
 		if (i+1)%10000 == 0 {
 			t.Logf("📊 Progress: %d/%d transfers completed", i+1, numTransfers)
 		}

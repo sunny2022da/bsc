@@ -893,8 +893,8 @@ func GenerateMIRCFG(hash common.Hash, code []byte) (*CFG, error) {
 			}
 		}
 	}
-	fmt.Fprintf(os.Stderr, "✅ CFG generation completed: totalIterations=%d, uniqueBlocks=%d, totalBlocks=%d\n",
-		iterationCount, processedUnique, len(cfg.basicBlocks))
+	//fmt.Fprintf(os.Stderr, "✅ CFG generation completed: totalIterations=%d, uniqueBlocks=%d, totalBlocks=%d\n",
+	//	iterationCount, processedUnique, len(cfg.basicBlocks))
 	// Fix entry block (firstPC == 0) to ensure it falls through to PC:2 if it's JUMPDEST
 	// This fixes cases where the entry block should end after PUSH1 and fall through to the loop block
 	cfg.buildPCIndex()
@@ -2921,8 +2921,8 @@ func (c *CFG) computeMaxHFast(curBB *MIRBasicBlock) int {
 		for _, ch := range curBB.Children() {
 			if ch == p {
 				excludeParents[p] = true
-				fmt.Fprintf(os.Stderr, "  🔄 Direct back-edge detected: PC=%d → PC=%d (excluded from maxH)\n",
-					p.firstPC, curBB.firstPC)
+				//fmt.Fprintf(os.Stderr, "  🔄 Direct back-edge detected: PC=%d → PC=%d (excluded from maxH)\n",
+				//	p.firstPC, curBB.firstPC)
 				break
 			}
 		}
@@ -2951,8 +2951,8 @@ func (c *CFG) computeMaxHFast(curBB *MIRBasicBlock) int {
 		if prevEntry := curBB.EntryStack(); prevEntry != nil && curBB.rebuildCount > WIDENING_START {
 			// Widening: fix at previous value to force convergence
 			maxH = len(prevEntry)
-			fmt.Fprintf(os.Stderr, "  🔒 Widening applied: PC=%d fixed at height=%d (rebuild#%d, threshold=%d)\n",
-				curBB.firstPC, maxH, curBB.rebuildCount, WIDENING_START)
+			//fmt.Fprintf(os.Stderr, "  🔒 Widening applied: PC=%d fixed at height=%d (rebuild#%d, threshold=%d)\n",
+			//	curBB.firstPC, maxH, curBB.rebuildCount, WIDENING_START)
 		} else {
 			// Warmup phase: use maximum to find stable value
 			maxH = 0
@@ -2962,10 +2962,10 @@ func (c *CFG) computeMaxHFast(curBB *MIRBasicBlock) int {
 					maxH = len(st)
 				}
 			}
-			if maxH > 0 && curBB.rebuildCount > DEEP_DETECTION_THRESHOLD {
-				fmt.Fprintf(os.Stderr, "  📈 Warmup phase: PC=%d maxH=%d (rebuild#%d/%d)\n",
-					curBB.firstPC, maxH, curBB.rebuildCount, WIDENING_START)
-			}
+			//if maxH > 0 && curBB.rebuildCount > DEEP_DETECTION_THRESHOLD {
+			//	fmt.Fprintf(os.Stderr, "  📈 Warmup phase: PC=%d maxH=%d (rebuild#%d/%d)\n",
+			//		curBB.firstPC, maxH, curBB.rebuildCount, WIDENING_START)
+			//}
 		}
 	}
 
@@ -3021,8 +3021,8 @@ func (c *CFG) computeMaxHWithDeepCycleDetection(curBB *MIRBasicBlock) int {
 		if prevEntry := curBB.EntryStack(); prevEntry != nil && curBB.rebuildCount > WIDENING_START {
 			// Widening: fix at previous value to force convergence
 			maxH = len(prevEntry)
-			fmt.Fprintf(os.Stderr, "  🔒 Widening applied: PC=%d fixed at height=%d (rebuild#%d, threshold=%d)\n",
-				curBB.firstPC, maxH, curBB.rebuildCount, WIDENING_START)
+			//fmt.Fprintf(os.Stderr, "  🔒 Widening applied: PC=%d fixed at height=%d (rebuild#%d, threshold=%d)\n",
+			//	curBB.firstPC, maxH, curBB.rebuildCount, WIDENING_START)
 		} else {
 			// Warmup phase: use maximum to find stable value
 			maxH = 0
@@ -3032,15 +3032,15 @@ func (c *CFG) computeMaxHWithDeepCycleDetection(curBB *MIRBasicBlock) int {
 					maxH = len(st)
 				}
 			}
-			if maxH > 0 && curBB.rebuildCount > DEEP_DETECTION_THRESHOLD {
-				fmt.Fprintf(os.Stderr, "  📈 Warmup phase: PC=%d maxH=%d (rebuild#%d/%d)\n",
-					curBB.firstPC, maxH, curBB.rebuildCount, WIDENING_START)
-			}
+			//if maxH > 0 && curBB.rebuildCount > DEEP_DETECTION_THRESHOLD {
+			//	fmt.Fprintf(os.Stderr, "  📈 Warmup phase: PC=%d maxH=%d (rebuild#%d/%d)\n",
+			//		curBB.firstPC, maxH, curBB.rebuildCount, WIDENING_START)
+			//}
 		}
 	}
 
-	fmt.Fprintf(os.Stderr, "  ✅ Deep analysis result: maxH=%d (excluded %d back-edges, kept %d parents)\n",
-		maxH, len(excludeParents), validParents)
+	//fmt.Fprintf(os.Stderr, "  ✅ Deep analysis result: maxH=%d (excluded %d back-edges, kept %d parents)\n",
+	//	maxH, len(excludeParents), validParents)
 
 	return maxH
 }
