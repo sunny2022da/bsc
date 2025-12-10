@@ -390,7 +390,7 @@ func (it *MIRInterpreter) RunMIR(block *MIRBasicBlock) ([]byte, error) {
 					}
 				}
 			}
-			return it.returndata, nil
+			return nil, nil // STOP returns empty data
 		}
 	}
 	// Avoid per-run clearing of results to reduce overhead for trivial blocks;
@@ -402,7 +402,7 @@ func (it *MIRInterpreter) RunMIR(block *MIRBasicBlock) ([]byte, error) {
 		if err := it.exec(ins); err != nil {
 			switch err {
 			case errSTOP:
-				return it.returndata, nil
+				return nil, nil // STOP returns empty data, not returndata
 			case errRETURN:
 				return it.returndata, nil
 			case errREVERT:
@@ -656,8 +656,10 @@ func (it *MIRInterpreter) RunCFGWithResolver(cfg *CFG, entry *MIRBasicBlock) ([]
 				lastInstr := bb.instructions[len(bb.instructions)-1]
 				if lastInstr != nil {
 					switch lastInstr.op {
-					case MirRETURN, MirREVERT, MirSTOP, MirSELFDESTRUCT:
+					case MirRETURN, MirREVERT:
 						return it.returndata, nil
+					case MirSTOP, MirSELFDESTRUCT:
+						return nil, nil // STOP/SELFDESTRUCT return empty data
 					}
 				}
 			}
@@ -770,7 +772,7 @@ func (it *MIRInterpreter) RunCFGWithResolver(cfg *CFG, entry *MIRBasicBlock) ([]
 			bb = it.nextBB
 			continue
 		case errSTOP:
-			return it.returndata, nil
+			return nil, nil // STOP returns empty data
 		case errRETURN:
 			return it.returndata, nil
 		case errREVERT:
@@ -1544,6 +1546,11 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 		sz := it.preOpOps[2]
 		if sz == nil {
 			sz = it.evalValue(m.operands[2])
+		}
+		// EVM semantics: revert if offset+size > returndatasize (since Byzantium)
+		end := new(uint256.Int).Add(off, sz)
+		if !end.IsUint64() || end.Uint64() > uint64(len(it.returndata)) {
+			return fmt.Errorf("return data out of bounds")
 		}
 		it.returnDataCopy(dest, off, sz)
 		return nil
