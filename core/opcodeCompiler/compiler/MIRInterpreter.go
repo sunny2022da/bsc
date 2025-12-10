@@ -3,12 +3,17 @@ package compiler
 import (
 	"errors"
 	"fmt"
+	"math"
 	"runtime/debug"
 	"time"
 
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/holiman/uint256"
 )
+
+// maxMemorySize is the maximum memory offset we allow to prevent overflow panics.
+// This is a conservative limit; actual EVM would OOG long before reaching this.
+const maxMemorySize = math.MaxUint64 - 64
 
 // Precomputed keccak256("") constant as a static array to avoid per-call allocations
 var emptyKeccakHash = [32]byte{
@@ -2308,6 +2313,10 @@ func mirHandleMLOAD(it *MIRInterpreter, m *MIR) error {
 	} else {
 		off = it.evalValue(m.operands[0])
 	}
+	// Check for huge memory offset that would cause gas overflow
+	if !off.IsUint64() || off.Uint64() > maxMemorySize-32 {
+		return fmt.Errorf("gas uint64 overflow")
+	}
 	// Ensure memory growth side-effect even if value is forwarded via meta
 	it.ensureMemSize(off.Uint64() + 32)
 	// DEBUG: Force actual memory read to verify optimization correctness
@@ -3090,11 +3099,20 @@ func (it *MIRInterpreter) readMemView(off, sz *uint256.Int) []byte {
 }
 
 func (it *MIRInterpreter) readMem32(off *uint256.Int) []byte {
+	// Check for overflow: if offset is too large, return zeros to prevent panic
+	if !off.IsUint64() || off.Uint64() > maxMemorySize-32 {
+		return make([]byte, 32)
+	}
 	it.ensureMemSize(off.Uint64() + 32)
 	return append([]byte(nil), it.memory[off.Uint64():off.Uint64()+32]...)
 }
 
 func (it *MIRInterpreter) readMem32Into(off *uint256.Int, dst *[32]byte) {
+	// Check for overflow: if offset is too large, return zeros to prevent panic
+	if !off.IsUint64() || off.Uint64() > maxMemorySize-32 {
+		clear(dst[:])
+		return
+	}
 	it.ensureMemSize(off.Uint64() + 32)
 	copy(dst[:], it.memory[off.Uint64():off.Uint64()+32])
 	if it.tracerEx != nil || it.tracer != nil {
@@ -3103,6 +3121,10 @@ func (it *MIRInterpreter) readMem32Into(off *uint256.Int, dst *[32]byte) {
 }
 
 func (it *MIRInterpreter) writeMem32(off, val *uint256.Int) {
+	// Check for overflow: if offset is too large, silently ignore to prevent panic
+	if !off.IsUint64() || off.Uint64() > maxMemorySize-32 {
+		return
+	}
 	o := off.Uint64()
 	it.ensureMemSize(o + 32)
 	// Directly encode 32-byte big-endian representation without extra zeroing/allocations
@@ -3110,6 +3132,10 @@ func (it *MIRInterpreter) writeMem32(off, val *uint256.Int) {
 }
 
 func (it *MIRInterpreter) writeMem8(off, val *uint256.Int) {
+	// Check for overflow: if offset is too large, silently ignore to prevent panic
+	if !off.IsUint64() || off.Uint64() > maxMemorySize-1 {
+		return
+	}
 	o := off.Uint64()
 	it.ensureMemSize(o + 1)
 	it.memory[o] = byte(val.Uint64() & 0xff)
