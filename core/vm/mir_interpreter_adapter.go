@@ -747,7 +747,10 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 	}
 
 	// Set current contract for the pre-installed hook
+	// Save old contract for restoration after nested calls
+	oldContract := adapter.currentContract
 	adapter.currentContract = contract
+	defer func() { adapter.currentContract = oldContract }()
 
 	// Save current env state before modifying it (for nested calls)
 	env := adapter.mirInterpreter.GetEnv()
@@ -830,6 +833,7 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 			adapter.currentBlock = ctx.Block
 			// Track total gas charged at block entry (for GAS opcode to add back)
 			var blockEntryTotalGas uint64
+
 			// If the first opcode of the underlying bytecode at this block is JUMPDEST, EVM charges 1 gas upon entering.
 			// Charge it up-front here (once), and record for GAS to add back.
 			if adapter.currentContract != nil {
@@ -865,6 +869,7 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 				validatedCounts := countOpcodesInRange(currentContract.Code, firstPC, lastPC)
 				// Use validated counts instead of EVMOpCounts() to ensure accuracy
 				counts = validatedCounts
+
 			} else {
 				// Fallback to EVMOpCounts() if we can't validate
 				counts = ctx.Block.EVMOpCounts()

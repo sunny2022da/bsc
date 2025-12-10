@@ -1790,6 +1790,7 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 				depth = 0
 			}
 		case CREATE:
+			curBB.SetLastPC(uint(i)) // Mark end of current block before CREATE
 			// CREATE takes 3 operands: value, offset, size
 			// EVM stack layout (top to bottom): value, offset, size
 			value := valueStack.pop()
@@ -1824,6 +1825,7 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 			depth = targetDepth
 			return nil
 		case CREATE2:
+			curBB.SetLastPC(uint(i)) // Mark end of current block before CREATE2
 			// CREATE2 takes 4 operands: value, offset, size, salt
 			// EVM stack layout (top to bottom): value, offset, size, salt
 			value := valueStack.pop()
@@ -1859,6 +1861,7 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 			depth = targetDepth
 			return nil
 		case CALL:
+			curBB.SetLastPC(uint(i)) // Mark end of current block before CALL
 			// CALL takes 7 operands: gas, addr, value, inOffset, inSize, outOffset, outSize
 			// Pop from stack top to bottom (LIFO): gas is on top
 			gas := valueStack.pop()
@@ -1898,6 +1901,7 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 			depth = targetDepth
 			return nil
 		case CALLCODE:
+			curBB.SetLastPC(uint(i)) // Mark end of current block before CALLCODE
 			// CALLCODE takes same operands as CALL
 			// Pop from stack top to bottom (LIFO): gas is on top
 			gas := valueStack.pop()
@@ -1956,6 +1960,7 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 			}
 			return nil
 		case DELEGATECALL:
+			curBB.SetLastPC(uint(i)) // Mark end of current block before DELEGATECALL
 			// DELEGATECALL takes 6 operands: gas, addr, inOffset, inSize, outOffset, outSize
 			// Pop from stack top to bottom (LIFO): gas is on top
 			gas := valueStack.pop()
@@ -1994,6 +1999,7 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 			depth = targetDepth
 			return nil
 		case STATICCALL:
+			curBB.SetLastPC(uint(i)) // Mark end of current block before STATICCALL
 			// STATICCALL takes 6 operands: gas, addr, inOffset, inSize, outOffset, outSize
 			// Pop from stack top to bottom (LIFO): gas is on top
 			gas := valueStack.pop()
