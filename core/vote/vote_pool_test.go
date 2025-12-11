@@ -46,6 +46,8 @@ import (
 	"github.com/ethereum/go-ethereum/eth/downloader"
 	"github.com/ethereum/go-ethereum/event"
 	"github.com/ethereum/go-ethereum/params"
+
+	"github.com/ethereum/go-ethereum/internal/vmtest"
 )
 
 var (
@@ -133,14 +135,22 @@ func (journal *VoteJournal) verifyJournal(size, lastLatestVoteNumber int) bool {
 }
 
 func TestValidVotePool(t *testing.T) {
-	testVotePool(t, true)
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testVotePool(t, true, vmCfg)
+		})
+	}
 }
 
 func TestInvalidVotePool(t *testing.T) {
-	testVotePool(t, false)
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testVotePool(t, false, vmCfg)
+		})
+	}
 }
 
-func testVotePool(t *testing.T, isValidRules bool) {
+func testVotePool(t *testing.T, isValidRules bool, vmCfg vm.Config) {
 	walletPasswordDir, walletDir := setUpKeyManager(t)
 
 	genesis := &core.Genesis{
@@ -150,7 +160,7 @@ func testVotePool(t *testing.T, isValidRules bool) {
 
 	mux := new(event.TypeMux)
 	db := rawdb.NewMemoryDatabase()
-	chain, _ := core.NewBlockChain(db, nil, genesis, nil, ethash.NewFullFaker(), vm.Config{}, nil, nil)
+	chain, _ := core.NewBlockChain(db, nil, genesis, nil, ethash.NewFullFaker(), vmCfg, nil, nil)
 
 	var mockEngine consensus.PoSA
 	if isValidRules {

@@ -128,12 +128,20 @@ func NewMIRInterpreterAdapter(evm *EVM) *MIRInterpreterAdapter {
 	adapter := &MIRInterpreterAdapter{evm: evm}
 
 	// Create MIR execution environment from EVM context
+	var chainID uint64
+	if evm.ChainConfig() != nil && evm.ChainConfig().ChainID != nil {
+		chainID = evm.ChainConfig().ChainID.Uint64()
+	}
+	var blockNumber uint64
+	if evm.Context.BlockNumber != nil {
+		blockNumber = evm.Context.BlockNumber.Uint64()
+	}
 	env := &compiler.MIRExecutionEnv{
 		Memory:      make([]byte, 0, 1024),
 		Storage:     make(map[[32]byte][32]byte),
-		BlockNumber: evm.Context.BlockNumber.Uint64(),
+		BlockNumber: blockNumber,
 		Timestamp:   evm.Context.Time,
-		ChainID:     evm.ChainConfig().ChainID.Uint64(),
+		ChainID:     chainID,
 		GasPrice:    0, // Will be set from transaction context
 		BaseFee:     0, // Will be set from block context
 		SelfBalance: 0, // Will be set from contract context
@@ -711,9 +719,19 @@ func NewMIRInterpreterAdapter(evm *EVM) *MIRInterpreterAdapter {
 	return adapter
 }
 
+// mirTestVerifyPath, when true, logs MIR execution path for test verification
+var mirTestVerifyPath = false
+
+// SetMIRTestVerifyPath enables/disables MIR path verification logging (testing only)
+func SetMIRTestVerifyPath(enabled bool) { mirTestVerifyPath = enabled }
+
 // Run executes the contract using MIR interpreter
 // This method should match the signature of EVMInterpreter.Run
 func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, readOnly bool) (ret []byte, err error) {
+	// Test verification logging
+	if mirTestVerifyPath {
+		log.Debug("[MIR-PATH-VERIFY] MIRInterpreterAdapter.Run ENTRY", "contract", contract.Address().Hex())
+	}
 	// PERFORMANCE: Only evaluate expensive Hex() when debug logging is enabled
 	if compiler.DebugLogsEnabled {
 		compiler.MirDebugWarn("MIRInterpreterAdapter.Run called", "contract", contract.Address().Hex(), "readOnly", readOnly)
@@ -1682,6 +1700,9 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 		result, err := adapter.mirInterpreter.RunCFGWithResolver(cfg, bbs[0])
 		if err != nil {
 			if err == compiler.ErrMIRFallback {
+				if mirTestVerifyPath {
+					log.Warn("[MIR-PATH-VERIFY] MIRInterpreterAdapter.Run ERROR (MIR FALLBACK requested)", "contract", contract.Address().Hex(), "err", err)
+				}
 				return nil, fmt.Errorf("MIR fallback requested but disabled: %w", err)
 			}
 			// Map compiler.errREVERT to vm.ErrExecutionReverted to preserve gas
@@ -1694,6 +1715,9 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 		// If MIR executed without error, return whatever returndata was produced.
 		// An empty result (e.g., STOP) should not trigger fallback; mirror EVM semantics
 		// where a STOP simply returns empty bytes.
+		if mirTestVerifyPath {
+			log.Debug("[MIR-PATH-VERIFY] MIRInterpreterAdapter.Run COMPLETED (MIR execution SUCCESS)", "contract", contract.Address().Hex(), "resultLen", len(result))
+		}
 		return result, nil
 	}
 	// If nothing returned from the entry, return error

@@ -35,6 +35,8 @@ import (
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/ethdb/memorydb"
 	"github.com/ethereum/go-ethereum/params"
+
+	"github.com/ethereum/go-ethereum/internal/vmtest"
 )
 
 var (
@@ -153,13 +155,13 @@ type testBackend struct {
 }
 
 // newTestBackend creates an empty chain and wraps it into a mock backend.
-func newTestBackend(blocks int, light bool) *testBackend {
-	return newTestBackendWithGenerator(blocks, light)
+func newTestBackend(blocks int, light bool, vmCfg vm.Config) *testBackend {
+	return newTestBackendWithGenerator(blocks, light, vmCfg)
 }
 
 // newTestBackendWithGenerator creates a chain with a number of explicitly defined blocks and
 // wraps it into a mock backend.
-func newTestBackendWithGenerator(blocks int, lightProcess bool) *testBackend {
+func newTestBackendWithGenerator(blocks int, lightProcess bool, vmCfg vm.Config) *testBackend {
 	signer := types.HomesteadSigner{}
 	// Create a database pre-initialize with a genesis block
 	db := rawdb.NewMemoryDatabase()
@@ -169,7 +171,7 @@ func newTestBackendWithGenerator(blocks int, lightProcess bool) *testBackend {
 		Alloc:   GenesisAlloc{testAddr: {Balance: big.NewInt(100000000000000000)}},
 		BaseFee: big.NewInt(params.InitialBaseFee),
 	}
-	chain, _ := NewBlockChain(db, nil, gspec, nil, ethash.NewFaker(), vm.Config{}, nil, nil, EnablePersistDiff(860000))
+	chain, _ := NewBlockChain(db, nil, gspec, nil, ethash.NewFaker(), vmCfg, nil, nil, EnablePersistDiff(860000))
 	generator := func(i int, block *BlockGen) {
 		// The chain maker doesn't have access to a chain, so the difficulty will be
 		// lets unset (nil). Set it here to the correct value.
@@ -230,8 +232,16 @@ func (b *testBackend) close() {
 func (b *testBackend) Chain() *BlockChain { return b.chain }
 
 func TestFreezeDiffLayer(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testFreezeDiffLayer(t, vmCfg)
+		})
+	}
+}
+
+func testFreezeDiffLayer(t *testing.T, vmCfg vm.Config) {
 	blockNum := 1024
-	fullBackend := newTestBackend(blockNum, true)
+	fullBackend := newTestBackend(blockNum, true, vmCfg)
 	defer fullBackend.close()
 	for len(fullBackend.chain.diffQueueBuffer) > 0 {
 		// Wait for the buffer to be zero.

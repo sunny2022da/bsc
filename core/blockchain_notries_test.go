@@ -31,6 +31,8 @@ import (
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/ethdb/memorydb"
 	"github.com/ethereum/go-ethereum/params"
+
+	"github.com/ethereum/go-ethereum/internal/vmtest"
 )
 
 func newMockVerifyPeer() *mockVerifyPeer {
@@ -80,7 +82,7 @@ func newMockRemoteVerifyPeer(peers []VerifyPeer) *mockVerifyPeers {
 	return &mockVerifyPeers{peers}
 }
 
-func makeTestBackendWithRemoteValidator(blocks int, mode VerifyMode, failed *verifFailedStatus) (*testBackend, *testBackend, []*types.Block, error) {
+func makeTestBackendWithRemoteValidator(blocks int, mode VerifyMode, failed *verifFailedStatus, vmCfg vm.Config) (*testBackend, *testBackend, []*types.Block, error) {
 	signer := types.HomesteadSigner{}
 
 	// Create a database pre-initialize with a genesis block
@@ -103,13 +105,13 @@ func makeTestBackendWithRemoteValidator(blocks int, mode VerifyMode, failed *ver
 	peer := newMockVerifyPeer()
 	peers := []VerifyPeer{peer}
 
-	verifier, err := NewBlockChain(db, nil, gspec, nil, engine, vm.Config{},
+	verifier, err := NewBlockChain(db, nil, gspec, nil, engine, vmCfg,
 		nil, nil, EnablePersistDiff(100000), EnableBlockValidator(params.TestChainConfig, LocalVerify, nil))
 	if err != nil {
 		return nil, nil, nil, err
 	}
 
-	fastnode, err := NewBlockChain(db2, nil, gspec2, nil, engine2, vm.Config{},
+	fastnode, err := NewBlockChain(db2, nil, gspec2, nil, engine2, vmCfg,
 		nil, nil, EnableBlockValidator(params.TestChainConfig, mode, newMockRemoteVerifyPeer(peers)))
 	if err != nil {
 		return nil, nil, nil, err
@@ -185,8 +187,16 @@ func makeTestBackendWithRemoteValidator(blocks int, mode VerifyMode, failed *ver
 }
 
 func TestFastNode(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testFastNode(t, vmCfg)
+		})
+	}
+}
+
+func testFastNode(t *testing.T, vmCfg vm.Config) {
 	// test full mode and succeed
-	_, fastnode, blocks, err := makeTestBackendWithRemoteValidator(2048, FullVerify, nil)
+	_, fastnode, blocks, err := makeTestBackendWithRemoteValidator(2048, FullVerify, nil, vmCfg)
 	if err != nil {
 		t.Fatalf("err: %v", err.Error())
 	}
@@ -196,7 +206,7 @@ func TestFastNode(t *testing.T) {
 	}
 	// test full mode and failed
 	failed := &verifFailedStatus{status: types.StatusDiffHashMismatch, blockNumber: 204}
-	_, fastnode, blocks, err = makeTestBackendWithRemoteValidator(2048, FullVerify, failed)
+	_, fastnode, blocks, err = makeTestBackendWithRemoteValidator(2048, FullVerify, failed, vmCfg)
 	if err != nil {
 		t.Fatalf("err: %v", err.Error())
 	}
@@ -205,7 +215,7 @@ func TestFastNode(t *testing.T) {
 		t.Fatalf("blocks insert should be failed at height %d", failed.blockNumber+11)
 	}
 	// test insecure mode and succeed
-	_, fastnode, blocks, err = makeTestBackendWithRemoteValidator(2048, InsecureVerify, nil)
+	_, fastnode, blocks, err = makeTestBackendWithRemoteValidator(2048, InsecureVerify, nil, vmCfg)
 	if err != nil {
 		t.Fatalf("err: %v", err.Error())
 	}
@@ -215,7 +225,7 @@ func TestFastNode(t *testing.T) {
 	}
 	// test insecure mode and failed
 	failed = &verifFailedStatus{status: types.StatusImpossibleFork, blockNumber: 204}
-	_, fastnode, blocks, err = makeTestBackendWithRemoteValidator(2048, FullVerify, failed)
+	_, fastnode, blocks, err = makeTestBackendWithRemoteValidator(2048, FullVerify, failed, vmCfg)
 	if err != nil {
 		t.Fatalf("err: %v", err.Error())
 	}

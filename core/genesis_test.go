@@ -33,14 +33,20 @@ import (
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/triedb"
 	"github.com/ethereum/go-ethereum/triedb/pathdb"
+
+	"github.com/ethereum/go-ethereum/internal/vmtest"
 )
 
 func TestSetupGenesis(t *testing.T) {
-	testSetupGenesis(t, rawdb.HashScheme)
-	testSetupGenesis(t, rawdb.PathScheme)
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testSetupGenesis(t, rawdb.HashScheme, vmCfg)
+			testSetupGenesis(t, rawdb.PathScheme, vmCfg)
+		})
+	}
 }
 
-func testSetupGenesis(t *testing.T, scheme string) {
+func testSetupGenesis(t *testing.T, scheme string, vmCfg vm.Config) {
 	var (
 		customghash = common.HexToHash("0x89c99d90b79719238d2645c7642f2c9295246e80775b38cfd162b696817fbd50")
 		customg     = Genesis{
@@ -140,7 +146,7 @@ func testSetupGenesis(t *testing.T, scheme string) {
 				tdb := triedb.NewDatabase(db, newDbConfig(scheme))
 				oldcustomg.Commit(db, tdb)
 
-				bc, _ := NewBlockChain(db, DefaultCacheConfigWithScheme(scheme), &oldcustomg, nil, ethash.NewFullFaker(), vm.Config{}, nil, nil)
+				bc, _ := NewBlockChain(db, DefaultCacheConfigWithScheme(scheme), &oldcustomg, nil, ethash.NewFullFaker(), vmCfg, nil, nil)
 				defer bc.Stop()
 
 				_, blocks, _ := GenerateChainWithGenesis(&oldcustomg, ethash.NewFaker(), 4, nil)
