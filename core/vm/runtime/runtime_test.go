@@ -43,7 +43,13 @@ import (
 
 	// force-load js tracers to trigger registration
 	_ "github.com/ethereum/go-ethereum/eth/tracers/js"
+	"github.com/ethereum/go-ethereum/internal/vmtest"
 )
+
+// =============================================================================
+// Tests (some modified to support dual-mode EVM + MIR testing)
+// See testing_helpers.go for vmtest.Configs() and vmtest.Name()
+// =============================================================================
 
 func TestDefaults(t *testing.T) {
 	cfg := new(Config)
@@ -71,62 +77,74 @@ func TestDefaults(t *testing.T) {
 }
 
 func TestEVM(t *testing.T) {
-	defer func() {
-		if r := recover(); r != nil {
-			t.Fatalf("crashed with: %v", r)
-		}
-	}()
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("crashed with: %v", r)
+				}
+			}()
 
-	Execute([]byte{
-		byte(vm.DIFFICULTY),
-		byte(vm.TIMESTAMP),
-		byte(vm.GASLIMIT),
-		byte(vm.PUSH1),
-		byte(vm.ORIGIN),
-		byte(vm.BLOCKHASH),
-		byte(vm.COINBASE),
-	}, nil, nil)
+			Execute([]byte{
+				byte(vm.DIFFICULTY),
+				byte(vm.TIMESTAMP),
+				byte(vm.GASLIMIT),
+				byte(vm.PUSH1),
+				byte(vm.ORIGIN),
+				byte(vm.BLOCKHASH),
+				byte(vm.COINBASE),
+			}, nil, &Config{EVMConfig: vmCfg})
+		})
+	}
 }
 
 func TestExecute(t *testing.T) {
-	ret, _, err := Execute([]byte{
-		byte(vm.PUSH1), 10,
-		byte(vm.PUSH1), 0,
-		byte(vm.MSTORE),
-		byte(vm.PUSH1), 32,
-		byte(vm.PUSH1), 0,
-		byte(vm.RETURN),
-	}, nil, nil)
-	if err != nil {
-		t.Fatal("didn't expect error", err)
-	}
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			ret, _, err := Execute([]byte{
+				byte(vm.PUSH1), 10,
+				byte(vm.PUSH1), 0,
+				byte(vm.MSTORE),
+				byte(vm.PUSH1), 32,
+				byte(vm.PUSH1), 0,
+				byte(vm.RETURN),
+			}, nil, &Config{EVMConfig: vmCfg})
+			if err != nil {
+				t.Fatal("didn't expect error", err)
+			}
 
-	num := new(big.Int).SetBytes(ret)
-	if num.Cmp(big.NewInt(10)) != 0 {
-		t.Error("Expected 10, got", num)
+			num := new(big.Int).SetBytes(ret)
+			if num.Cmp(big.NewInt(10)) != 0 {
+				t.Error("Expected 10, got", num)
+			}
+		})
 	}
 }
 
 func TestCall(t *testing.T) {
-	state, _ := state.New(types.EmptyRootHash, state.NewDatabaseForTesting())
-	address := common.HexToAddress("0xaa")
-	state.SetCode(address, []byte{
-		byte(vm.PUSH1), 10,
-		byte(vm.PUSH1), 0,
-		byte(vm.MSTORE),
-		byte(vm.PUSH1), 32,
-		byte(vm.PUSH1), 0,
-		byte(vm.RETURN),
-	})
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			statedb, _ := state.New(types.EmptyRootHash, state.NewDatabaseForTesting())
+			address := common.HexToAddress("0xaa")
+			statedb.SetCode(address, []byte{
+				byte(vm.PUSH1), 10,
+				byte(vm.PUSH1), 0,
+				byte(vm.MSTORE),
+				byte(vm.PUSH1), 32,
+				byte(vm.PUSH1), 0,
+				byte(vm.RETURN),
+			})
 
-	ret, _, err := Call(address, nil, &Config{State: state})
-	if err != nil {
-		t.Fatal("didn't expect error", err)
-	}
+			ret, _, err := Call(address, nil, &Config{State: statedb, EVMConfig: vmCfg})
+			if err != nil {
+				t.Fatal("didn't expect error", err)
+			}
 
-	num := new(big.Int).SetBytes(ret)
-	if num.Cmp(big.NewInt(10)) != 0 {
-		t.Error("Expected 10, got", num)
+			num := new(big.Int).SetBytes(ret)
+			if num.Cmp(big.NewInt(10)) != 0 {
+				t.Error("Expected 10, got", num)
+			}
+		})
 	}
 }
 

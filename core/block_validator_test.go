@@ -31,15 +31,21 @@ import (
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/params"
+
+	"github.com/ethereum/go-ethereum/internal/vmtest"
 )
 
 // Tests that simple header verification works, for both good and bad blocks.
 func TestHeaderVerification(t *testing.T) {
-	testHeaderVerification(t, rawdb.HashScheme)
-	testHeaderVerification(t, rawdb.PathScheme)
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testHeaderVerification(t, rawdb.HashScheme, vmCfg)
+			testHeaderVerification(t, rawdb.PathScheme, vmCfg)
+		})
+	}
 }
 
-func testHeaderVerification(t *testing.T, scheme string) {
+func testHeaderVerification(t *testing.T, scheme string, vmCfg vm.Config) {
 	// Create a simple chain to verify
 	var (
 		gspec        = &Genesis{Config: params.TestChainConfig}
@@ -50,7 +56,7 @@ func testHeaderVerification(t *testing.T, scheme string) {
 		headers[i] = block.Header()
 	}
 	// Run the header checker for blocks one-by-one, checking for both valid and invalid nonces
-	chain, _ := NewBlockChain(rawdb.NewMemoryDatabase(), DefaultCacheConfigWithScheme(scheme), gspec, nil, ethash.NewFaker(), vm.Config{}, nil, nil)
+	chain, _ := NewBlockChain(rawdb.NewMemoryDatabase(), DefaultCacheConfigWithScheme(scheme), gspec, nil, ethash.NewFaker(), vmCfg, nil, nil)
 	defer chain.Stop()
 
 	for i := 0; i < len(blocks); i++ {
@@ -84,11 +90,24 @@ func testHeaderVerification(t *testing.T, scheme string) {
 	}
 }
 
-func TestHeaderVerificationForMergingClique(t *testing.T) { testHeaderVerificationForMerging(t, true) }
-func TestHeaderVerificationForMergingEthash(t *testing.T) { testHeaderVerificationForMerging(t, false) }
+func TestHeaderVerificationForMergingClique(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testHeaderVerificationForMerging(t, true, vmCfg)
+		})
+	}
+}
+
+func TestHeaderVerificationForMergingEthash(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testHeaderVerificationForMerging(t, false, vmCfg)
+		})
+	}
+}
 
 // Tests the verification for eth1/2 merging, including pre-merge and post-merge
-func testHeaderVerificationForMerging(t *testing.T, isClique bool) {
+func testHeaderVerificationForMerging(t *testing.T, isClique bool, vmCfg vm.Config) {
 	var (
 		gspec      *Genesis
 		preBlocks  []*types.Block
@@ -163,7 +182,7 @@ func testHeaderVerificationForMerging(t *testing.T, isClique bool) {
 		postHeaders[i] = block.Header()
 	}
 	// Run the header checker for blocks one-by-one, checking for both valid and invalid nonces
-	chain, _ := NewBlockChain(rawdb.NewMemoryDatabase(), nil, gspec, nil, engine, vm.Config{}, nil, nil)
+	chain, _ := NewBlockChain(rawdb.NewMemoryDatabase(), nil, gspec, nil, engine, vmCfg, nil, nil)
 	defer chain.Stop()
 
 	// Verify the blocks before the merging

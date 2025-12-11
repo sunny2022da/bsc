@@ -51,6 +51,8 @@ import (
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/trie"
 	"github.com/holiman/uint256"
+
+	"github.com/ethereum/go-ethereum/internal/vmtest"
 )
 
 // So we can deterministically seed different blockchains
@@ -64,6 +66,12 @@ var (
 // header only chain. The database and genesis specification for block generation
 // are also returned in case more test blocks are needed later.
 func newCanonical(engine consensus.Engine, n int, full bool, scheme string) (ethdb.Database, *Genesis, *BlockChain, error) {
+	return newCanonicalWithVMConfig(engine, n, full, scheme, vm.Config{})
+}
+
+// newCanonicalWithVMConfig is like newCanonical but allows specifying a custom vm.Config.
+// This is useful for dual-mode testing (EVM + MIR).
+func newCanonicalWithVMConfig(engine consensus.Engine, n int, full bool, scheme string, vmConfig vm.Config) (ethdb.Database, *Genesis, *BlockChain, error) {
 	var (
 		genesis = &Genesis{
 			BaseFee: big.NewInt(params.InitialBaseFee),
@@ -72,7 +80,7 @@ func newCanonical(engine consensus.Engine, n int, full bool, scheme string) (eth
 	)
 	// Initialize a fresh chain with only a genesis block
 	var ops []BlockChainOption
-	blockchain, _ := NewBlockChain(rawdb.NewMemoryDatabase(), DefaultCacheConfigWithScheme(scheme), genesis, nil, engine, vm.Config{}, nil, nil, ops...)
+	blockchain, _ := NewBlockChain(rawdb.NewMemoryDatabase(), DefaultCacheConfigWithScheme(scheme), genesis, nil, engine, vmConfig, nil, nil, ops...)
 	// Create and inject the requested chain
 	if n == 0 {
 		return rawdb.NewMemoryDatabase(), genesis, blockchain, nil
@@ -212,12 +220,16 @@ func testHeaderChainImport(chain []*types.Header, blockchain *BlockChain) error 
 }
 
 func TestLastBlock(t *testing.T) {
-	testLastBlock(t, rawdb.HashScheme)
-	testLastBlock(t, rawdb.PathScheme)
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testLastBlock(t, rawdb.HashScheme, vmCfg)
+			testLastBlock(t, rawdb.PathScheme, vmCfg)
+		})
+	}
 }
 
-func testLastBlock(t *testing.T, scheme string) {
-	genDb, _, blockchain, err := newCanonical(ethash.NewFaker(), 0, true, scheme)
+func testLastBlock(t *testing.T, scheme string, vmCfg vm.Config) {
+	genDb, _, blockchain, err := newCanonicalWithVMConfig(ethash.NewFaker(), 0, true, scheme, vmCfg)
 	if err != nil {
 		t.Fatalf("failed to create pristine chain: %v", err)
 	}
@@ -289,15 +301,23 @@ func TestExtendCanonicalHeaders(t *testing.T) {
 }
 
 func TestExtendCanonicalBlocks(t *testing.T) {
-	testExtendCanonical(t, true, rawdb.HashScheme)
-	testExtendCanonical(t, true, rawdb.PathScheme)
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testExtendCanonicalWithVMConfig(t, true, rawdb.HashScheme, vmCfg)
+			testExtendCanonicalWithVMConfig(t, true, rawdb.PathScheme, vmCfg)
+		})
+	}
 }
 
 func testExtendCanonical(t *testing.T, full bool, scheme string) {
+	testExtendCanonicalWithVMConfig(t, full, scheme, vm.Config{})
+}
+
+func testExtendCanonicalWithVMConfig(t *testing.T, full bool, scheme string, vmCfg vm.Config) {
 	length := 5
 
 	// Make first chain starting from genesis
-	_, _, processor, err := newCanonical(ethash.NewFaker(), length, full, scheme)
+	_, _, processor, err := newCanonicalWithVMConfig(ethash.NewFaker(), length, full, scheme, vmCfg)
 	if err != nil {
 		t.Fatalf("failed to make new canonical chain: %v", err)
 	}
@@ -989,11 +1009,19 @@ func testLightVsFastVsFullChainHeads(t *testing.T, scheme string) {
 
 // Tests that chain reorganisations handle transaction removals and reinsertions.
 func TestChainTxReorgs(t *testing.T) {
-	testChainTxReorgs(t, rawdb.HashScheme)
-	testChainTxReorgs(t, rawdb.PathScheme)
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testChainTxReorgsWithVMConfig(t, rawdb.HashScheme, vmCfg)
+			testChainTxReorgsWithVMConfig(t, rawdb.PathScheme, vmCfg)
+		})
+	}
 }
 
 func testChainTxReorgs(t *testing.T, scheme string) {
+	testChainTxReorgsWithVMConfig(t, scheme, vm.Config{})
+}
+
+func testChainTxReorgsWithVMConfig(t *testing.T, scheme string, vmCfg vm.Config) {
 	var (
 		key1, _ = crypto.HexToECDSA("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291")
 		key2, _ = crypto.HexToECDSA("8a1f9a8f95be41cd7ccb6168179afb4504aefe388d1e14474d32c45c72ce7b7a")
@@ -1049,7 +1077,7 @@ func testChainTxReorgs(t *testing.T, scheme string) {
 	})
 	// Import the chain. This runs all block validation rules.
 	db := rawdb.NewMemoryDatabase()
-	blockchain, _ := NewBlockChain(db, DefaultCacheConfigWithScheme(scheme), gspec, nil, ethash.NewFaker(), vm.Config{}, nil, nil)
+	blockchain, _ := NewBlockChain(db, DefaultCacheConfigWithScheme(scheme), gspec, nil, ethash.NewFaker(), vmCfg, nil, nil)
 	if i, err := blockchain.InsertChain(chain); err != nil {
 		t.Fatalf("failed to insert original chain[%d]: %v", i, err)
 	}
