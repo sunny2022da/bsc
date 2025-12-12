@@ -1696,7 +1696,8 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 		log.Warn("Adapter.Run checking entry block", "len(bbs)", 0)
 	}
 	entryBlockHasContent := len(bbs) > 0 && bbs[0] != nil && (bbs[0].Size() > 0 || len(bbs[0].Children()) > 0)
-	if entryBlockHasContent {
+	hasCode := len(contract.Code) > 0
+	if entryBlockHasContent || hasCode {
 		result, err := adapter.mirInterpreter.RunCFGWithResolver(cfg, bbs[0])
 		if err != nil {
 			if err == compiler.ErrMIRFallback {
@@ -1720,7 +1721,13 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 		}
 		return result, nil
 	}
-	// If nothing returned from the entry, return error
+	// If nothing returned from the entry, check for implicit STOP
+	if len(contract.Code) > 0 {
+		if mirTestVerifyPath {
+			log.Debug("[MIR-PATH-VERIFY] MIRInterpreterAdapter.Run COMPLETED (implicit STOP)", "contract", contract.Address().Hex())
+		}
+		return nil, nil // Implicit STOP for code with no MIR-executable instructions
+	}
 	return nil, fmt.Errorf("MIR entry block produced no result")
 }
 

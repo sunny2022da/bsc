@@ -445,7 +445,7 @@ type testBackend struct {
 	acc     accounts.Account
 }
 
-func newTestBackend(t *testing.T, n int, gspec *core.Genesis, engine consensus.Engine, generator func(i int, b *core.BlockGen), vmCfg vm.Config) *testBackend {
+func newTestBackend(t *testing.T, n int, gspec *core.Genesis, engine consensus.Engine, generator func(i int, b *core.BlockGen, vmCfg vm.Config), vmCfg vm.Config) *testBackend {
 	var (
 		cacheConfig = &core.CacheConfig{
 			TrieCleanLimit:    256,
@@ -458,7 +458,7 @@ func newTestBackend(t *testing.T, n int, gspec *core.Genesis, engine consensus.E
 	accman, acc := newTestAccountManager(t)
 	gspec.Alloc[acc.Address] = types.Account{Balance: big.NewInt(params.Ether)}
 	// Generate blocks for testing
-	db, blocks, _ := core.GenerateChainWithGenesis(gspec, engine, n, generator)
+	db, blocks, _ := core.GenerateChainWithGenesisAndVMConfig(gspec, engine, n, generator, vmCfg)
 	txlookupLimit := uint64(0)
 	chain, err := core.NewBlockChain(db, cacheConfig, gspec, nil, engine, vmCfg, nil, &txlookupLimit)
 	if err != nil {
@@ -709,12 +709,12 @@ func testEstimateGas(t *testing.T, vmCfg vm.Config) {
 		return append(revertSelector, encodedMessage...)
 	}
 
-	api := NewBlockChainAPI(newTestBackend(t, genBlocks, genesis, beacon.New(ethash.NewFaker()), func(i int, b *core.BlockGen) {
+	api := NewBlockChainAPI(newTestBackend(t, genBlocks, genesis, beacon.New(ethash.NewFaker()), func(i int, b *core.BlockGen, vmCfg vm.Config) {
 		// Transfer from account[0] to account[1]
 		//    value: 1000 wei
 		//    fee:   0 wei
 		tx, _ := types.SignTx(types.NewTx(&types.LegacyTx{Nonce: uint64(i), To: &accounts[1].addr, Value: big.NewInt(1000), Gas: params.TxGas, GasPrice: b.BaseFee(), Data: nil}), signer, accounts[0].key)
-		b.AddTx(tx)
+		b.AddTxWithVMConfigForTest(tx, vmCfg)
 		b.SetPoS()
 	}, vmCfg))
 
@@ -1003,12 +1003,12 @@ func testCall(t *testing.T, vmCfg vm.Config) {
 		genBlocks = 10
 		signer    = types.HomesteadSigner{}
 	)
-	api := NewBlockChainAPI(newTestBackend(t, genBlocks, genesis, beacon.New(ethash.NewFaker()), func(i int, b *core.BlockGen) {
+	api := NewBlockChainAPI(newTestBackend(t, genBlocks, genesis, beacon.New(ethash.NewFaker()), func(i int, b *core.BlockGen, vmCfg vm.Config) {
 		// Transfer from account[0] to account[1]
 		//    value: 1000 wei
 		//    fee:   0 wei
 		tx, _ := types.SignTx(types.NewTx(&types.LegacyTx{Nonce: uint64(i), To: &accounts[1].addr, Value: big.NewInt(1000), Gas: params.TxGas, GasPrice: b.BaseFee(), Data: nil}), signer, accounts[0].key)
-		b.AddTx(tx)
+		b.AddTxWithVMConfigForTest(tx, vmCfg)
 		b.SetPoS()
 	}, vmCfg))
 	randomAccounts := newAccounts(3)
@@ -1341,7 +1341,7 @@ func testSimulateV1(t *testing.T, vmCfg vm.Config) {
 		}
 		sha256Address = common.BytesToAddress([]byte{0x02})
 	)
-	api := NewBlockChainAPI(newTestBackend(t, genBlocks, genesis, ethash.NewFaker(), func(i int, b *core.BlockGen) {
+	api := NewBlockChainAPI(newTestBackend(t, genBlocks, genesis, ethash.NewFaker(), func(i int, b *core.BlockGen, vmCfg vm.Config) {
 		b.SetCoinbase(common.HexToAddress(coinbase))
 		// Transfer from account[0] to account[1]
 		//    value: 1000 wei
@@ -1354,7 +1354,7 @@ func testSimulateV1(t *testing.T, vmCfg vm.Config) {
 			GasPrice: b.BaseFee(),
 			Data:     nil,
 		}), signer, accounts[0].key)
-		b.AddTx(tx)
+		b.AddTxWithVMConfigForTest(tx, vmCfg)
 	}, vmCfg))
 	var (
 		randomAccounts   = newAccounts(4)
@@ -2455,7 +2455,7 @@ func testSignTransaction(t *testing.T, vmCfg vm.Config) {
 			Alloc:  types.GenesisAlloc{},
 		}
 	)
-	b := newTestBackend(t, 1, genesis, beacon.New(ethash.NewFaker()), func(i int, b *core.BlockGen) {
+	b := newTestBackend(t, 1, genesis, beacon.New(ethash.NewFaker()), func(i int, b *core.BlockGen, vmCfg vm.Config) {
 		b.SetPoS()
 	}, vmCfg)
 	api := NewTransactionAPI(b, nil)
@@ -2501,7 +2501,7 @@ func testSignBlobTransaction(t *testing.T, vmCfg vm.Config) {
 			Alloc:  types.GenesisAlloc{},
 		}
 	)
-	b := newTestBackend(t, 1, genesis, beacon.New(ethash.NewFaker()), func(i int, b *core.BlockGen) {
+	b := newTestBackend(t, 1, genesis, beacon.New(ethash.NewFaker()), func(i int, b *core.BlockGen, vmCfg vm.Config) {
 		b.SetPoS()
 	}, vmCfg)
 	api := NewTransactionAPI(b, nil)
@@ -2540,7 +2540,7 @@ func testSendBlobTransaction(t *testing.T, vmCfg vm.Config) {
 			Alloc:  types.GenesisAlloc{},
 		}
 	)
-	b := newTestBackend(t, 1, genesis, beacon.New(ethash.NewFaker()), func(i int, b *core.BlockGen) {
+	b := newTestBackend(t, 1, genesis, beacon.New(ethash.NewFaker()), func(i int, b *core.BlockGen, vmCfg vm.Config) {
 		b.SetPoS()
 	}, vmCfg)
 	api := NewTransactionAPI(b, nil)
@@ -2586,7 +2586,7 @@ func testFillBlobTransaction(t *testing.T, vmCfg vm.Config) {
 		emptyBlobProof, _              = kzg4844.ComputeBlobProof(emptyBlob, emptyBlobCommit)
 		emptyBlobHash      common.Hash = kzg4844.CalcBlobHashV1(sha256.New(), &emptyBlobCommit)
 	)
-	b := newTestBackend(t, 1, genesis, beacon.New(ethash.NewFaker()), func(i int, b *core.BlockGen) {
+	b := newTestBackend(t, 1, genesis, beacon.New(ethash.NewFaker()), func(i int, b *core.BlockGen, vmCfg vm.Config) {
 		b.SetPoS()
 	}, vmCfg)
 	api := NewTransactionAPI(b, nil)
@@ -3096,12 +3096,12 @@ func testRPCGetBlockOrHeader(t *testing.T, vmCfg vm.Config) {
 		}
 		pending = types.NewBlock(&types.Header{Number: big.NewInt(11), Time: 42}, &types.Body{Transactions: types.Transactions{tx}, Withdrawals: types.Withdrawals{withdrawal}}, nil, blocktest.NewHasher())
 	)
-	backend := newTestBackend(t, genBlocks, genesis, ethash.NewFaker(), func(i int, b *core.BlockGen) {
+	backend := newTestBackend(t, genBlocks, genesis, ethash.NewFaker(), func(i int, b *core.BlockGen, vmCfg vm.Config) {
 		// Transfer from account[0] to account[1]
 		//    value: 1000 wei
 		//    fee:   0 wei
 		tx, _ := types.SignTx(types.NewTx(&types.LegacyTx{Nonce: uint64(i), To: &acc2Addr, Value: big.NewInt(1000), Gas: params.TxGas, GasPrice: b.BaseFee(), Data: nil}), signer, acc1Key)
-		b.AddTx(tx)
+		b.AddTxWithVMConfigForTest(tx, vmCfg)
 	}, vmCfg)
 	backend.setPendingBlock(pending)
 	api := NewBlockChainAPI(backend)
@@ -3351,7 +3351,7 @@ func setupReceiptBackend(t *testing.T, genBlocks int, vmCfg vm.Config) (*testBac
 		txHashes = make([]common.Hash, genBlocks)
 	)
 
-	backend := newTestBackend(t, genBlocks, genesis, beacon.New(ethash.NewFaker()), func(i int, b *core.BlockGen) {
+	backend := newTestBackend(t, genBlocks, genesis, beacon.New(ethash.NewFaker()), func(i int, b *core.BlockGen, vmCfg vm.Config) {
 		var (
 			tx  *types.Transaction
 			err error
@@ -3424,7 +3424,7 @@ func setupReceiptBackend(t *testing.T, genBlocks int, vmCfg vm.Config) (*testBac
 			t.Errorf("failed to sign tx: %v", err)
 		}
 		if tx != nil {
-			b.AddTx(tx)
+			b.AddTxWithVMConfigForTest(tx, vmCfg)
 			txHashes[i] = tx.Hash()
 		}
 	}, vmCfg)
