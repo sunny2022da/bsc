@@ -28,15 +28,24 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/core/vm"
+	"github.com/ethereum/go-ethereum/internal/vmtest"
 )
 
 func TestBuildPayload(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testBuildPayload(t, vmCfg)
+		})
+	}
+}
+
+func testBuildPayload(t *testing.T, vmCfg vm.Config) {
 	t.Parallel()
 	var (
 		db        = rawdb.NewMemoryDatabase()
 		recipient = common.HexToAddress("0xdeadbeef")
 	)
-	w, b := newTestWorker(t, params.TestChainConfig, ethash.NewFaker(), db, 0, vm.Config{})
+	w, b := newTestWorker(t, params.TestChainConfig, ethash.NewFaker(), db, 0, vmCfg)
 	defer w.close()
 
 	timestamp := uint64(time.Now().Unix())

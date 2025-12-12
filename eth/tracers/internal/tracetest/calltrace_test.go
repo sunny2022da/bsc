@@ -212,12 +212,12 @@ func BenchmarkTracers(b *testing.B) {
 			if err := json.Unmarshal(blob, test); err != nil {
 				b.Fatalf("failed to parse testcase: %v", err)
 			}
-			benchTracer("callTracer", test, b)
+			benchTracer("callTracer", test, b, vm.Config{})
 		})
 	}
 }
 
-func benchTracer(tracerName string, test *callTracerTest, b *testing.B) {
+func benchTracer(tracerName string, test *callTracerTest, b *testing.B, vmCfg vm.Config) {
 	// Configure a blockchain with the given prestate
 	tx := new(types.Transaction)
 	if err := tx.UnmarshalBinary(common.FromHex(test.Input)); err != nil {
