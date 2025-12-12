@@ -44,6 +44,8 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/eth/downloader"
 	"github.com/ethereum/go-ethereum/event"
+	"github.com/ethereum/go-ethereum/core/vm"
+	"github.com/ethereum/go-ethereum/internal/vmtest"
 	"github.com/ethereum/go-ethereum/params"
 )
 
@@ -139,7 +141,7 @@ func TestInvalidVotePool(t *testing.T) {
 	testVotePool(t, false)
 }
 
-func testVotePool(t *testing.T, isValidRules bool) {
+func testVotePool(t *testing.T, isValidRules bool, vmCfg vm.Config) {
 	walletPasswordDir, walletDir := setUpKeyManager(t)
 
 	genesis := &core.Genesis{
@@ -149,7 +151,7 @@ func testVotePool(t *testing.T, isValidRules bool) {
 
 	mux := new(event.TypeMux)
 	db := rawdb.NewMemoryDatabase()
-	chain, _ := core.NewBlockChain(db, genesis, ethash.NewFullFaker(), nil)
+	chain, _ := core.NewBlockChain(db, genesis, ethash.NewFullFaker(), core.DefaultConfig().WithVMConfig(vmCfg))
 
 	var mockEngine consensus.PoSA
 	if isValidRules {

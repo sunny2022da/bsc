@@ -39,6 +39,7 @@ import (
 	"github.com/ethereum/go-ethereum/eth/ethconfig"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/event"
+	"github.com/ethereum/go-ethereum/internal/vmtest"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/trie"
@@ -211,6 +212,43 @@ func newTestHandlerWithBlocks(blocks int) *testHandler {
 		Alloc:  types.GenesisAlloc{testAddr: {Balance: big.NewInt(1000000)}},
 	}
 	chain, _ := core.NewBlockChain(db, gspec, ethash.NewFaker(), nil)
+
+	_, bs, _ := core.GenerateChainWithGenesis(gspec, ethash.NewFaker(), blocks, nil)
+	if _, err := chain.InsertChain(bs); err != nil {
+		panic(err)
+	}
+	txpool := newTestTxPool()
+	votepool := newTestVotePool()
+
+	handler, _ := newHandler(&handlerConfig{
+		Database:   db,
+		Chain:      chain,
+		TxPool:     txpool,
+		VotePool:   votepool,
+		Network:    1,
+		Sync:       ethconfig.SnapSync,
+		BloomCache: 1,
+	})
+	handler.Start(1000, 3)
+
+	return &testHandler{
+		db:       db,
+		chain:    chain,
+		txpool:   txpool,
+		votepool: votepool,
+		handler:  handler,
+	}
+}
+
+// newTestHandlerWithBlocksAndVMConfig creates a new handler with custom vm.Config.
+func newTestHandlerWithBlocksAndVMConfig(blocks int, vmCfg vm.Config) *testHandler {
+	// Create a database pre-initialize with a genesis block
+	db := rawdb.NewMemoryDatabase()
+	gspec := &core.Genesis{
+		Config: params.TestChainConfig,
+		Alloc:  types.GenesisAlloc{testAddr: {Balance: big.NewInt(1000000)}},
+	}
+	chain, _ := core.NewBlockChain(db, gspec, ethash.NewFaker(), core.DefaultConfig().WithVMConfig(vmCfg))
 
 	_, bs, _ := core.GenerateChainWithGenesis(gspec, ethash.NewFaker(), blocks, nil)
 	if _, err := chain.InsertChain(bs); err != nil {

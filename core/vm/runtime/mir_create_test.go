@@ -489,7 +489,7 @@ func runCreateComparison(t *testing.T, name string, code, input []byte) {
 	evmMIR := NewEnv(mirCfg)
 
 	retBase, gasBase, errBase := evmBase.Call(
-		vm.AccountRef(baseCfg.Origin),
+		baseCfg.Origin,
 		contractAddr,
 		input,
 		baseCfg.GasLimit,
@@ -497,7 +497,7 @@ func runCreateComparison(t *testing.T, name string, code, input []byte) {
 	)
 
 	retMIR, gasMIR, errMIR := evmMIR.Call(
-		vm.AccountRef(mirCfg.Origin),
+		mirCfg.Origin,
 		contractAddr,
 		input,
 		mirCfg.GasLimit,
@@ -569,7 +569,7 @@ func runCreateComparisonWithBalance(t *testing.T, name string, code, input []byt
 	evmMIR := NewEnv(mirCfg)
 
 	retBase, gasBase, errBase := evmBase.Call(
-		vm.AccountRef(baseCfg.Origin),
+		baseCfg.Origin,
 		contractAddr,
 		input,
 		baseCfg.GasLimit,
@@ -577,7 +577,7 @@ func runCreateComparisonWithBalance(t *testing.T, name string, code, input []byt
 	)
 
 	retMIR, gasMIR, errMIR := evmMIR.Call(
-		vm.AccountRef(mirCfg.Origin),
+		mirCfg.Origin,
 		contractAddr,
 		input,
 		mirCfg.GasLimit,
@@ -634,7 +634,7 @@ func runCreateComparisonWithGasLimit(t *testing.T, name string, code, input []by
 	evmMIR := NewEnv(mirCfg)
 
 	_, gasBase, errBase := evmBase.Call(
-		vm.AccountRef(baseCfg.Origin),
+		baseCfg.Origin,
 		contractAddr,
 		input,
 		gasLimit,
@@ -642,7 +642,7 @@ func runCreateComparisonWithGasLimit(t *testing.T, name string, code, input []by
 	)
 
 	_, gasMIR, errMIR := evmMIR.Call(
-		vm.AccountRef(mirCfg.Origin),
+		mirCfg.Origin,
 		contractAddr,
 		input,
 		gasLimit,

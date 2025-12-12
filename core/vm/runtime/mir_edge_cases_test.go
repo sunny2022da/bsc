@@ -445,7 +445,7 @@ func runEdgeCaseComparison(t *testing.T, name string, code, input []byte) {
 
 	// Execute
 	retBase, gasBase, errBase := evmBase.Call(
-		vm.AccountRef(baseCfg.Origin),
+		baseCfg.Origin,
 		contractAddr,
 		input,
 		baseCfg.GasLimit,
@@ -453,7 +453,7 @@ func runEdgeCaseComparison(t *testing.T, name string, code, input []byte) {
 	)
 
 	retMIR, gasMIR, errMIR := evmMIR.Call(
-		vm.AccountRef(mirCfg.Origin),
+		mirCfg.Origin,
 		contractAddr,
 		input,
 		mirCfg.GasLimit,

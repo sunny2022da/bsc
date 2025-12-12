@@ -381,7 +381,7 @@ func runGasComparison(t *testing.T, name string, code, input []byte, strictGas b
 
 	// Execute
 	_, gasBase, errBase := evmBase.Call(
-		vm.AccountRef(baseCfg.Origin),
+		baseCfg.Origin,
 		contractAddr,
 		input,
 		baseCfg.GasLimit,
@@ -389,7 +389,7 @@ func runGasComparison(t *testing.T, name string, code, input []byte, strictGas b
 	)
 
 	_, gasMIR, errMIR := evmMIR.Call(
-		vm.AccountRef(mirCfg.Origin),
+		mirCfg.Origin,
 		contractAddr,
 		input,
 		mirCfg.GasLimit,
@@ -467,7 +467,7 @@ func runGasComparisonWithBalance(t *testing.T, name string, code, input []byte, 
 	evmMIR := NewEnv(mirCfg)
 
 	_, gasBase, errBase := evmBase.Call(
-		vm.AccountRef(baseCfg.Origin),
+		baseCfg.Origin,
 		contractAddr,
 		input,
 		baseCfg.GasLimit,
@@ -475,7 +475,7 @@ func runGasComparisonWithBalance(t *testing.T, name string, code, input []byte, 
 	)
 
 	_, gasMIR, errMIR := evmMIR.Call(
-		vm.AccountRef(mirCfg.Origin),
+		mirCfg.Origin,
 		contractAddr,
 		input,
 		mirCfg.GasLimit,
@@ -544,7 +544,7 @@ func runGasComparisonWithExactGas(t *testing.T, name string, code, input []byte,
 	evmMIR := NewEnv(mirCfg)
 
 	_, gasBase, errBase := evmBase.Call(
-		vm.AccountRef(baseCfg.Origin),
+		baseCfg.Origin,
 		contractAddr,
 		input,
 		gasLimit,
@@ -552,7 +552,7 @@ func runGasComparisonWithExactGas(t *testing.T, name string, code, input []byte,
 	)
 
 	_, gasMIR, errMIR := evmMIR.Call(
-		vm.AccountRef(mirCfg.Origin),
+		mirCfg.Origin,
 		contractAddr,
 		input,
 		gasLimit,

@@ -35,6 +35,8 @@ import (
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/event"
 	"github.com/ethereum/go-ethereum/miner/minerconfig"
+	"github.com/ethereum/go-ethereum/core/vm"
+	"github.com/ethereum/go-ethereum/internal/vmtest"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/holiman/uint256"
 )
@@ -167,6 +169,14 @@ func newTestWorker(t *testing.T, chainConfig *params.ChainConfig, engine consens
 }
 
 func TestGenerateAndImportBlock(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testGenerateAndImportBlock(t, vmCfg)
+		})
+	}
+}
+
+func testGenerateAndImportBlock(t *testing.T, vmCfg vm.Config) {
 	t.Parallel()
 	var (
 		db     = rawdb.NewMemoryDatabase()
@@ -179,7 +189,7 @@ func TestGenerateAndImportBlock(t *testing.T) {
 	defer w.close()
 
 	// This test chain imports the mined blocks.
-	chain, _ := core.NewBlockChain(rawdb.NewMemoryDatabase(), b.genesis, engine, nil)
+	chain, _ := core.NewBlockChain(rawdb.NewMemoryDatabase(), b.genesis, engine, core.DefaultConfig().WithVMConfig(vmCfg))
 	defer chain.Stop()
 
 	// Ignore empty commit here for less noise.

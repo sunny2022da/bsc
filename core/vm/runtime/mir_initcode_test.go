@@ -288,7 +288,7 @@ func runInitcodeComparison(t *testing.T, name string, initcode []byte) {
 
 	// Deploy with base EVM
 	retBase, addrBase, gasBase, errBase := evmBase.Create(
-		vm.AccountRef(baseCfg.Origin),
+		baseCfg.Origin,
 		initcode,
 		baseCfg.GasLimit,
 		uint256.MustFromBig(baseCfg.Value),
@@ -296,7 +296,7 @@ func runInitcodeComparison(t *testing.T, name string, initcode []byte) {
 
 	// Deploy with MIR
 	retMIR, addrMIR, gasMIR, errMIR := evmMIR.Create(
-		vm.AccountRef(mirCfg.Origin),
+		mirCfg.Origin,
 		initcode,
 		mirCfg.GasLimit,
 		uint256.MustFromBig(mirCfg.Value),
@@ -375,14 +375,14 @@ func runInitcodeComparisonExpectError(t *testing.T, name string, initcode []byte
 	evmMIR := NewEnv(mirCfg)
 
 	_, _, gasBase, errBase := evmBase.Create(
-		vm.AccountRef(baseCfg.Origin),
+		baseCfg.Origin,
 		initcode,
 		baseCfg.GasLimit,
 		uint256.MustFromBig(baseCfg.Value),
 	)
 
 	_, _, gasMIR, errMIR := evmMIR.Create(
-		vm.AccountRef(mirCfg.Origin),
+		mirCfg.Origin,
 		initcode,
 		mirCfg.GasLimit,
 		uint256.MustFromBig(mirCfg.Value),

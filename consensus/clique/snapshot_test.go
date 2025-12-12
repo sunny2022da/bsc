@@ -29,6 +29,8 @@ import (
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/core/vm"
+	"github.com/ethereum/go-ethereum/internal/vmtest"
 	"github.com/ethereum/go-ethereum/params"
 )
 
@@ -106,6 +108,14 @@ type cliqueTest struct {
 // Tests that Clique signer voting is evaluated correctly for various simple and
 // complex scenarios, as well as that a few special corner cases fail correctly.
 func TestClique(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testClique(t, vmCfg)
+		})
+	}
+}
+
+func testClique(t *testing.T, vmCfg vm.Config) {
 	// Define the various voting scenarios to test
 	tests := []cliqueTest{
 		{
@@ -457,7 +467,7 @@ func (tt *cliqueTest) run(t *testing.T) {
 		batches[len(batches)-1] = append(batches[len(batches)-1], block)
 	}
 	// Pass all the headers through clique and ensure tallying succeeds
-	chain, err := core.NewBlockChain(rawdb.NewMemoryDatabase(), genesis, engine, nil)
+	chain, err := core.NewBlockChain(rawdb.NewMemoryDatabase(), genesis, engine, core.DefaultConfig().WithVMConfig(vmCfg))
 	if err != nil {
 		t.Fatalf("failed to create test chain: %v", err)
 	}
