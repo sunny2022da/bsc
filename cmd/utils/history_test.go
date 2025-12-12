@@ -37,6 +37,9 @@ import (
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/trie"
 	"github.com/ethereum/go-ethereum/triedb"
+
+
+	"github.com/ethereum/go-ethereum/internal/vmtest"
 )
 
 var (
@@ -45,6 +48,14 @@ var (
 )
 
 func TestHistoryImportAndExport(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testHistoryImportAndExport(t, vmCfg)
+		})
+	}
+}
+
+func testHistoryImportAndExport(t *testing.T, vmCfg vm.Config) {
 	var (
 		key, _  = crypto.HexToECDSA("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291")
 		address = crypto.PubkeyToAddress(key.PublicKey)
@@ -78,7 +89,7 @@ func TestHistoryImportAndExport(t *testing.T) {
 	})
 
 	// Initialize BlockChain.
-	chain, err := core.NewBlockChain(db, nil, genesis, nil, ethash.NewFaker(), vm.Config{}, nil, nil)
+	chain, err := core.NewBlockChain(db, nil, genesis, nil, ethash.NewFaker(), vmCfg, nil, nil)
 	if err != nil {
 		t.Fatalf("unable to initialize chain: %v", err)
 	}
@@ -171,7 +182,7 @@ func TestHistoryImportAndExport(t *testing.T) {
 	})
 
 	genesis.MustCommit(db2, triedb.NewDatabase(db2, triedb.HashDefaults))
-	imported, err := core.NewBlockChain(db2, nil, genesis, nil, ethash.NewFaker(), vm.Config{}, nil, nil)
+	imported, err := core.NewBlockChain(db2, nil, genesis, nil, ethash.NewFaker(), vmCfg, nil, nil)
 	if err != nil {
 		t.Fatalf("unable to initialize chain: %v", err)
 	}

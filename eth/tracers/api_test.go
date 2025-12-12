@@ -47,6 +47,9 @@ import (
 	"github.com/ethereum/go-ethereum/internal/ethapi/override"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rpc"
+
+
+	"github.com/ethereum/go-ethereum/internal/vmtest"
 )
 
 var (
@@ -84,7 +87,7 @@ func newTestBackend(t *testing.T, n int, gspec *core.Genesis, generator func(i i
 		TriesInMemory:     128,
 		TrieDirtyDisabled: true, // Archive mode
 	}
-	chain, err := core.NewBlockChain(backend.chaindb, cacheConfig, gspec, nil, backend.engine, vm.Config{}, nil, nil)
+	chain, err := core.NewBlockChain(backend.chaindb, cacheConfig, gspec, nil, backend.engine, vmCfg, nil, nil)
 	if err != nil {
 		t.Fatalf("failed to create tester chain: %v", err)
 	}
@@ -174,7 +177,7 @@ func (b *testBackend) StateAtTransaction(ctx context.Context, block *types.Block
 	// Recompute transactions up to the target index.
 	signer := types.MakeSigner(b.chainConfig, block.Number(), block.Time())
 	context := core.NewEVMBlockContext(block.Header(), b.chain, nil)
-	evm := vm.NewEVM(context, statedb, b.chainConfig, vm.Config{})
+	evm := vm.NewEVM(context, statedb, b.chainConfig, vmCfg)
 	for idx, tx := range block.Transactions() {
 		if idx == txIndex {
 			return tx, context, statedb, release, nil
@@ -277,6 +280,14 @@ func TestStateHooks(t *testing.T) {
 }
 
 func TestTraceCall(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testTraceCall(t, vmCfg)
+		})
+	}
+}
+
+func testTraceCall(t *testing.T, vmCfg vm.Config) {
 	t.Parallel()
 
 	// Initialize test accounts
@@ -495,6 +506,14 @@ func TestTraceCall(t *testing.T) {
 }
 
 func TestTraceTransaction(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testTraceTransaction(t, vmCfg)
+		})
+	}
+}
+
+func testTraceTransaction(t *testing.T, vmCfg vm.Config) {
 	t.Parallel()
 
 	// Initialize test accounts
@@ -550,6 +569,14 @@ func TestTraceTransaction(t *testing.T) {
 }
 
 func TestTraceBlock(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testTraceBlock(t, vmCfg)
+		})
+	}
+}
+
+func testTraceBlock(t *testing.T, vmCfg vm.Config) {
 	t.Parallel()
 
 	// Initialize test accounts
@@ -640,6 +667,14 @@ func TestTraceBlock(t *testing.T) {
 }
 
 func TestTracingWithOverrides(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testTracingWithOverrides(t, vmCfg)
+		})
+	}
+}
+
+func testTracingWithOverrides(t *testing.T, vmCfg vm.Config) {
 	t.Parallel()
 	// Initialize test accounts
 	accounts := newAccounts(3)
@@ -1010,6 +1045,14 @@ func newStates(keys []common.Hash, vals []common.Hash) map[common.Hash]common.Ha
 }
 
 func TestTraceChain(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testTraceChain(t, vmCfg)
+		})
+	}
+}
+
+func testTraceChain(t *testing.T, vmCfg vm.Config) {
 	// Initialize test accounts
 	accounts := newAccounts(3)
 	genesis := &core.Genesis{
@@ -1104,7 +1147,7 @@ func newTestMergedBackend(t *testing.T, n int, gspec *core.Genesis, generator fu
 		SnapshotLimit:     0,
 		TrieDirtyDisabled: true, // Archive mode
 	}
-	chain, err := core.NewBlockChain(backend.chaindb, cacheConfig, gspec, nil, backend.engine, vm.Config{}, nil, nil)
+	chain, err := core.NewBlockChain(backend.chaindb, cacheConfig, gspec, nil, backend.engine, vmCfg, nil, nil)
 	if err != nil {
 		t.Fatalf("failed to create tester chain: %v", err)
 	}

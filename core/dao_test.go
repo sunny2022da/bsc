@@ -24,11 +24,22 @@ import (
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/params"
+
+
+	"github.com/ethereum/go-ethereum/internal/vmtest"
 )
 
 // Tests that DAO-fork enabled clients can properly filter out fork-commencing
 // blocks based on their extradata fields.
 func TestDAOForkRangeExtradata(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testDAOForkRangeExtradata(t, vmCfg)
+		})
+	}
+}
+
+func testDAOForkRangeExtradata(t *testing.T, vmCfg vm.Config) {
 	forkBlock := big.NewInt(32)
 	chainConfig := *params.NonActivatedConfig
 	chainConfig.HomesteadBlock = big.NewInt(0)
@@ -50,7 +61,7 @@ func TestDAOForkRangeExtradata(t *testing.T) {
 		BaseFee: big.NewInt(params.InitialBaseFee),
 		Config:  &proConf,
 	}
-	proBc, _ := NewBlockChain(proDb, nil, progspec, nil, ethash.NewFaker(), vm.Config{}, nil, nil)
+	proBc, _ := NewBlockChain(proDb, nil, progspec, nil, ethash.NewFaker(), vmCfg, nil, nil)
 	defer proBc.Stop()
 
 	conDb := rawdb.NewMemoryDatabase()
@@ -62,7 +73,7 @@ func TestDAOForkRangeExtradata(t *testing.T) {
 		BaseFee: big.NewInt(params.InitialBaseFee),
 		Config:  &conConf,
 	}
-	conBc, _ := NewBlockChain(conDb, nil, congspec, nil, ethash.NewFaker(), vm.Config{}, nil, nil)
+	conBc, _ := NewBlockChain(conDb, nil, congspec, nil, ethash.NewFaker(), vmCfg, nil, nil)
 	defer conBc.Stop()
 
 	if _, err := proBc.InsertChain(prefix); err != nil {
@@ -74,7 +85,7 @@ func TestDAOForkRangeExtradata(t *testing.T) {
 	// Try to expand both pro-fork and non-fork chains iteratively with other camp's blocks
 	for i := int64(0); i < params.DAOForkExtraRange.Int64(); i++ {
 		// Create a pro-fork block, and try to feed into the no-fork chain
-		bc, _ := NewBlockChain(rawdb.NewMemoryDatabase(), nil, congspec, nil, ethash.NewFaker(), vm.Config{}, nil, nil)
+		bc, _ := NewBlockChain(rawdb.NewMemoryDatabase(), nil, congspec, nil, ethash.NewFaker(), vmCfg, nil, nil)
 
 		blocks := conBc.GetBlocksFromHash(conBc.CurrentBlock().Hash(), int(conBc.CurrentBlock().Number.Uint64()))
 		for j := 0; j < len(blocks)/2; j++ {
@@ -97,7 +108,7 @@ func TestDAOForkRangeExtradata(t *testing.T) {
 			t.Fatalf("contra-fork chain didn't accepted no-fork block: %v", err)
 		}
 		// Create a no-fork block, and try to feed into the pro-fork chain
-		bc, _ = NewBlockChain(rawdb.NewMemoryDatabase(), nil, progspec, nil, ethash.NewFaker(), vm.Config{}, nil, nil)
+		bc, _ = NewBlockChain(rawdb.NewMemoryDatabase(), nil, progspec, nil, ethash.NewFaker(), vmCfg, nil, nil)
 
 		blocks = proBc.GetBlocksFromHash(proBc.CurrentBlock().Hash(), int(proBc.CurrentBlock().Number.Uint64()))
 		for j := 0; j < len(blocks)/2; j++ {
@@ -121,7 +132,7 @@ func TestDAOForkRangeExtradata(t *testing.T) {
 		}
 	}
 	// Verify that contra-forkers accept pro-fork extra-datas after forking finishes
-	bc, _ := NewBlockChain(rawdb.NewMemoryDatabase(), nil, congspec, nil, ethash.NewFaker(), vm.Config{}, nil, nil)
+	bc, _ := NewBlockChain(rawdb.NewMemoryDatabase(), nil, congspec, nil, ethash.NewFaker(), vmCfg, nil, nil)
 	defer bc.Stop()
 
 	blocks := conBc.GetBlocksFromHash(conBc.CurrentBlock().Hash(), int(conBc.CurrentBlock().Number.Uint64()))
@@ -139,7 +150,7 @@ func TestDAOForkRangeExtradata(t *testing.T) {
 		t.Fatalf("contra-fork chain didn't accept pro-fork block post-fork: %v", err)
 	}
 	// Verify that pro-forkers accept contra-fork extra-datas after forking finishes
-	bc, _ = NewBlockChain(rawdb.NewMemoryDatabase(), nil, progspec, nil, ethash.NewFaker(), vm.Config{}, nil, nil)
+	bc, _ = NewBlockChain(rawdb.NewMemoryDatabase(), nil, progspec, nil, ethash.NewFaker(), vmCfg, nil, nil)
 	defer bc.Stop()
 
 	blocks = proBc.GetBlocksFromHash(proBc.CurrentBlock().Hash(), int(proBc.CurrentBlock().Number.Uint64()))

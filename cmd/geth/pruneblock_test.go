@@ -43,6 +43,9 @@ import (
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/triedb"
+
+
+	"github.com/ethereum/go-ethereum/internal/vmtest"
 )
 
 var (
@@ -64,6 +67,14 @@ var (
 )
 
 func TestOfflineBlockPrune(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testOfflineBlockPrune(t, vmCfg)
+		})
+	}
+}
+
+func testOfflineBlockPrune(t *testing.T, vmCfg vm.Config) {
 	//Corner case for 0 remain in ancinetStore.
 	testOfflineBlockPruneWithAmountReserved(t, 0)
 	//General case.
@@ -163,7 +174,7 @@ func BlockchainCreator(t *testing.T, chaindbPath, AncientPath string, blockRemai
 	}
 	genesis := gspec.MustCommit(db, triedb)
 	// Initialize a fresh chain with only a genesis block
-	blockchain, err := core.NewBlockChain(db, config, gspec, nil, engine, vm.Config{}, nil, nil)
+	blockchain, err := core.NewBlockChain(db, config, gspec, nil, engine, vmCfg, nil, nil)
 	if err != nil {
 		t.Fatalf("Failed to create chain: %v", err)
 	}

@@ -17,6 +17,9 @@ import (
 	"github.com/ethereum/go-ethereum/p2p/enode"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/triedb"
+
+
+	"github.com/ethereum/go-ethereum/internal/vmtest"
 )
 
 var (
@@ -37,13 +40,13 @@ type testBackend struct {
 }
 
 // newTestBackend creates an empty chain and wraps it into a mock backend.
-func newTestBackend(blocks int) *testBackend {
-	return newTestBackendWithGenerator(blocks)
+func newTestBackend(blocks int, vmCfg vm.Config) *testBackend {
+	return newTestBackendWithGenerator(blocks, vmCfg)
 }
 
 // newTestBackend creates a chain with a number of explicitly defined blocks and
 // wraps it into a mock backend.
-func newTestBackendWithGenerator(blocks int) *testBackend {
+func newTestBackendWithGenerator(blocks int, vmCfg vm.Config) *testBackend {
 	signer := types.HomesteadSigner{}
 	db := rawdb.NewMemoryDatabase()
 	engine := clique.New(params.AllCliqueProtocolChanges.Clique, db)
@@ -56,7 +59,7 @@ func newTestBackendWithGenerator(blocks int) *testBackend {
 	copy(genspec.ExtraData[32:], testAddr[:])
 	genesis := genspec.MustCommit(db, triedb.NewDatabase(db, nil))
 
-	chain, _ := core.NewBlockChain(db, nil, genspec, nil, engine, vm.Config{}, nil, nil)
+	chain, _ := core.NewBlockChain(db, nil, genspec, nil, engine, vmCfg, nil, nil)
 	generator := func(i int, block *core.BlockGen) {
 		// The chain maker doesn't have access to a chain, so the difficulty will be
 		// lets unset (nil). Set it here to the correct value.
@@ -119,13 +122,19 @@ func (b *testBackend) Handle(*Peer, Packet) error {
 	panic("data processing tests should be done in the handler package")
 }
 
-func TestRequestRoot(t *testing.T) { testRequestRoot(t, Trust1) }
+func TestRequestRoot(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testRequestRoot(t, Trust1, vmCfg)
+		})
+	}
+}
 
-func testRequestRoot(t *testing.T, protocol uint) {
+func testRequestRoot(t *testing.T, protocol uint, vmCfg vm.Config) {
 	t.Parallel()
 
 	blockNum := 1032 // The latest 1024 blocks' DiffLayer will be cached.
-	backend := newTestBackend(blockNum)
+	backend := newTestBackend(blockNum, vmCfg)
 	defer backend.close()
 
 	peer, _ := newTestPeer("peer", protocol, backend)

@@ -41,6 +41,9 @@ import (
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rpc"
 	"github.com/ethereum/go-ethereum/triedb"
+
+
+	"github.com/ethereum/go-ethereum/internal/vmtest"
 )
 
 // Verify that Client implements the ethereum interfaces.
@@ -182,9 +185,9 @@ type testBlockParam struct {
 	txs     []testTransactionParam
 }
 
-func newTestBackend(config *node.Config) (*node.Node, []*types.Block, error) {
+func newTestBackend(config *node.Config, vmCfg vm.Config) (*node.Node, []*types.Block, error) {
 	// Generate test chain.
-	blocks := generateTestChain()
+	blocks := generateTestChain(vmCfg)
 
 	// Create node
 	if config == nil {
@@ -219,12 +222,12 @@ func newTestBackend(config *node.Config) (*node.Node, []*types.Block, error) {
 	return n, blocks, nil
 }
 
-func generateTestChain() []*types.Block {
+func generateTestChain(vmCfg vm.Config) []*types.Block {
 	signer := types.HomesteadSigner{}
 	// Create a database pre-initialize with a genesis block
 	db := rawdb.NewMemoryDatabase()
 	genesis.MustCommit(db, triedb.NewDatabase(db, nil))
-	chain, _ := core.NewBlockChain(db, nil, genesis, nil, ethash.NewFaker(), vm.Config{}, nil, nil, core.EnablePersistDiff(860000))
+	chain, _ := core.NewBlockChain(db, nil, genesis, nil, ethash.NewFaker(), vmCfg, nil, nil, core.EnablePersistDiff(860000))
 	generate := func(i int, block *core.BlockGen) {
 		block.OffsetTime(5)
 		block.SetExtra([]byte("test"))
@@ -272,7 +275,15 @@ func generateTestChain() []*types.Block {
 }
 
 func TestEthClient(t *testing.T) {
-	backend, chain, err := newTestBackend(nil)
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testEthClient(t, vmCfg)
+		})
+	}
+}
+
+func testEthClient(t *testing.T, vmCfg vm.Config) {
+	backend, chain, err := newTestBackend(nil, vmCfg)
 	if err != nil {
 		t.Fatal(err)
 	}

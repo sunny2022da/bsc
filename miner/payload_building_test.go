@@ -27,6 +27,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/params"
+	"github.com/ethereum/go-ethereum/core/vm"
 )
 
 func TestBuildPayload(t *testing.T) {
@@ -35,7 +36,7 @@ func TestBuildPayload(t *testing.T) {
 		db        = rawdb.NewMemoryDatabase()
 		recipient = common.HexToAddress("0xdeadbeef")
 	)
-	w, b := newTestWorker(t, params.TestChainConfig, ethash.NewFaker(), db, 0)
+	w, b := newTestWorker(t, params.TestChainConfig, ethash.NewFaker(), db, 0, vm.Config{})
 	defer w.close()
 
 	timestamp := uint64(time.Now().Unix())

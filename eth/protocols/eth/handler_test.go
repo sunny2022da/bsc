@@ -45,6 +45,9 @@ import (
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/holiman/uint256"
+
+
+	"github.com/ethereum/go-ethereum/internal/vmtest"
 )
 
 var (
@@ -67,13 +70,13 @@ type testBackend struct {
 }
 
 // newTestBackend creates an empty chain and wraps it into a mock backend.
-func newTestBackend(blocks int) *testBackend {
-	return newTestBackendWithGenerator(blocks, false, nil)
+func newTestBackend(blocks int, vmCfg vm.Config) *testBackend {
+	return newTestBackendWithGenerator(blocks, false, nil, vmCfg)
 }
 
 // newTestBackendWithGenerator creates a chain with a number of explicitly defined blocks and
 // wraps it into a mock backend.
-func newTestBackendWithGenerator(blocks int, shanghai bool, generator func(int, *core.BlockGen)) *testBackend {
+func newTestBackendWithGenerator(blocks int, shanghai bool, generator func(int, *core.BlockGen), vmCfg vm.Config) *testBackend {
 	var (
 		// Create a database pre-initialize with a genesis block
 		db                      = rawdb.NewMemoryDatabase()
@@ -110,7 +113,7 @@ func newTestBackendWithGenerator(blocks int, shanghai bool, generator func(int, 
 		Config: config,
 		Alloc:  types.GenesisAlloc{testAddr: {Balance: big.NewInt(100_000_000_000_000_000)}},
 	}
-	chain, _ := core.NewBlockChain(db, nil, gspec, nil, engine, vm.Config{}, nil, nil)
+	chain, _ := core.NewBlockChain(db, nil, gspec, nil, engine, vmCfg, nil, nil)
 
 	_, bs, _ := core.GenerateChainWithGenesis(gspec, engine, blocks, generator)
 	if _, err := chain.InsertChain(bs); err != nil {
@@ -158,12 +161,20 @@ func (b *testBackend) Handle(*Peer, Packet) error {
 }
 
 // Tests that block headers can be retrieved from a remote chain based on user queries.
-func TestGetBlockHeaders68(t *testing.T) { testGetBlockHeaders(t, ETH68) }
+func TestGetBlockHeaders68(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testGetBlockHeaders68(t, vmCfg)
+		})
+	}
+}
 
-func testGetBlockHeaders(t *testing.T, protocol uint) {
+func testGetBlockHeaders68(t *testing.T, vmCfg vm.Config) { testGetBlockHeaders(t, ETH68, vmCfg) }
+
+func testGetBlockHeaders(t *testing.T, protocol uint, vmCfg vm.Config) {
 	t.Parallel()
 
-	backend := newTestBackend(maxHeadersServe + 15)
+	backend := newTestBackend(maxHeadersServe + 15, vmCfg)
 	defer backend.close()
 
 	peer, _ := newTestPeer("peer", protocol, backend)
@@ -371,9 +382,17 @@ func testGetBlockHeaders(t *testing.T, protocol uint) {
 }
 
 // Tests that block contents can be retrieved from a remote chain based on their hashes.
-func TestGetBlockBodies68(t *testing.T) { testGetBlockBodies(t, ETH68) }
+func TestGetBlockBodies68(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testGetBlockBodies68(t, vmCfg)
+		})
+	}
+}
 
-func testGetBlockBodies(t *testing.T, protocol uint) {
+func testGetBlockBodies68(t *testing.T, vmCfg vm.Config) { testGetBlockBodies(t, ETH68, vmCfg) }
+
+func testGetBlockBodies(t *testing.T, protocol uint, vmCfg vm.Config) {
 	t.Parallel()
 
 	gen := func(n int, g *core.BlockGen) {
@@ -386,7 +405,7 @@ func testGetBlockBodies(t *testing.T, protocol uint) {
 		}
 	}
 
-	backend := newTestBackendWithGenerator(maxBodiesServe+15, true, gen)
+	backend := newTestBackendWithGenerator(maxBodiesServe+15, true, gen, vm.Config{})
 	defer backend.close()
 
 	peer, _ := newTestPeer("peer", protocol, backend)
@@ -465,9 +484,17 @@ func testGetBlockBodies(t *testing.T, protocol uint) {
 }
 
 // Tests that the transaction receipts can be retrieved based on hashes.
-func TestGetBlockReceipts68(t *testing.T) { testGetBlockReceipts(t, ETH68) }
+func TestGetBlockReceipts68(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testGetBlockReceipts68(t, vmCfg)
+		})
+	}
+}
 
-func testGetBlockReceipts(t *testing.T, protocol uint) {
+func testGetBlockReceipts68(t *testing.T, vmCfg vm.Config) { testGetBlockReceipts(t, ETH68, vmCfg) }
+
+func testGetBlockReceipts(t *testing.T, protocol uint, vmCfg vm.Config) {
 	t.Parallel()
 
 	// Define three accounts to simulate transactions with
@@ -506,7 +533,7 @@ func testGetBlockReceipts(t *testing.T, protocol uint) {
 		}
 	}
 	// Assemble the test environment
-	backend := newTestBackendWithGenerator(4, false, generator)
+	backend := newTestBackendWithGenerator(4, false, generator, vmCfg)
 	defer backend.close()
 
 	peer, _ := newTestPeer("peer", protocol, backend)
@@ -583,7 +610,7 @@ func setup() (*testBackend, *testPeer) {
 			block.SetExtra([]byte("yeehaw"))
 		}
 	}
-	backend := newTestBackendWithGenerator(maxBodiesServe+15, true, gen)
+	backend := newTestBackendWithGenerator(maxBodiesServe+15, true, gen, vm.Config{})
 	peer, _ := newTestPeer("peer", ETH68, backend)
 	// Discard all messages
 	go func() {
@@ -622,7 +649,7 @@ func TestHandleNewBlock(t *testing.T) {
 		}
 	}
 
-	backend := newTestBackendWithGenerator(maxBodiesServe+15, true, gen)
+	backend := newTestBackendWithGenerator(maxBodiesServe+15, true, gen, vm.Config{})
 	defer backend.close()
 
 	peer, _ := newTestPeer("peer", ETH68, backend)

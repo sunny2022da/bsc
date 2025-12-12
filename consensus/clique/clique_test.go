@@ -28,6 +28,9 @@ import (
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/params"
+
+
+	"github.com/ethereum/go-ethereum/internal/vmtest"
 )
 
 // This test case is a repro of an annoying bug that took us forever to catch.
@@ -37,6 +40,14 @@ import (
 // The bug was that processing the block *prior* to an empty one **also
 // completes** the empty one, ending up in a known-block error.
 func TestReimportMirroredState(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testReimportMirroredState(t, vmCfg)
+		})
+	}
+}
+
+func testReimportMirroredState(t *testing.T, vmCfg vm.Config) {
 	// Initialize a Clique chain with a single signer
 	var (
 		db     = rawdb.NewMemoryDatabase()
@@ -56,7 +67,7 @@ func TestReimportMirroredState(t *testing.T) {
 	copy(genspec.ExtraData[extraVanity:], addr[:])
 
 	// Generate a batch of blocks, each properly signed
-	chain, _ := core.NewBlockChain(rawdb.NewMemoryDatabase(), nil, genspec, nil, engine, vm.Config{}, nil, nil)
+	chain, _ := core.NewBlockChain(rawdb.NewMemoryDatabase(), nil, genspec, nil, engine, vmCfg, nil, nil)
 	defer chain.Stop()
 
 	_, blocks, _ := core.GenerateChainWithGenesis(genspec, engine, 3, func(i int, block *core.BlockGen) {
@@ -93,7 +104,7 @@ func TestReimportMirroredState(t *testing.T) {
 	}
 	// Insert the first two blocks and make sure the chain is valid
 	db = rawdb.NewMemoryDatabase()
-	chain, _ = core.NewBlockChain(db, nil, genspec, nil, engine, vm.Config{}, nil, nil)
+	chain, _ = core.NewBlockChain(db, nil, genspec, nil, engine, vmCfg, nil, nil)
 	defer chain.Stop()
 
 	if _, err := chain.InsertChain(blocks[:2]); err != nil {
@@ -106,7 +117,7 @@ func TestReimportMirroredState(t *testing.T) {
 	// Simulate a crash by creating a new chain on top of the database, without
 	// flushing the dirty states out. Insert the last block, triggering a sidechain
 	// reimport.
-	chain, _ = core.NewBlockChain(db, nil, genspec, nil, engine, vm.Config{}, nil, nil)
+	chain, _ = core.NewBlockChain(db, nil, genspec, nil, engine, vmCfg, nil, nil)
 	defer chain.Stop()
 
 	if _, err := chain.InsertChain(blocks[2:]); err != nil {
@@ -118,6 +129,14 @@ func TestReimportMirroredState(t *testing.T) {
 }
 
 func TestSealHash(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testSealHash(t, vmCfg)
+		})
+	}
+}
+
+func testSealHash(t *testing.T, vmCfg vm.Config) {
 	have := SealHash(&types.Header{
 		Difficulty: new(big.Int),
 		Number:     new(big.Int),

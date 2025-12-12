@@ -18,6 +18,7 @@ package ethclient_test
 
 import (
 	"github.com/ethereum/go-ethereum/node"
+	"github.com/ethereum/go-ethereum/core/vm"
 )
 
 var exampleNode *node.Node
@@ -27,7 +28,7 @@ func init() {
 	config := &node.Config{
 		HTTPHost: "127.0.0.1",
 	}
-	n, _, err := newTestBackend(config)
+	n, _, err := newTestBackend(config, vm.Config{})
 	if err != nil {
 		panic("can't launch node: " + err.Error())
 	}

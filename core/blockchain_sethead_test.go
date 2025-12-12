@@ -40,6 +40,9 @@ import (
 	"github.com/ethereum/go-ethereum/triedb"
 	"github.com/ethereum/go-ethereum/triedb/hashdb"
 	"github.com/ethereum/go-ethereum/triedb/pathdb"
+
+
+	"github.com/ethereum/go-ethereum/internal/vmtest"
 )
 
 // rewindTest is a test case for chain rollback upon user request.
@@ -1957,12 +1960,17 @@ func testLongReorgedSnapSyncingDeepSetHead(t *testing.T, snapshots bool) {
 }
 
 func testSetHead(t *testing.T, tt *rewindTest, snapshots bool) {
-	for _, scheme := range []string{rawdb.HashScheme, rawdb.PathScheme} {
-		testSetHeadWithScheme(t, tt, snapshots, scheme)
+	for _, vmCfg := range vmtest.Configs() {
+		for _, scheme := range []string{rawdb.HashScheme, rawdb.PathScheme} {
+			name := vmtest.Name(vmCfg) + "/" + scheme
+			t.Run(name, func(t *testing.T) {
+				testSetHeadWithScheme(t, tt, snapshots, scheme, vmCfg)
+			})
+		}
 	}
 }
 
-func testSetHeadWithScheme(t *testing.T, tt *rewindTest, snapshots bool, scheme string) {
+func testSetHeadWithScheme(t *testing.T, tt *rewindTest, snapshots bool, scheme string, vmCfg vm.Config) {
 	// It's hard to follow the test case, visualize the input
 	// log.SetDefault(log.NewLogger(log.NewTerminalHandlerWithLevel(os.Stderr, log.LevelInfo, true)))
 	// fmt.Println(tt.dump(false))
@@ -2008,7 +2016,7 @@ func testSetHeadWithScheme(t *testing.T, tt *rewindTest, snapshots bool, scheme 
 	}); err != nil {
 		t.Fatalf("Failed to create chain: %v", err)
 	}
-	chain, err := NewBlockChain(db, config, gspec, nil, engine, vm.Config{}, nil, nil)
+	chain, err := NewBlockChain(db, config, gspec, nil, engine, vmCfg, nil, nil)
 	if err != nil {
 		t.Fatalf("Failed to create chain: %v", err)
 	}

@@ -38,6 +38,9 @@ import (
 	"github.com/ethereum/go-ethereum/p2p"
 	"github.com/ethereum/go-ethereum/p2p/enode"
 	"github.com/ethereum/go-ethereum/params"
+
+
+	"github.com/ethereum/go-ethereum/internal/vmtest"
 )
 
 // testEthHandler is a mock event handler to listen for inbound network requests
@@ -79,7 +82,15 @@ func (h *testEthHandler) Handle(peer *eth.Peer, packet eth.Packet) error {
 
 // Tests that peers are correctly accepted (or rejected) based on the advertised
 // fork IDs in the protocol handshake.
-func TestForkIDSplit68(t *testing.T) { testForkIDSplit(t, eth.ETH68) }
+func TestForkIDSplit68(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testForkIDSplit68(t, vmCfg)
+		})
+	}
+}
+
+func testForkIDSplit68(t *testing.T, vmCfg vm.Config) { testForkIDSplit(t, eth.ETH68) }
 
 func testForkIDSplit(t *testing.T, protocol uint) {
 	t.Parallel()
@@ -116,8 +127,8 @@ func testForkIDSplit(t *testing.T, protocol uint) {
 		gspecNoFork  = &core.Genesis{Config: configNoFork}
 		gspecProFork = &core.Genesis{Config: configProFork}
 
-		chainNoFork, _  = core.NewBlockChain(dbNoFork, nil, gspecNoFork, nil, engine, vm.Config{}, nil, nil)
-		chainProFork, _ = core.NewBlockChain(dbProFork, nil, gspecProFork, nil, engine, vm.Config{}, nil, nil)
+		chainNoFork, _  = core.NewBlockChain(dbNoFork, nil, gspecNoFork, nil, engine, vmCfg, nil, nil)
+		chainProFork, _ = core.NewBlockChain(dbProFork, nil, gspecProFork, nil, engine, vmCfg, nil, nil)
 
 		_, blocksNoFork, _  = core.GenerateChainWithGenesis(gspecNoFork, engine, 2, nil)
 		_, blocksProFork, _ = core.GenerateChainWithGenesis(gspecProFork, engine, 2, nil)
@@ -248,13 +259,21 @@ func testForkIDSplit(t *testing.T, protocol uint) {
 }
 
 // Tests that received transactions are added to the local pool.
-func TestRecvTransactions68(t *testing.T) { testRecvTransactions(t, eth.ETH68) }
+func TestRecvTransactions68(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testRecvTransactions68(t, vmCfg)
+		})
+	}
+}
+
+func testRecvTransactions68(t *testing.T, vmCfg vm.Config) { testRecvTransactions(t, eth.ETH68) }
 
 func testRecvTransactions(t *testing.T, protocol uint) {
 	t.Parallel()
 
 	// Create a message handler, configure it to accept transactions and watch them
-	handler := newTestHandler()
+	handler := newTestHandler(vmCfg)
 	defer handler.close()
 
 	handler.handler.acceptTxs.Store(true) // mark synced to accept transactions
@@ -304,13 +323,21 @@ func testRecvTransactions(t *testing.T, protocol uint) {
 	}
 }
 
-func TestWaitSnapExtensionTimout68(t *testing.T) { testWaitSnapExtensionTimout(t, eth.ETH68) }
+func TestWaitSnapExtensionTimout68(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testWaitSnapExtensionTimout68(t, vmCfg)
+		})
+	}
+}
+
+func testWaitSnapExtensionTimout68(t *testing.T, vmCfg vm.Config) { testWaitSnapExtensionTimout(t, eth.ETH68) }
 
 func testWaitSnapExtensionTimout(t *testing.T, protocol uint) {
 	t.Parallel()
 
 	// Create a message handler, configure it to accept transactions and watch them
-	handler := newTestHandler()
+	handler := newTestHandler(vmCfg)
 	defer handler.close()
 
 	// Create a source peer to send messages through and a sink handler to receive them
@@ -341,13 +368,21 @@ func testWaitSnapExtensionTimout(t *testing.T, protocol uint) {
 	}
 }
 
-func TestWaitBscExtensionTimout68(t *testing.T) { testWaitBscExtensionTimout(t, eth.ETH68) }
+func TestWaitBscExtensionTimout68(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testWaitBscExtensionTimout68(t, vmCfg)
+		})
+	}
+}
+
+func testWaitBscExtensionTimout68(t *testing.T, vmCfg vm.Config) { testWaitBscExtensionTimout(t, eth.ETH68) }
 
 func testWaitBscExtensionTimout(t *testing.T, protocol uint) {
 	t.Parallel()
 
 	// Create a message handler, configure it to accept transactions and watch them
-	handler := newTestHandler()
+	handler := newTestHandler(vmCfg)
 	defer handler.close()
 
 	// Create a source peer to send messages through and a sink handler to receive them
@@ -379,13 +414,21 @@ func testWaitBscExtensionTimout(t *testing.T, protocol uint) {
 }
 
 // This test checks that pending transactions are sent.
-func TestSendTransactions68(t *testing.T) { testSendTransactions(t, eth.ETH68) }
+func TestSendTransactions68(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testSendTransactions68(t, vmCfg)
+		})
+	}
+}
+
+func testSendTransactions68(t *testing.T, vmCfg vm.Config) { testSendTransactions(t, eth.ETH68) }
 
 func testSendTransactions(t *testing.T, protocol uint) {
 	t.Parallel()
 
 	// Create a message handler and fill the pool with big transactions
-	handler := newTestHandler()
+	handler := newTestHandler(vmCfg)
 	defer handler.close()
 
 	insert := make([]*types.Transaction, 100)
@@ -463,7 +506,15 @@ func testSendTransactions(t *testing.T, protocol uint) {
 
 // Tests that transactions get propagated to all attached peers, either via direct
 // broadcasts or via announcements/retrievals.
-func TestTransactionPropagation68(t *testing.T) { testTransactionPropagation(t, eth.ETH68) }
+func TestTransactionPropagation68(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testTransactionPropagation68(t, vmCfg)
+		})
+	}
+}
+
+func testTransactionPropagation68(t *testing.T, vmCfg vm.Config) { testTransactionPropagation(t, eth.ETH68) }
 
 func testTransactionPropagation(t *testing.T, protocol uint) {
 	t.Parallel()
@@ -471,13 +522,13 @@ func testTransactionPropagation(t *testing.T, protocol uint) {
 	// Create a source handler to send transactions from and a number of sinks
 	// to receive them. We need multiple sinks since a one-to-one peering would
 	// broadcast all transactions without announcement.
-	source := newTestHandler()
+	source := newTestHandler(vmCfg)
 	source.handler.snapSync.Store(false) // Avoid requiring snap, otherwise some will be dropped below
 	defer source.close()
 
 	sinks := make([]*testHandler, 10)
 	for i := 0; i < len(sinks); i++ {
-		sinks[i] = newTestHandler()
+		sinks[i] = newTestHandler(vmCfg)
 		defer sinks[i].close()
 
 		sinks[i].handler.acceptTxs.Store(true) // mark synced to accept transactions
@@ -533,14 +584,22 @@ func testTransactionPropagation(t *testing.T, protocol uint) {
 
 // Tests that local pending transactions get propagated to peers.
 func TestTransactionPendingReannounce(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testTransactionPendingReannounce(t, vmCfg)
+		})
+	}
+}
+
+func testTransactionPendingReannounce(t *testing.T, vmCfg vm.Config) {
 	t.Parallel()
 
 	// Create a source handler to announce transactions from and a sink handler
 	// to receive them.
-	source := newTestHandler()
+	source := newTestHandler(vmCfg)
 	defer source.close()
 
-	sink := newTestHandler()
+	sink := newTestHandler(vmCfg)
 	defer sink.close()
 	sink.handler.acceptTxs.Store(true) // mark synced to accept transactions
 
@@ -594,14 +653,22 @@ func TestBroadcastBlock8Peers(t *testing.T)   { testBroadcastBlock(t, 9, 3) }
 func TestBroadcastBlock12Peers(t *testing.T)  { testBroadcastBlock(t, 12, 3) }
 func TestBroadcastBlock16Peers(t *testing.T)  { testBroadcastBlock(t, 16, 4) }
 func TestBroadcastBloc26Peers(t *testing.T)   { testBroadcastBlock(t, 26, 5) }
-func TestBroadcastBlock100Peers(t *testing.T) { testBroadcastBlock(t, 100, 10) }
+func TestBroadcastBlock100Peers(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testBroadcastBlock100Peers(t, vmCfg)
+		})
+	}
+}
+
+func testBroadcastBlock100Peers(t *testing.T, vmCfg vm.Config) { testBroadcastBlock(t, 100, 10) }
 
 func testBroadcastBlock(t *testing.T, peers, bcasts int) {
 	t.Parallel()
 
 	// Create a source handler to broadcast blocks from and a number of sinks
 	// to receive them.
-	source := newTestHandlerWithBlocks(1)
+	source := newTestHandlerWithBlocks(1, vmCfg)
 	defer source.close()
 
 	sinks := make([]*testEthHandler, peers)
@@ -673,14 +740,22 @@ func testBroadcastBlock(t *testing.T, peers, bcasts int) {
 
 // Tests that a propagated malformed block (uncles or transactions don't match
 // with the hashes in the header) gets discarded and not broadcast forward.
-func TestBroadcastMalformedBlock68(t *testing.T) { testBroadcastMalformedBlock(t, eth.ETH68) }
+func TestBroadcastMalformedBlock68(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testBroadcastMalformedBlock68(t, vmCfg)
+		})
+	}
+}
+
+func testBroadcastMalformedBlock68(t *testing.T, vmCfg vm.Config) { testBroadcastMalformedBlock(t, eth.ETH68) }
 
 func testBroadcastMalformedBlock(t *testing.T, protocol uint) {
 	t.Parallel()
 
 	// Create a source handler to broadcast blocks from and a number of sinks
 	// to receive them.
-	source := newTestHandlerWithBlocks(1)
+	source := newTestHandlerWithBlocks(1, vmCfg)
 	defer source.close()
 
 	// Create a source handler to send messages through and a sink peer to receive them
@@ -741,9 +816,17 @@ func testBroadcastMalformedBlock(t *testing.T, protocol uint) {
 }
 
 func TestOptionMaxPeersPerIP(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testOptionMaxPeersPerIP(t, vmCfg)
+		})
+	}
+}
+
+func testOptionMaxPeersPerIP(t *testing.T, vmCfg vm.Config) {
 	t.Parallel()
 
-	handler := newTestHandler()
+	handler := newTestHandler(vmCfg)
 	defer handler.close()
 	var (
 		genesis       = handler.chain.Genesis()

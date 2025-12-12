@@ -29,6 +29,9 @@ import (
 	"github.com/ethereum/go-ethereum/triedb"
 	"github.com/holiman/uint256"
 	"golang.org/x/crypto/sha3"
+
+
+	"github.com/ethereum/go-ethereum/internal/vmtest"
 )
 
 const (
@@ -36,6 +39,14 @@ const (
 )
 
 func TestImpactOfValidatorOutOfService(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testImpactOfValidatorOutOfService(t, vmCfg)
+		})
+	}
+}
+
+func testImpactOfValidatorOutOfService(t *testing.T, vmCfg vm.Config) {
 	testCases := []struct {
 		totalValidators int
 		downValidators  int
@@ -612,6 +623,14 @@ var simulatorTestcases = []*TestSimulatorParam{
 }
 
 func TestSimulateP2P(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testSimulateP2P(t, vmCfg)
+		})
+	}
+}
+
+func testSimulateP2P(t *testing.T, vmCfg vm.Config) {
 	for index, testcase := range simulatorTestcases {
 		c := NewCoordinator(testcase.validatorsNumber)
 		err := c.SimulateP2P(testcase.cs)
@@ -640,6 +659,14 @@ var (
 )
 
 func TestParlia_applyTransactionTracing(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testParlia_applyTransactionTracing(t, vmCfg)
+		})
+	}
+}
+
+func testParlia_applyTransactionTracing(t *testing.T, vmCfg vm.Config) {
 	frdir := t.TempDir()
 	db, err := rawdb.NewDatabaseWithFreezer(rawdb.NewMemoryDatabase(), frdir, "", false, false, false, false, false)
 	if err != nil {
@@ -658,7 +685,7 @@ func TestParlia_applyTransactionTracing(t *testing.T) {
 	mockEngine := &mockParlia{}
 	genesisBlock := gspec.MustCommit(db, trieDB)
 
-	chain, _ := core.NewBlockChain(db, nil, gspec, nil, mockEngine, vm.Config{}, nil, nil)
+	chain, _ := core.NewBlockChain(db, nil, gspec, nil, mockEngine, vmCfg, nil, nil)
 	signer := types.LatestSigner(config)
 
 	bs, _ := core.GenerateChain(config, genesisBlock, mockEngine, db, 1, func(i int, gen *core.BlockGen) {

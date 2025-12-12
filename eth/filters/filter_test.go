@@ -35,6 +35,9 @@ import (
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rpc"
 	"github.com/ethereum/go-ethereum/triedb"
+
+
+	"github.com/ethereum/go-ethereum/internal/vmtest"
 )
 
 func makeReceipt(addr common.Address) *types.Receipt {
@@ -108,6 +111,14 @@ func BenchmarkFilters(b *testing.B) {
 }
 
 func TestFilters(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testFilters(t, vmCfg)
+		})
+	}
+}
+
+func testFilters(t *testing.T, vmCfg vm.Config) {
 	var (
 		db     = rawdb.NewMemoryDatabase()
 		_, sys = newTestFilterSystem(t, db, Config{})
@@ -250,7 +261,7 @@ func TestFilters(t *testing.T) {
 		}
 	})
 	var l uint64
-	bc, err := core.NewBlockChain(db, nil, gspec, nil, ethash.NewFaker(), vm.Config{}, nil, &l)
+	bc, err := core.NewBlockChain(db, nil, gspec, nil, ethash.NewFaker(), vmCfg, nil, &l)
 	if err != nil {
 		t.Fatal(err)
 	}

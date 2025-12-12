@@ -35,6 +35,9 @@ import (
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/ethdb/pebble"
 	"github.com/ethereum/go-ethereum/params"
+
+
+	"github.com/ethereum/go-ethereum/internal/vmtest"
 )
 
 // Tests a recovery for a short canonical chain where a recent block was already
@@ -1753,12 +1756,17 @@ func testLongReorgedSnapSyncingDeepRepair(t *testing.T, snapshots bool) {
 }
 
 func testRepair(t *testing.T, tt *rewindTest, snapshots bool) {
-	for _, scheme := range []string{rawdb.HashScheme, rawdb.PathScheme} {
-		testRepairWithScheme(t, tt, snapshots, scheme)
+	for _, vmCfg := range vmtest.Configs() {
+		for _, scheme := range []string{rawdb.HashScheme, rawdb.PathScheme} {
+			name := vmtest.Name(vmCfg) + "/" + scheme
+			t.Run(name, func(t *testing.T) {
+				testRepairWithScheme(t, tt, snapshots, scheme, vmCfg)
+			})
+		}
 	}
 }
 
-func testRepairWithScheme(t *testing.T, tt *rewindTest, snapshots bool, scheme string) {
+func testRepairWithScheme(t *testing.T, tt *rewindTest, snapshots bool, scheme string, vmCfg vm.Config) {
 	// It's hard to follow the test case, visualize the input
 	// log.SetDefault(log.NewLogger(log.NewTerminalHandlerWithLevel(os.Stderr, log.LevelInfo, true)))
 	// fmt.Println(tt.dump(false))
@@ -1805,7 +1813,7 @@ func testRepairWithScheme(t *testing.T, tt *rewindTest, snapshots bool, scheme s
 	}); err != nil {
 		t.Fatalf("Failed to create chain: %v", err)
 	}
-	chain, err := NewBlockChain(db, config, gspec, nil, engine, vm.Config{}, nil, nil)
+	chain, err := NewBlockChain(db, config, gspec, nil, engine, vmCfg, nil, nil)
 	if err != nil {
 		t.Fatalf("Failed to create chain: %v", err)
 	}
@@ -1871,7 +1879,7 @@ func testRepairWithScheme(t *testing.T, tt *rewindTest, snapshots bool, scheme s
 	}
 	defer db.Close()
 
-	newChain, err := NewBlockChain(db, config, gspec, nil, engine, vm.Config{}, nil, nil)
+	newChain, err := NewBlockChain(db, config, gspec, nil, engine, vmCfg, nil, nil)
 	if err != nil {
 		t.Fatalf("Failed to recreate chain: %v", err)
 	}
@@ -1914,11 +1922,16 @@ func testRepairWithScheme(t *testing.T, tt *rewindTest, snapshots bool, scheme s
 // In this case the snapshot layer of B3 is not created because of existent
 // state.
 func TestIssue23496(t *testing.T) {
-	testIssue23496(t, rawdb.HashScheme)
-	testIssue23496(t, rawdb.PathScheme)
+	for _, vmCfg := range vmtest.Configs() {
+		vmCfg := vmCfg // capture
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testIssue23496(t, rawdb.HashScheme, vmCfg)
+			testIssue23496(t, rawdb.PathScheme, vmCfg)
+		})
+	}
 }
 
-func testIssue23496(t *testing.T, scheme string) {
+func testIssue23496(t *testing.T, scheme string, vmCfg vm.Config) {
 	// It's hard to follow the test case, visualize the input
 	// log.SetDefault(log.NewLogger(log.NewTerminalHandlerWithLevel(os.Stderr, log.LevelInfo, true)))
 
@@ -1944,7 +1957,7 @@ func testIssue23496(t *testing.T, scheme string) {
 		}
 		engine = ethash.NewFullFaker()
 	)
-	chain, err := NewBlockChain(db, DefaultCacheConfigWithScheme(scheme), gspec, nil, engine, vm.Config{}, nil, nil)
+	chain, err := NewBlockChain(db, DefaultCacheConfigWithScheme(scheme), gspec, nil, engine, vmCfg, nil, nil)
 	if err != nil {
 		t.Fatalf("Failed to create chain: %v", err)
 	}
@@ -1994,7 +2007,7 @@ func testIssue23496(t *testing.T, scheme string) {
 	}
 	defer db.Close()
 
-	chain, err = NewBlockChain(db, DefaultCacheConfigWithScheme(scheme), gspec, nil, engine, vm.Config{}, nil, nil)
+	chain, err = NewBlockChain(db, DefaultCacheConfigWithScheme(scheme), gspec, nil, engine, vmCfg, nil, nil)
 	if err != nil {
 		t.Fatalf("Failed to recreate chain: %v", err)
 	}

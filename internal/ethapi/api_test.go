@@ -61,6 +61,9 @@ import (
 	"github.com/ethereum/go-ethereum/rpc"
 	"github.com/holiman/uint256"
 	"github.com/stretchr/testify/require"
+
+
+	"github.com/ethereum/go-ethereum/internal/vmtest"
 )
 
 func testTransactionMarshal(t *testing.T, tests []txData, config *params.ChainConfig) {
@@ -442,7 +445,7 @@ type testBackend struct {
 	acc     accounts.Account
 }
 
-func newTestBackend(t *testing.T, n int, gspec *core.Genesis, engine consensus.Engine, generator func(i int, b *core.BlockGen)) *testBackend {
+func newTestBackend(t *testing.T, n int, gspec *core.Genesis, engine consensus.Engine, generator func(i int, b *core.BlockGen), vmCfg vm.Config) *testBackend {
 	var (
 		cacheConfig = &core.CacheConfig{
 			TrieCleanLimit:    256,
@@ -457,7 +460,7 @@ func newTestBackend(t *testing.T, n int, gspec *core.Genesis, engine consensus.E
 	// Generate blocks for testing
 	db, blocks, _ := core.GenerateChainWithGenesis(gspec, engine, n, generator)
 	txlookupLimit := uint64(0)
-	chain, err := core.NewBlockChain(db, cacheConfig, gspec, nil, engine, vm.Config{}, nil, &txlookupLimit)
+	chain, err := core.NewBlockChain(db, cacheConfig, gspec, nil, engine, vmCfg, nil, &txlookupLimit)
 	if err != nil {
 		t.Fatalf("failed to create tester chain: %v", err)
 	}
@@ -671,6 +674,14 @@ func (b *testBackend) BestBidGasFee(parentHash common.Hash) *big.Int {
 }
 
 func TestEstimateGas(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testEstimateGas(t, vmCfg)
+		})
+	}
+}
+
+func testEstimateGas(t *testing.T, vmCfg vm.Config) {
 	t.Parallel()
 	// Initialize test accounts
 	var (
@@ -705,7 +716,7 @@ func TestEstimateGas(t *testing.T) {
 		tx, _ := types.SignTx(types.NewTx(&types.LegacyTx{Nonce: uint64(i), To: &accounts[1].addr, Value: big.NewInt(1000), Gas: params.TxGas, GasPrice: b.BaseFee(), Data: nil}), signer, accounts[0].key)
 		b.AddTx(tx)
 		b.SetPoS()
-	}))
+	}, vmCfg))
 
 	setCodeAuthorization, _ := types.SignSetCode(accounts[0].key, types.SetCodeAuthorization{
 		Address: accounts[0].addr,
@@ -960,6 +971,14 @@ func TestEstimateGas(t *testing.T) {
 }
 
 func TestCall(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testCall(t, vmCfg)
+		})
+	}
+}
+
+func testCall(t *testing.T, vmCfg vm.Config) {
 	t.Parallel()
 
 	// Initialize test accounts
@@ -991,7 +1010,7 @@ func TestCall(t *testing.T) {
 		tx, _ := types.SignTx(types.NewTx(&types.LegacyTx{Nonce: uint64(i), To: &accounts[1].addr, Value: big.NewInt(1000), Gas: params.TxGas, GasPrice: b.BaseFee(), Data: nil}), signer, accounts[0].key)
 		b.AddTx(tx)
 		b.SetPoS()
-	}))
+	}, vmCfg))
 	randomAccounts := newAccounts(3)
 	var testSuite = []struct {
 		name           string
@@ -1262,6 +1281,14 @@ func TestCall(t *testing.T) {
 }
 
 func TestSimulateV1(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testSimulateV1(t, vmCfg)
+		})
+	}
+}
+
+func testSimulateV1(t *testing.T, vmCfg vm.Config) {
 	t.Parallel()
 	// Initialize test accounts
 	var (
@@ -1328,7 +1355,7 @@ func TestSimulateV1(t *testing.T) {
 			Data:     nil,
 		}), signer, accounts[0].key)
 		b.AddTx(tx)
-	}))
+	}, vmCfg))
 	var (
 		randomAccounts   = newAccounts(4)
 		latest           = rpc.BlockNumberOrHashWithNumber(rpc.LatestBlockNumber)
@@ -2410,6 +2437,14 @@ func TestSimulateV1(t *testing.T) {
 }
 
 func TestSignTransaction(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testSignTransaction(t, vmCfg)
+		})
+	}
+}
+
+func testSignTransaction(t *testing.T, vmCfg vm.Config) {
 	t.Parallel()
 	// Initialize test accounts
 	var (
@@ -2422,7 +2457,7 @@ func TestSignTransaction(t *testing.T) {
 	)
 	b := newTestBackend(t, 1, genesis, beacon.New(ethash.NewFaker()), func(i int, b *core.BlockGen) {
 		b.SetPoS()
-	})
+	}, vmCfg)
 	api := NewTransactionAPI(b, nil)
 	res, err := api.FillTransaction(context.Background(), TransactionArgs{
 		From:  &b.acc.Address,
@@ -2448,6 +2483,14 @@ func TestSignTransaction(t *testing.T) {
 }
 
 func TestSignBlobTransaction(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testSignBlobTransaction(t, vmCfg)
+		})
+	}
+}
+
+func testSignBlobTransaction(t *testing.T, vmCfg vm.Config) {
 	t.Parallel()
 	// Initialize test accounts
 	var (
@@ -2460,7 +2503,7 @@ func TestSignBlobTransaction(t *testing.T) {
 	)
 	b := newTestBackend(t, 1, genesis, beacon.New(ethash.NewFaker()), func(i int, b *core.BlockGen) {
 		b.SetPoS()
-	})
+	}, vmCfg)
 	api := NewTransactionAPI(b, nil)
 	res, err := api.FillTransaction(context.Background(), TransactionArgs{
 		From:       &b.acc.Address,
@@ -2479,6 +2522,14 @@ func TestSignBlobTransaction(t *testing.T) {
 }
 
 func TestSendBlobTransaction(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testSendBlobTransaction(t, vmCfg)
+		})
+	}
+}
+
+func testSendBlobTransaction(t *testing.T, vmCfg vm.Config) {
 	t.Parallel()
 	// Initialize test accounts
 	var (
@@ -2491,7 +2542,7 @@ func TestSendBlobTransaction(t *testing.T) {
 	)
 	b := newTestBackend(t, 1, genesis, beacon.New(ethash.NewFaker()), func(i int, b *core.BlockGen) {
 		b.SetPoS()
-	})
+	}, vmCfg)
 	api := NewTransactionAPI(b, nil)
 	res, err := api.FillTransaction(context.Background(), TransactionArgs{
 		From:       &b.acc.Address,
@@ -2512,6 +2563,14 @@ func TestSendBlobTransaction(t *testing.T) {
 }
 
 func TestFillBlobTransaction(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testFillBlobTransaction(t, vmCfg)
+		})
+	}
+}
+
+func testFillBlobTransaction(t *testing.T, vmCfg vm.Config) {
 	t.Parallel()
 	// Initialize test accounts
 	var (
@@ -2529,7 +2588,7 @@ func TestFillBlobTransaction(t *testing.T) {
 	)
 	b := newTestBackend(t, 1, genesis, beacon.New(ethash.NewFaker()), func(i int, b *core.BlockGen) {
 		b.SetPoS()
-	})
+	}, vmCfg)
 	api := NewTransactionAPI(b, nil)
 	type result struct {
 		Hashes  []common.Hash
@@ -2779,6 +2838,14 @@ func uint256ToBytes(v *uint256.Int) *hexutil.Bytes {
 }
 
 func TestRPCMarshalBlock(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testRPCMarshalBlock(t, vmCfg)
+		})
+	}
+}
+
+func testRPCMarshalBlock(t *testing.T, vmCfg vm.Config) {
 	t.Parallel()
 	var (
 		txs []*types.Transaction
@@ -2988,6 +3055,14 @@ func TestRPCMarshalBlock(t *testing.T) {
 }
 
 func TestRPCGetBlockOrHeader(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testRPCGetBlockOrHeader(t, vmCfg)
+		})
+	}
+}
+
+func testRPCGetBlockOrHeader(t *testing.T, vmCfg vm.Config) {
 	t.Parallel()
 
 	// Initialize test accounts
@@ -3027,7 +3102,7 @@ func TestRPCGetBlockOrHeader(t *testing.T) {
 		//    fee:   0 wei
 		tx, _ := types.SignTx(types.NewTx(&types.LegacyTx{Nonce: uint64(i), To: &acc2Addr, Value: big.NewInt(1000), Gas: params.TxGas, GasPrice: b.BaseFee(), Data: nil}), signer, acc1Key)
 		b.AddTx(tx)
-	})
+	}, vmCfg)
 	backend.setPendingBlock(pending)
 	api := NewBlockChainAPI(backend)
 	blockHashes := make([]common.Hash, genBlocks+1)
@@ -3244,7 +3319,7 @@ func TestRPCGetBlockOrHeader(t *testing.T) {
 	}
 }
 
-func setupReceiptBackend(t *testing.T, genBlocks int) (*testBackend, []common.Hash) {
+func setupReceiptBackend(t *testing.T, genBlocks int, vmCfg vm.Config) (*testBackend, []common.Hash) {
 	config := *params.MergedTestChainConfig
 	var (
 		acc1Key, _ = crypto.HexToECDSA("8a1f9a8f95be41cd7ccb6168179afb4504aefe388d1e14474d32c45c72ce7b7a")
@@ -3352,15 +3427,23 @@ func setupReceiptBackend(t *testing.T, genBlocks int) (*testBackend, []common.Ha
 			b.AddTx(tx)
 			txHashes[i] = tx.Hash()
 		}
-	})
+	}, vmCfg)
 	return backend, txHashes
 }
 
 func TestRPCGetTransactionReceipt(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testRPCGetTransactionReceipt(t, vmCfg)
+		})
+	}
+}
+
+func testRPCGetTransactionReceipt(t *testing.T, vmCfg vm.Config) {
 	t.Parallel()
 
 	var (
-		backend, txHashes = setupReceiptBackend(t, 6)
+		backend, txHashes = setupReceiptBackend(t, 6, vmCfg)
 		api               = NewTransactionAPI(backend, new(AddrLocker))
 	)
 
@@ -3425,11 +3508,19 @@ func TestRPCGetTransactionReceipt(t *testing.T) {
 }
 
 func TestRPCGetBlockReceipts(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testRPCGetBlockReceipts(t, vmCfg)
+		})
+	}
+}
+
+func testRPCGetBlockReceipts(t *testing.T, vmCfg vm.Config) {
 	t.Parallel()
 
 	var (
 		genBlocks  = 6
-		backend, _ = setupReceiptBackend(t, genBlocks)
+		backend, _ = setupReceiptBackend(t, genBlocks, vmCfg)
 		api        = NewBlockChainAPI(backend)
 	)
 	blockHashes := make([]common.Hash, genBlocks+1)
@@ -3545,10 +3636,18 @@ func makeBlkSidecars(n, nPerTx int) []*types.BlobTxSidecar {
 }
 
 func TestRPCGetBlobSidecars(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testRPCGetBlobSidecars(t, vmCfg)
+		})
+	}
+}
+
+func testRPCGetBlobSidecars(t *testing.T, vmCfg vm.Config) {
 	t.Parallel()
 	var (
 		genBlocks  = 7
-		backend, _ = setupReceiptBackend(t, genBlocks)
+		backend, _ = setupReceiptBackend(t, genBlocks, vmCfg)
 		api        = NewBlockChainAPI(backend)
 	)
 	blockHashes := make([]common.Hash, genBlocks+1)
@@ -3643,6 +3742,14 @@ func (p *precompileContract) RequiredGas(input []byte) uint64 { return 0 }
 func (p *precompileContract) Run(input []byte) ([]byte, error) { return nil, nil }
 
 func TestStateOverrideMovePrecompile(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testStateOverrideMovePrecompile(t, vmCfg)
+		})
+	}
+}
+
+func testStateOverrideMovePrecompile(t *testing.T, vmCfg vm.Config) {
 	db := state.NewDatabase(triedb.NewDatabase(rawdb.NewMemoryDatabase(), nil), nil)
 	statedb, err := state.New(common.Hash{}, db)
 	if err != nil {
@@ -3728,9 +3835,17 @@ func TestStateOverrideMovePrecompile(t *testing.T) {
 }
 
 func TestGetBlobSidecarByTxHash(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testGetBlobSidecarByTxHash(t, vmCfg)
+		})
+	}
+}
+
+func testGetBlobSidecarByTxHash(t *testing.T, vmCfg vm.Config) {
 	t.Parallel()
 	var (
-		backend, txHashs = setupReceiptBackend(t, 7)
+		backend, txHashs = setupReceiptBackend(t, 7, vmCfg)
 		api              = NewBlockChainAPI(backend)
 	)
 	var testSuite = []struct {
@@ -3812,6 +3927,14 @@ func addressToHash(a common.Address) common.Hash {
 }
 
 func TestCreateAccessListWithStateOverrides(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testCreateAccessListWithStateOverrides(t, vmCfg)
+		})
+	}
+}
+
+func testCreateAccessListWithStateOverrides(t *testing.T, vmCfg vm.Config) {
 	// Initialize test backend
 	genesis := &core.Genesis{
 		Config: params.TestChainConfig,
@@ -3819,7 +3942,7 @@ func TestCreateAccessListWithStateOverrides(t *testing.T) {
 			common.HexToAddress("0x71562b71999873db5b286df957af199ec94617f7"): {Balance: big.NewInt(1000000000000000000)},
 		},
 	}
-	backend := newTestBackend(t, 1, genesis, ethash.NewFaker(), nil)
+	backend := newTestBackend(t, 1, genesis, ethash.NewFaker(), nil, vmCfg)
 
 	// Create a new BlockChainAPI instance
 	api := NewBlockChainAPI(backend)

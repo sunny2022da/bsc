@@ -37,6 +37,9 @@ import (
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/ethdb/pebble"
 	"github.com/ethereum/go-ethereum/params"
+
+
+	"github.com/ethereum/go-ethereum/internal/vmtest"
 )
 
 // snapshotTestBasic wraps the common testing fields in the snapshot tests.
@@ -59,6 +62,7 @@ type snapshotTestBasic struct {
 	genDb   ethdb.Database
 	engine  consensus.Engine
 	gspec   *Genesis
+	vmCfg   vm.Config // VM configuration for tests
 }
 
 func (basic *snapshotTestBasic) prepare(t *testing.T) (*BlockChain, []*types.Block) {
@@ -82,7 +86,7 @@ func (basic *snapshotTestBasic) prepare(t *testing.T) (*BlockChain, []*types.Blo
 		}
 		engine = ethash.NewFullFaker()
 	)
-	chain, err := NewBlockChain(db, DefaultCacheConfigWithScheme(basic.scheme), gspec, nil, engine, vm.Config{}, nil, nil)
+	chain, err := NewBlockChain(db, DefaultCacheConfigWithScheme(basic.scheme), gspec, nil, engine, basic.vmCfg, nil, nil)
 	if err != nil {
 		t.Fatalf("Failed to create chain: %v", err)
 	}
@@ -229,7 +233,7 @@ func (snaptest *snapshotTest) test(t *testing.T) {
 
 	// Restart the chain normally
 	chain.Stop()
-	newchain, err := NewBlockChain(snaptest.db, DefaultCacheConfigWithScheme(snaptest.scheme), snaptest.gspec, nil, snaptest.engine, vm.Config{}, nil, nil)
+	newchain, err := NewBlockChain(snaptest.db, DefaultCacheConfigWithScheme(snaptest.scheme), snaptest.gspec, nil, snaptest.engine, snaptest.vmCfg, nil, nil)
 	if err != nil {
 		t.Fatalf("Failed to recreate chain: %v", err)
 	}
@@ -271,13 +275,13 @@ func (snaptest *crashSnapshotTest) test(t *testing.T) {
 	// the crash, we do restart twice here: one after the crash and one
 	// after the normal stop. It's used to ensure the broken snapshot
 	// can be detected all the time.
-	newchain, err := NewBlockChain(newdb, DefaultCacheConfigWithScheme(snaptest.scheme), snaptest.gspec, nil, snaptest.engine, vm.Config{}, nil, nil)
+	newchain, err := NewBlockChain(newdb, DefaultCacheConfigWithScheme(snaptest.scheme), snaptest.gspec, nil, snaptest.engine, snaptest.vmCfg, nil, nil)
 	if err != nil {
 		t.Fatalf("Failed to recreate chain: %v", err)
 	}
 	newchain.Stop()
 
-	newchain, err = NewBlockChain(newdb, DefaultCacheConfigWithScheme(snaptest.scheme), snaptest.gspec, nil, snaptest.engine, vm.Config{}, nil, nil)
+	newchain, err = NewBlockChain(newdb, DefaultCacheConfigWithScheme(snaptest.scheme), snaptest.gspec, nil, snaptest.engine, snaptest.vmCfg, nil, nil)
 	if err != nil {
 		t.Fatalf("Failed to recreate chain: %v", err)
 	}
@@ -315,7 +319,7 @@ func (snaptest *gappedSnapshotTest) test(t *testing.T) {
 		SnapshotLimit:  0,
 		StateScheme:    snaptest.scheme,
 	}
-	newchain, err := NewBlockChain(snaptest.db, cacheConfig, snaptest.gspec, nil, snaptest.engine, vm.Config{}, nil, nil)
+	newchain, err := NewBlockChain(snaptest.db, cacheConfig, snaptest.gspec, nil, snaptest.engine, snaptest.vmCfg, nil, nil)
 	if err != nil {
 		t.Fatalf("Failed to recreate chain: %v", err)
 	}
@@ -323,7 +327,7 @@ func (snaptest *gappedSnapshotTest) test(t *testing.T) {
 	newchain.Stop()
 
 	// Restart the chain with enabling the snapshot
-	newchain, err = NewBlockChain(snaptest.db, DefaultCacheConfigWithScheme(snaptest.scheme), snaptest.gspec, nil, snaptest.engine, vm.Config{}, nil, nil)
+	newchain, err = NewBlockChain(snaptest.db, DefaultCacheConfigWithScheme(snaptest.scheme), snaptest.gspec, nil, snaptest.engine, snaptest.vmCfg, nil, nil)
 	if err != nil {
 		t.Fatalf("Failed to recreate chain: %v", err)
 	}
@@ -351,7 +355,7 @@ func (snaptest *setHeadSnapshotTest) test(t *testing.T) {
 	chain.SetHead(snaptest.setHead)
 	chain.Stop()
 
-	newchain, err := NewBlockChain(snaptest.db, DefaultCacheConfigWithScheme(snaptest.scheme), snaptest.gspec, nil, snaptest.engine, vm.Config{}, nil, nil)
+	newchain, err := NewBlockChain(snaptest.db, DefaultCacheConfigWithScheme(snaptest.scheme), snaptest.gspec, nil, snaptest.engine, snaptest.vmCfg, nil, nil)
 	if err != nil {
 		t.Fatalf("Failed to recreate chain: %v", err)
 	}
@@ -388,7 +392,7 @@ func (snaptest *wipeCrashSnapshotTest) test(t *testing.T) {
 		TriesInMemory:  128,
 		StateScheme:    snaptest.scheme,
 	}
-	newchain, err := NewBlockChain(snaptest.db, config, snaptest.gspec, nil, snaptest.engine, vm.Config{}, nil, nil)
+	newchain, err := NewBlockChain(snaptest.db, config, snaptest.gspec, nil, snaptest.engine, snaptest.vmCfg, nil, nil)
 	if err != nil {
 		t.Fatalf("Failed to recreate chain: %v", err)
 	}
@@ -406,7 +410,7 @@ func (snaptest *wipeCrashSnapshotTest) test(t *testing.T) {
 		TriesInMemory:  128,
 		StateScheme:    snaptest.scheme,
 	}
-	tmp, err := NewBlockChain(snaptest.db, config, snaptest.gspec, nil, snaptest.engine, vm.Config{}, nil, nil)
+	tmp, err := NewBlockChain(snaptest.db, config, snaptest.gspec, nil, snaptest.engine, snaptest.vmCfg, nil, nil)
 	if err != nil {
 		t.Fatalf("Failed to recreate chain: %v", err)
 	}
@@ -415,7 +419,7 @@ func (snaptest *wipeCrashSnapshotTest) test(t *testing.T) {
 	tmp.triedb.Close()
 	tmp.stopWithoutSaving()
 
-	newchain, err = NewBlockChain(snaptest.db, DefaultCacheConfigWithScheme(snaptest.scheme), snaptest.gspec, nil, snaptest.engine, vm.Config{}, nil, nil)
+	newchain, err = NewBlockChain(snaptest.db, DefaultCacheConfigWithScheme(snaptest.scheme), snaptest.gspec, nil, snaptest.engine, snaptest.vmCfg, nil, nil)
 	if err != nil {
 		t.Fatalf("Failed to recreate chain: %v", err)
 	}
@@ -427,6 +431,14 @@ func (snaptest *wipeCrashSnapshotTest) test(t *testing.T) {
 // journal will be persisted correctly. In this case no snapshot recovery is
 // required.
 func TestRestartWithNewSnapshot(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testRestartWithNewSnapshot(t, vmCfg)
+		})
+	}
+}
+
+func testRestartWithNewSnapshot(t *testing.T, vmCfg vm.Config) {
 	// Chain:
 	//   G->C1->C2->C3->C4->C5->C6->C7->C8 (HEAD)
 	//
@@ -469,6 +481,14 @@ func TestRestartWithNewSnapshot(t *testing.T) {
 // so the chain should be rewound to genesis and the disk layer should be left
 // for recovery.
 func TestNoCommitCrashWithNewSnapshot(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testNoCommitCrashWithNewSnapshot(t, vmCfg)
+		})
+	}
+}
+
+func testNoCommitCrashWithNewSnapshot(t *testing.T, vmCfg vm.Config) {
 	// Chain:
 	//   G->C1->C2->C3->C4->C5->C6->C7->C8 (HEAD)
 	//
@@ -513,6 +533,14 @@ func TestNoCommitCrashWithNewSnapshot(t *testing.T) {
 // point so the chain should be rewound to committed point and the disk layer
 // should be left for recovery.
 func TestLowCommitCrashWithNewSnapshot(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testLowCommitCrashWithNewSnapshot(t, vmCfg)
+		})
+	}
+}
+
+func testLowCommitCrashWithNewSnapshot(t *testing.T, vmCfg vm.Config) {
 	// Chain:
 	//   G->C1->C2->C3->C4->C5->C6->C7->C8 (HEAD)
 	//
@@ -557,6 +585,14 @@ func TestLowCommitCrashWithNewSnapshot(t *testing.T) {
 // committed point so the chain should be rewound to genesis and the disk layer
 // should be left for recovery.
 func TestHighCommitCrashWithNewSnapshot(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testHighCommitCrashWithNewSnapshot(t, vmCfg)
+		})
+	}
+}
+
+func testHighCommitCrashWithNewSnapshot(t *testing.T, vmCfg vm.Config) {
 	// Chain:
 	//   G->C1->C2->C3->C4->C5->C6->C7->C8 (HEAD)
 	//
@@ -601,6 +637,14 @@ func TestHighCommitCrashWithNewSnapshot(t *testing.T) {
 // enabling snapshot and after that re-enable the snapshot again. In this
 // case the snapshot should be rebuilt with latest chain head.
 func TestGappedNewSnapshot(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testGappedNewSnapshot(t, vmCfg)
+		})
+	}
+}
+
+func testGappedNewSnapshot(t *testing.T, vmCfg vm.Config) {
 	// Chain:
 	//   G->C1->C2->C3->C4->C5->C6->C7->C8 (HEAD)
 	//
@@ -642,6 +686,14 @@ func TestGappedNewSnapshot(t *testing.T) {
 // In this case the head is rewound to the target(with state available). After
 // that the chain is restarted and the original disk layer is kept.
 func TestSetHeadWithNewSnapshot(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testSetHeadWithNewSnapshot(t, vmCfg)
+		})
+	}
+}
+
+func testSetHeadWithNewSnapshot(t *testing.T, vmCfg vm.Config) {
 	// Chain:
 	//   G->C1->C2->C3->C4->C5->C6->C7->C8 (HEAD)
 	//
@@ -683,6 +735,14 @@ func TestSetHeadWithNewSnapshot(t *testing.T) {
 // more new blocks on top without enabling the snapshot. After the restart,
 // crash happens. Check everything is ok after the restart.
 func TestRecoverSnapshotFromWipingCrash(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testRecoverSnapshotFromWipingCrash(t, vmCfg)
+		})
+	}
+}
+
+func testRecoverSnapshotFromWipingCrash(t *testing.T, vmCfg vm.Config) {
 	// Chain:
 	//   G->C1->C2->C3->C4->C5->C6->C7->C8 (HEAD)
 	//

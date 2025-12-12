@@ -36,6 +36,9 @@ import (
 	"github.com/ethereum/go-ethereum/eth/tracers"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/tests"
+
+
+	"github.com/ethereum/go-ethereum/internal/vmtest"
 )
 
 // callLog is the result of LOG opCode
@@ -75,10 +78,26 @@ type callTracerTest struct {
 // Iterates over all the input-output datasets in the tracer test harness and
 // runs the JavaScript tracers against them.
 func TestCallTracerLegacy(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testCallTracerLegacy(t, vmCfg)
+		})
+	}
+}
+
+func testCallTracerLegacy(t *testing.T, vmCfg vm.Config) {
 	testCallTracer("callTracerLegacy", "call_tracer_legacy", t)
 }
 
 func TestCallTracerNative(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testCallTracerNative(t, vmCfg)
+		})
+	}
+}
+
+func testCallTracerNative(t *testing.T, vmCfg vm.Config) {
 	testCallTracer("callTracer", "call_tracer", t)
 }
 
@@ -216,7 +235,7 @@ func benchTracer(tracerName string, test *callTracerTest, b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 
-	evm := vm.NewEVM(context, state.StateDB, test.Genesis.Config, vm.Config{})
+	evm := vm.NewEVM(context, state.StateDB, test.Genesis.Config, vmCfg)
 
 	for i := 0; i < b.N; i++ {
 		snap := state.StateDB.Snapshot()
@@ -243,6 +262,14 @@ func benchTracer(tracerName string, test *callTracerTest, b *testing.B) {
 }
 
 func TestInternals(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testInternals(t, vmCfg)
+		})
+	}
+}
+
+func testInternals(t *testing.T, vmCfg vm.Config) {
 	var (
 		config    = params.MainnetChainConfig
 		to        = common.HexToAddress("0x00000000000000000000000000000000deadbeef")

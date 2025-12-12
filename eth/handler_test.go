@@ -167,20 +167,20 @@ type testHandler struct {
 }
 
 // newTestHandler creates a new handler for testing purposes with no blocks.
-func newTestHandler() *testHandler {
+func newTestHandler(vmCfg vm.Config) *testHandler {
 	return newTestHandlerWithBlocks(0)
 }
 
 // newTestHandlerWithBlocks creates a new handler for testing purposes, with a
 // given number of initial blocks.
-func newTestHandlerWithBlocks(blocks int) *testHandler {
+func newTestHandlerWithBlocks(blocks int, vmCfg vm.Config) *testHandler {
 	// Create a database pre-initialize with a genesis block
 	db := rawdb.NewMemoryDatabase()
 	gspec := &core.Genesis{
 		Config: params.TestChainConfig,
 		Alloc:  types.GenesisAlloc{testAddr: {Balance: big.NewInt(1000000)}},
 	}
-	chain, _ := core.NewBlockChain(db, nil, gspec, nil, ethash.NewFaker(), vm.Config{}, nil, nil)
+	chain, _ := core.NewBlockChain(db, nil, gspec, nil, ethash.NewFaker(), vmCfg, nil, nil)
 
 	_, bs, _ := core.GenerateChainWithGenesis(gspec, ethash.NewFaker(), blocks, nil)
 	if _, err := chain.InsertChain(bs); err != nil {
@@ -270,7 +270,7 @@ func newTestParliaHandlerAfterCancun(t *testing.T, config *params.ChainConfig, m
 		Alloc:  types.GenesisAlloc{testAddr: {Balance: new(big.Int).SetUint64(10 * params.Ether)}},
 	}
 	engine := &mockParlia{}
-	chain, _ := core.NewBlockChain(db, nil, gspec, nil, engine, vm.Config{}, nil, nil)
+	chain, _ := core.NewBlockChain(db, nil, gspec, nil, engine, vmCfg, nil, nil)
 	signer := types.LatestSigner(config)
 
 	_, bs, _ := core.GenerateChainWithGenesis(gspec, engine, int(preCancunBlks+postCancunBlks), func(i int, gen *core.BlockGen) {

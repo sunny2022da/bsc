@@ -23,6 +23,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/forkid"
 	"github.com/ethereum/go-ethereum/p2p"
+	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/p2p/enode"
 )
 
@@ -33,7 +34,7 @@ func testHandshake(t *testing.T, protocol uint) {
 	t.Parallel()
 
 	// Create a test backend only to have some valid genesis chain
-	backend := newTestBackend(3)
+	backend := newTestBackend(3, vm.Config{})
 	defer backend.close()
 
 	var (

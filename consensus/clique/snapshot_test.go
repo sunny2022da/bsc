@@ -31,6 +31,9 @@ import (
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/params"
+
+
+	"github.com/ethereum/go-ethereum/internal/vmtest"
 )
 
 // testerAccountPool is a pool to maintain currently active tester accounts,
@@ -107,6 +110,14 @@ type cliqueTest struct {
 // Tests that Clique signer voting is evaluated correctly for various simple and
 // complex scenarios, as well as that a few special corner cases fail correctly.
 func TestClique(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testClique(t, vmCfg)
+		})
+	}
+}
+
+func testClique(t *testing.T, vmCfg vm.Config) {
 	// Define the various voting scenarios to test
 	tests := []cliqueTest{
 		{
@@ -383,11 +394,15 @@ func TestClique(t *testing.T) {
 
 	// Run through the scenarios and test them
 	for i, tt := range tests {
-		t.Run(fmt.Sprint(i), tt.run)
+		tt := tt // capture for closure
+		vmCfgCopy := vmCfg // capture vmCfg for closure
+		t.Run(fmt.Sprint(i), func(t *testing.T) {
+			tt.runWithConfig(t, vmCfgCopy)
+		})
 	}
 }
 
-func (tt *cliqueTest) run(t *testing.T) {
+func (tt *cliqueTest) runWithConfig(t *testing.T, vmCfg vm.Config) {
 	// Create the account pool and generate the initial set of signers
 	accounts := newTesterAccountPool()
 
@@ -458,7 +473,7 @@ func (tt *cliqueTest) run(t *testing.T) {
 		batches[len(batches)-1] = append(batches[len(batches)-1], block)
 	}
 	// Pass all the headers through clique and ensure tallying succeeds
-	chain, err := core.NewBlockChain(rawdb.NewMemoryDatabase(), nil, genesis, nil, engine, vm.Config{}, nil, nil)
+	chain, err := core.NewBlockChain(rawdb.NewMemoryDatabase(), nil, genesis, nil, engine, vmCfg, nil, nil)
 	if err != nil {
 		t.Fatalf("failed to create test chain: %v", err)
 	}
