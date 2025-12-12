@@ -168,7 +168,7 @@ type testHandler struct {
 
 // newTestHandler creates a new handler for testing purposes with no blocks.
 func newTestHandler(vmCfg vm.Config) *testHandler {
-	return newTestHandlerWithBlocks(0)
+	return newTestHandlerWithBlocks(0, vmCfg)
 }
 
 // newTestHandlerWithBlocks creates a new handler for testing purposes, with a
@@ -270,7 +270,7 @@ func newTestParliaHandlerAfterCancun(t *testing.T, config *params.ChainConfig, m
 		Alloc:  types.GenesisAlloc{testAddr: {Balance: new(big.Int).SetUint64(10 * params.Ether)}},
 	}
 	engine := &mockParlia{}
-	chain, _ := core.NewBlockChain(db, nil, gspec, nil, engine, vmCfg, nil, nil)
+	chain, _ := core.NewBlockChain(db, nil, gspec, nil, engine, vm.Config{}, nil, nil)
 	signer := types.LatestSigner(config)
 
 	_, bs, _ := core.GenerateChainWithGenesis(gspec, engine, int(preCancunBlks+postCancunBlks), func(i int, gen *core.BlockGen) {

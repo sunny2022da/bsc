@@ -33,6 +33,12 @@ import (
 	"github.com/ethereum/go-ethereum/triedb"
 )
 
+// cacheKey combines block hash and MIR flag for blockchain caching
+type cacheKey struct {
+	hash      common.Hash
+	enableMIR bool
+}
+
 // Test chain parameters.
 var (
 	testKey, _  = crypto.HexToECDSA("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291")
@@ -187,7 +193,7 @@ func (tc *testChain) generate(n int, seed byte, parent *types.Block, heavy bool)
 }
 
 var (
-	testBlockchains     = make(map[common.Hash]*testBlockchain)
+	testBlockchains     = make(map[cacheKey]*testBlockchain)
 	testBlockchainsLock sync.Mutex
 )
 
@@ -206,10 +212,11 @@ func newTestBlockchain(blocks []*types.Block) *core.BlockChain {
 		head = blocks[len(blocks)-1].Hash()
 	}
 	testBlockchainsLock.Lock()
-	if _, ok := testBlockchains[head]; !ok {
-		testBlockchains[head] = new(testBlockchain)
+	key := cacheKey{hash: head, enableMIR: false}
+	if _, ok := testBlockchains[key]; !ok {
+		testBlockchains[key] = new(testBlockchain)
 	}
-	tbc := testBlockchains[head]
+	tbc := testBlockchains[key]
 	testBlockchainsLock.Unlock()
 
 	// Ensure that the database is generated
@@ -218,6 +225,40 @@ func newTestBlockchain(blocks []*types.Block) *core.BlockChain {
 			panic("Requested chain generation outside of init")
 		}
 		chain, err := core.NewBlockChain(rawdb.NewMemoryDatabase(), nil, testGspec, nil, ethash.NewFaker(), vm.Config{}, nil, nil)
+		if err != nil {
+			panic(err)
+		}
+		if n, err := chain.InsertChain(blocks); err != nil {
+			panic(fmt.Sprintf("block %d: %v", n, err))
+		}
+		tbc.chain = chain
+	})
+	return tbc.chain
+}
+
+// newTestBlockchainWithConfig creates a blockchain with custom vm.Config.
+// This allows testing with both EVM and MIR interpreters.
+func newTestBlockchainWithConfig(blocks []*types.Block, vmCfg vm.Config) *core.BlockChain {
+	// Retrieve an existing database, or create a new one
+	head := testGenesis.Hash()
+	if len(blocks) > 0 {
+		head = blocks[len(blocks)-1].Hash()
+	}
+	key := cacheKey{hash: head, enableMIR: vmCfg.EnableMIR}
+	
+	testBlockchainsLock.Lock()
+	if _, ok := testBlockchains[key]; !ok {
+		testBlockchains[key] = new(testBlockchain)
+	}
+	tbc := testBlockchains[key]
+	testBlockchainsLock.Unlock()
+
+	// Ensure that the database is generated
+	tbc.gen.Do(func() {
+		if pregenerated && !vmCfg.EnableMIR {
+			panic("Requested chain generation outside of init")
+		}
+		chain, err := core.NewBlockChain(rawdb.NewMemoryDatabase(), nil, testGspec, nil, ethash.NewFaker(), vmCfg, nil, nil)
 		if err != nil {
 			panic(err)
 		}

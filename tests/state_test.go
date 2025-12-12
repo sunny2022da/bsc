@@ -34,6 +34,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
+	"github.com/ethereum/go-ethereum/internal/vmtest"
 	"github.com/ethereum/go-ethereum/eth/tracers/logger"
 	"github.com/holiman/uint256"
 )
@@ -106,6 +107,14 @@ func TestExecutionSpecState(t *testing.T) {
 }
 
 func execStateTest(t *testing.T, st *testMatcher, test *StateTest) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			execStateTestWithConfig(t, st, test, vmCfg)
+		})
+	}
+}
+
+func execStateTestWithConfig(t *testing.T, st *testMatcher, test *StateTest, baseVmCfg vm.Config) {
 	for _, subtest := range test.Subtests() {
 		key := fmt.Sprintf("%s/%d", subtest.Fork, subtest.Index)
 
@@ -119,7 +128,7 @@ func execStateTest(t *testing.T, st *testMatcher, test *StateTest) {
 			if executionMask&0x1 == 0 {
 				t.Skip("test (randomly) skipped due to short-tag")
 			}
-			withTrace(t, test.gasLimit(subtest), func(vmconfig vm.Config) error {
+			withTrace(t, test.gasLimit(subtest), baseVmCfg, func(vmconfig vm.Config) error {
 				var result error
 				test.Run(subtest, vmconfig, false, rawdb.HashScheme, func(err error, state *StateTestState) {
 					result = st.checkFailure(t, err)
@@ -131,7 +140,7 @@ func execStateTest(t *testing.T, st *testMatcher, test *StateTest) {
 			if executionMask&0x2 == 0 {
 				t.Skip("test (randomly) skipped due to short-tag")
 			}
-			withTrace(t, test.gasLimit(subtest), func(vmconfig vm.Config) error {
+			withTrace(t, test.gasLimit(subtest), baseVmCfg, func(vmconfig vm.Config) error {
 				var result error
 				test.Run(subtest, vmconfig, true, rawdb.HashScheme, func(err error, state *StateTestState) {
 					if state.Snapshots != nil && state.StateDB != nil {
@@ -149,7 +158,7 @@ func execStateTest(t *testing.T, st *testMatcher, test *StateTest) {
 			if executionMask&0x4 == 0 {
 				t.Skip("test (randomly) skipped due to short-tag")
 			}
-			withTrace(t, test.gasLimit(subtest), func(vmconfig vm.Config) error {
+			withTrace(t, test.gasLimit(subtest), baseVmCfg, func(vmconfig vm.Config) error {
 				var result error
 				test.Run(subtest, vmconfig, false, rawdb.PathScheme, func(err error, state *StateTestState) {
 					result = st.checkFailure(t, err)
@@ -161,7 +170,7 @@ func execStateTest(t *testing.T, st *testMatcher, test *StateTest) {
 			if executionMask&0x8 == 0 {
 				t.Skip("test (randomly) skipped due to short-tag")
 			}
-			withTrace(t, test.gasLimit(subtest), func(vmconfig vm.Config) error {
+			withTrace(t, test.gasLimit(subtest), baseVmCfg, func(vmconfig vm.Config) error {
 				var result error
 				test.Run(subtest, vmconfig, true, rawdb.PathScheme, func(err error, state *StateTestState) {
 					if state.Snapshots != nil && state.StateDB != nil {
@@ -181,9 +190,9 @@ func execStateTest(t *testing.T, st *testMatcher, test *StateTest) {
 // Transactions with gasLimit above this value will not get a VM trace on failure.
 const traceErrorLimit = 400000
 
-func withTrace(t *testing.T, gasLimit uint64, test func(vm.Config) error) {
+func withTrace(t *testing.T, gasLimit uint64, baseConfig vm.Config, test func(vm.Config) error) {
 	// Use config from command line arguments.
-	config := vm.Config{}
+	config := baseConfig
 	err := test(config)
 	if err == nil {
 		return
@@ -197,6 +206,7 @@ func withTrace(t *testing.T, gasLimit uint64, test func(vm.Config) error) {
 	}
 	buf := new(bytes.Buffer)
 	w := bufio.NewWriter(buf)
+	config = baseConfig
 	config.Tracer = logger.NewJSONLogger(&logger.Config{}, w)
 	err2 := test(config)
 	if !reflect.DeepEqual(err, err2) {

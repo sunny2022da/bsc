@@ -46,6 +46,7 @@ import (
 
 // downloadTester is a test simulator for mocking out local block chain.
 type downloadTester struct {
+	vmCfg      vm.Config
 	freezer    string
 	chain      *core.BlockChain
 	downloader *Downloader
@@ -89,6 +90,7 @@ func newTesterWithNotificationAndVMConfig(t *testing.T, success func(), vmCfg vm
 		panic(err)
 	}
 	tester := &downloadTester{
+		vmCfg:   vmCfg,
 		freezer: freezer,
 		chain:   chain,
 		peers:   make(map[string]*downloadTesterPeer),
@@ -133,7 +135,7 @@ func (dl *downloadTester) newPeer(id string, version uint, blocks []*types.Block
 	peer := &downloadTesterPeer{
 		dl:              dl,
 		id:              id,
-		chain:           newTestBlockchain(blocks),
+		chain:           newTestBlockchainWithConfig(blocks, dl.vmCfg),
 		withholdHeaders: make(map[common.Hash]struct{}),
 	}
 	dl.peers[id] = peer

@@ -261,7 +261,7 @@ func testFilters(t *testing.T, vmCfg vm.Config) {
 		}
 	})
 	var l uint64
-	bc, err := core.NewBlockChain(db, nil, gspec, nil, ethash.NewFaker(), vmCfg, nil, &l)
+	bc, err := core.NewBlockChain(db, nil, gspec, nil, ethash.NewFaker(), vm.Config{}, nil, &l)
 	if err != nil {
 		t.Fatal(err)
 	}

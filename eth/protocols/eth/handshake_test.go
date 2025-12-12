@@ -24,17 +24,24 @@ import (
 	"github.com/ethereum/go-ethereum/core/forkid"
 	"github.com/ethereum/go-ethereum/p2p"
 	"github.com/ethereum/go-ethereum/core/vm"
+	"github.com/ethereum/go-ethereum/internal/vmtest"
 	"github.com/ethereum/go-ethereum/p2p/enode"
 )
 
 // Tests that handshake failures are detected and reported correctly.
-func TestHandshake68(t *testing.T) { testHandshake(t, ETH68) }
+func TestHandshake68(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testHandshake(t, ETH68, vmCfg)
+		})
+	}
+}
 
-func testHandshake(t *testing.T, protocol uint) {
+func testHandshake(t *testing.T, protocol uint, vmCfg vm.Config) {
 	t.Parallel()
 
 	// Create a test backend only to have some valid genesis chain
-	backend := newTestBackend(3, vm.Config{})
+	backend := newTestBackend(3, vmCfg)
 	defer backend.close()
 
 	var (

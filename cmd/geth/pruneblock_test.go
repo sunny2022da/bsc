@@ -76,9 +76,9 @@ func TestOfflineBlockPrune(t *testing.T) {
 
 func testOfflineBlockPrune(t *testing.T, vmCfg vm.Config) {
 	//Corner case for 0 remain in ancinetStore.
-	testOfflineBlockPruneWithAmountReserved(t, 0)
+	testOfflineBlockPruneWithAmountReserved(t, 0, vmCfg)
 	//General case.
-	testOfflineBlockPruneWithAmountReserved(t, 100)
+	testOfflineBlockPruneWithAmountReserved(t, 100, vmCfg)
 }
 
 func NewLevelDBDatabaseWithFreezer(file string, cache int, handles int, ancient string, namespace string, readonly, disableFreeze, isLastOffset, pruneAncientData bool) (ethdb.Database, error) {
@@ -94,14 +94,14 @@ func NewLevelDBDatabaseWithFreezer(file string, cache int, handles int, ancient 
 	return frdb, nil
 }
 
-func testOfflineBlockPruneWithAmountReserved(t *testing.T, amountReserved uint64) {
+func testOfflineBlockPruneWithAmountReserved(t *testing.T, amountReserved uint64, vmCfg vm.Config) {
 	datadir := t.TempDir()
 
 	chaindbPath := filepath.Join(datadir, "chaindata")
 	oldAncientPath := filepath.Join(chaindbPath, "ancient")
 	newAncientPath := filepath.Join(chaindbPath, "ancient_back")
 
-	db, blocks, blockList, receiptsList, externTdList, startBlockNumber, _ := BlockchainCreator(t, chaindbPath, oldAncientPath, amountReserved)
+	db, blocks, blockList, receiptsList, externTdList, startBlockNumber, _ := BlockchainCreator(t, chaindbPath, oldAncientPath, amountReserved, vmCfg)
 	node, _ := startEthService(t, gspec, blocks, chaindbPath)
 	defer node.Close()
 
@@ -155,7 +155,7 @@ func testOfflineBlockPruneWithAmountReserved(t *testing.T, amountReserved uint64
 	}
 }
 
-func BlockchainCreator(t *testing.T, chaindbPath, AncientPath string, blockRemain uint64) (ethdb.Database, []*types.Block, []*types.Block, []types.Receipts, []*big.Int, uint64, *core.BlockChain) {
+func BlockchainCreator(t *testing.T, chaindbPath, AncientPath string, blockRemain uint64, vmCfg vm.Config) (ethdb.Database, []*types.Block, []*types.Block, []types.Receipts, []*big.Int, uint64, *core.BlockChain) {
 	//create a database with ancient freezer
 	db, err := NewLevelDBDatabaseWithFreezer(chaindbPath, 0, 0, AncientPath, "", false, false, false, false)
 	if err != nil {

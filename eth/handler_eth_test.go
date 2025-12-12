@@ -90,9 +90,9 @@ func TestForkIDSplit68(t *testing.T) {
 	}
 }
 
-func testForkIDSplit68(t *testing.T, vmCfg vm.Config) { testForkIDSplit(t, eth.ETH68) }
+func testForkIDSplit68(t *testing.T, vmCfg vm.Config) { testForkIDSplit(t, eth.ETH68, vmCfg) }
 
-func testForkIDSplit(t *testing.T, protocol uint) {
+func testForkIDSplit(t *testing.T, protocol uint, vmCfg vm.Config) {
 	t.Parallel()
 
 	var (
@@ -267,9 +267,9 @@ func TestRecvTransactions68(t *testing.T) {
 	}
 }
 
-func testRecvTransactions68(t *testing.T, vmCfg vm.Config) { testRecvTransactions(t, eth.ETH68) }
+func testRecvTransactions68(t *testing.T, vmCfg vm.Config) { testRecvTransactions(t, eth.ETH68, vmCfg) }
 
-func testRecvTransactions(t *testing.T, protocol uint) {
+func testRecvTransactions(t *testing.T, protocol uint, vmCfg vm.Config) {
 	t.Parallel()
 
 	// Create a message handler, configure it to accept transactions and watch them
@@ -331,9 +331,9 @@ func TestWaitSnapExtensionTimout68(t *testing.T) {
 	}
 }
 
-func testWaitSnapExtensionTimout68(t *testing.T, vmCfg vm.Config) { testWaitSnapExtensionTimout(t, eth.ETH68) }
+func testWaitSnapExtensionTimout68(t *testing.T, vmCfg vm.Config) { testWaitSnapExtensionTimout(t, eth.ETH68, vmCfg) }
 
-func testWaitSnapExtensionTimout(t *testing.T, protocol uint) {
+func testWaitSnapExtensionTimout(t *testing.T, protocol uint, vmCfg vm.Config) {
 	t.Parallel()
 
 	// Create a message handler, configure it to accept transactions and watch them
@@ -376,9 +376,9 @@ func TestWaitBscExtensionTimout68(t *testing.T) {
 	}
 }
 
-func testWaitBscExtensionTimout68(t *testing.T, vmCfg vm.Config) { testWaitBscExtensionTimout(t, eth.ETH68) }
+func testWaitBscExtensionTimout68(t *testing.T, vmCfg vm.Config) { testWaitBscExtensionTimout(t, eth.ETH68, vmCfg) }
 
-func testWaitBscExtensionTimout(t *testing.T, protocol uint) {
+func testWaitBscExtensionTimout(t *testing.T, protocol uint, vmCfg vm.Config) {
 	t.Parallel()
 
 	// Create a message handler, configure it to accept transactions and watch them
@@ -422,9 +422,9 @@ func TestSendTransactions68(t *testing.T) {
 	}
 }
 
-func testSendTransactions68(t *testing.T, vmCfg vm.Config) { testSendTransactions(t, eth.ETH68) }
+func testSendTransactions68(t *testing.T, vmCfg vm.Config) { testSendTransactions(t, eth.ETH68, vmCfg) }
 
-func testSendTransactions(t *testing.T, protocol uint) {
+func testSendTransactions(t *testing.T, protocol uint, vmCfg vm.Config) {
 	t.Parallel()
 
 	// Create a message handler and fill the pool with big transactions
@@ -514,9 +514,9 @@ func TestTransactionPropagation68(t *testing.T) {
 	}
 }
 
-func testTransactionPropagation68(t *testing.T, vmCfg vm.Config) { testTransactionPropagation(t, eth.ETH68) }
+func testTransactionPropagation68(t *testing.T, vmCfg vm.Config) { testTransactionPropagation(t, eth.ETH68, vmCfg) }
 
-func testTransactionPropagation(t *testing.T, protocol uint) {
+func testTransactionPropagation(t *testing.T, protocol uint, vmCfg vm.Config) {
 	t.Parallel()
 
 	// Create a source handler to send transactions from and a number of sinks
@@ -668,7 +668,7 @@ func testBroadcastBlock(t *testing.T, peers, bcasts int) {
 
 	// Create a source handler to broadcast blocks from and a number of sinks
 	// to receive them.
-	source := newTestHandlerWithBlocks(1, vmCfg)
+	source := newTestHandlerWithBlocks(1, vm.Config{})
 	defer source.close()
 
 	sinks := make([]*testEthHandler, peers)
@@ -755,7 +755,7 @@ func testBroadcastMalformedBlock(t *testing.T, protocol uint) {
 
 	// Create a source handler to broadcast blocks from and a number of sinks
 	// to receive them.
-	source := newTestHandlerWithBlocks(1, vmCfg)
+	source := newTestHandlerWithBlocks(1, vm.Config{})
 	defer source.close()
 
 	// Create a source handler to send messages through and a sink peer to receive them

@@ -29,7 +29,7 @@ import (
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/types"
-	"github.com/ethereum/go-ethereum/core/vm"
+	"github.com/ethereum/go-ethereum/internal/vmtest"
 	"github.com/ethereum/go-ethereum/p2p"
 	"github.com/ethereum/go-ethereum/p2p/enode"
 	"github.com/ethereum/go-ethereum/params"
@@ -126,7 +126,9 @@ func getChain() *core.BlockChain {
 		SnapshotWait:        true,
 	}
 	trieRoot = blocks[len(blocks)-1].Root()
-	bc, _ := core.NewBlockChain(rawdb.NewMemoryDatabase(), cacheConf, gspec, nil, ethash.NewFaker(), vm.Config{}, nil, nil)
+	// Use the first available config - EVM by default, MIR when TEST_WITH_MIR is set
+	vmCfg := vmtest.Configs()[0]
+	bc, _ := core.NewBlockChain(rawdb.NewMemoryDatabase(), cacheConf, gspec, nil, ethash.NewFaker(), vmCfg, nil, nil)
 	if _, err := bc.InsertChain(blocks); err != nil {
 		panic(err)
 	}

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -720,7 +721,7 @@ func NewMIRInterpreterAdapter(evm *EVM) *MIRInterpreterAdapter {
 }
 
 // mirTestVerifyPath, when true, logs MIR execution path for test verification
-var mirTestVerifyPath = false
+var mirTestVerifyPath = os.Getenv("MIR_TEST_VERIFY_PATH") == "true"
 
 // SetMIRTestVerifyPath enables/disables MIR path verification logging (testing only)
 func SetMIRTestVerifyPath(enabled bool) { mirTestVerifyPath = enabled }
@@ -730,7 +731,7 @@ func SetMIRTestVerifyPath(enabled bool) { mirTestVerifyPath = enabled }
 func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, readOnly bool) (ret []byte, err error) {
 	// Test verification logging
 	if mirTestVerifyPath {
-		log.Debug("[MIR-PATH-VERIFY] MIRInterpreterAdapter.Run ENTRY", "contract", contract.Address().Hex())
+		fmt.Println("[MIR-PATH-VERIFY] MIRInterpreterAdapter.Run ENTRY", "contract", contract.Address().Hex())
 	}
 	// PERFORMANCE: Only evaluate expensive Hex() when debug logging is enabled
 	if compiler.DebugLogsEnabled {
@@ -1717,14 +1718,14 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 		// An empty result (e.g., STOP) should not trigger fallback; mirror EVM semantics
 		// where a STOP simply returns empty bytes.
 		if mirTestVerifyPath {
-			log.Debug("[MIR-PATH-VERIFY] MIRInterpreterAdapter.Run COMPLETED (MIR execution SUCCESS)", "contract", contract.Address().Hex(), "resultLen", len(result))
+			fmt.Println("[MIR-PATH-VERIFY] MIRInterpreterAdapter.Run COMPLETED (MIR execution SUCCESS)", "contract", contract.Address().Hex(), "resultLen", len(result))
 		}
 		return result, nil
 	}
 	// If nothing returned from the entry, check for implicit STOP
 	if len(contract.Code) > 0 {
 		if mirTestVerifyPath {
-			log.Debug("[MIR-PATH-VERIFY] MIRInterpreterAdapter.Run COMPLETED (implicit STOP)", "contract", contract.Address().Hex())
+			fmt.Println("[MIR-PATH-VERIFY] MIRInterpreterAdapter.Run COMPLETED (implicit STOP)", "contract", contract.Address().Hex())
 		}
 		return nil, nil // Implicit STOP for code with no MIR-executable instructions
 	}

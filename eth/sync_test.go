@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/core"
+	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/eth/downloader"
 	"github.com/ethereum/go-ethereum/eth/ethconfig"
 	"github.com/ethereum/go-ethereum/eth/protocols/eth"
@@ -40,14 +41,14 @@ func testSnapSyncDisabling(t *testing.T, ethVer uint, snapVer uint) {
 	t.Parallel()
 
 	// Create an empty handler and ensure it's in snap sync mode
-	empty := newTestHandler()
+	empty := newTestHandler(vm.Config{})
 	if !empty.handler.snapSync.Load() {
 		t.Fatalf("snap sync disabled on pristine blockchain")
 	}
 	defer empty.close()
 
 	// Create a full handler and ensure snap sync ends up disabled
-	full := newTestHandlerWithBlocks(1024)
+	full := newTestHandlerWithBlocks(1024, vm.Config{})
 	if full.handler.snapSync.Load() {
 		t.Fatalf("snap sync not disabled on non-empty blockchain")
 	}
