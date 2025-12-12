@@ -134,11 +134,19 @@ func (journal *VoteJournal) verifyJournal(size, lastLatestVoteNumber int) bool {
 }
 
 func TestValidVotePool(t *testing.T) {
-	testVotePool(t, true)
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testVotePool(t, true, vmCfg)
+		})
+	}
 }
 
 func TestInvalidVotePool(t *testing.T) {
-	testVotePool(t, false)
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testVotePool(t, false, vmCfg)
+		})
+	}
 }
 
 func testVotePool(t *testing.T, isValidRules bool, vmCfg vm.Config) {

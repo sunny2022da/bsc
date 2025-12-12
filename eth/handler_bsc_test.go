@@ -35,13 +35,19 @@ func (h *testBscHandler) Handle(peer *bsc.Peer, packet bsc.Packet) error {
 	}
 }
 
-func TestSendVotes68(t *testing.T) { testSendVotes(t, eth.ETH68) }
+func TestSendVotes68(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testSendVotes(t, eth.ETH68, vmCfg)
+		})
+	}
+}
 
-func testSendVotes(t *testing.T, protocol uint) {
+func testSendVotes(t *testing.T, protocol uint, vmCfg vm.Config) {
 	t.Parallel()
 
 	// Create a message handler and fill the pool with big votes
-	handler := newTestHandler()
+	handler := newTestHandlerWithBlocksAndVMConfig(0, vmCfg)
 	defer handler.close()
 
 	insert := make([]*types.VoteEnvelope, 100)
@@ -153,13 +159,19 @@ func testSendVotes(t *testing.T, protocol uint) {
 	}
 }
 
-func TestRecvVotes68(t *testing.T) { testRecvVotes(t, eth.ETH68) }
+func TestRecvVotes68(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testRecvVotes(t, eth.ETH68, vmCfg)
+		})
+	}
+}
 
-func testRecvVotes(t *testing.T, protocol uint) {
+func testRecvVotes(t *testing.T, protocol uint, vmCfg vm.Config) {
 	t.Parallel()
 
 	// Create a message handler and fill the pool with big votes
-	handler := newTestHandler()
+	handler := newTestHandlerWithBlocksAndVMConfig(0, vmCfg)
 	defer handler.close()
 
 	protos := []p2p.Protocol{

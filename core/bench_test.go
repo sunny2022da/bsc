@@ -29,11 +29,17 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/ethdb/pebble"
+	"github.com/ethereum/go-ethereum/core/vm"
+	"github.com/ethereum/go-ethereum/internal/vmtest"
 	"github.com/ethereum/go-ethereum/params"
 )
 
 func BenchmarkInsertChain_empty_memdb(b *testing.B) {
-	benchInsertChain(b, false, nil)
+	for _, vmCfg := range vmtest.Configs() {
+		b.Run(vmtest.Name(vmCfg), func(b *testing.B) {
+			benchInsertChain(b, false, nil, vmCfg)
+		})
+	}
 }
 func BenchmarkInsertChain_empty_diskdb(b *testing.B) {
 	benchInsertChain(b, true, nil)
@@ -176,7 +182,7 @@ func genUncles(i int, gen *BlockGen) {
 	}
 }
 
-func benchInsertChain(b *testing.B, disk bool, gen func(int, *BlockGen)) {
+func benchInsertChain(b *testing.B, disk bool, gen func(int, *BlockGen), vmCfg vm.Config) {
 	// Create the database in memory or in a temporary directory.
 	var db ethdb.Database
 	if !disk {
