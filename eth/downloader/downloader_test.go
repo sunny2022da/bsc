@@ -687,13 +687,21 @@ func testBoundedForkedSync(t *testing.T, protocol uint, mode SyncMode, vmCfg vm.
 // chain head for short but heavy forks too. These are a bit special because they
 // take different ancestor lookup paths.
 func TestBoundedHeavyForkedSync68Full(t *testing.T) {
-	testBoundedHeavyForkedSync(t, eth.ETH68, FullSync)
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testBoundedHeavyForkedSync(t, eth.ETH68, FullSync, vmCfg)
+		})
+	}
 }
 func TestBoundedHeavyForkedSync68Snap(t *testing.T) {
-	testBoundedHeavyForkedSync(t, eth.ETH68, SnapSync)
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testBoundedHeavyForkedSync(t, eth.ETH68, SnapSync, vmCfg)
+		})
+	}
 }
 
-func testBoundedHeavyForkedSync(t *testing.T, protocol uint, mode SyncMode) {
+func testBoundedHeavyForkedSync(t *testing.T, protocol uint, mode SyncMode, vmCfg vm.Config) {
 	tester := newTesterWithVMConfig(t, vmCfg)
 	defer tester.terminate()
 
@@ -966,13 +974,21 @@ func testShiftedHeaderAttack(t *testing.T, protocol uint, mode SyncMode, vmCfg v
 // Tests that a peer advertising a high TD doesn't get to stall the downloader
 // afterwards by not sending any useful hashes.
 func TestHighTDStarvationAttack68Full(t *testing.T) {
-	testHighTDStarvationAttack(t, eth.ETH68, FullSync)
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testHighTDStarvationAttack(t, eth.ETH68, FullSync, vmCfg)
+		})
+	}
 }
 func TestHighTDStarvationAttack68Snap(t *testing.T) {
-	testHighTDStarvationAttack(t, eth.ETH68, SnapSync)
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testHighTDStarvationAttack(t, eth.ETH68, SnapSync, vmCfg)
+		})
+	}
 }
 
-func testHighTDStarvationAttack(t *testing.T, protocol uint, mode SyncMode) {
+func testHighTDStarvationAttack(t *testing.T, protocol uint, mode SyncMode, vmCfg vm.Config) {
 	tester := newTesterWithVMConfig(t, vmCfg)
 	defer tester.terminate()
 
@@ -984,9 +1000,15 @@ func testHighTDStarvationAttack(t *testing.T, protocol uint, mode SyncMode) {
 }
 
 // Tests that misbehaving peers are disconnected, whilst behaving ones are not.
-func TestBlockHeaderAttackerDropping68(t *testing.T) { testBlockHeaderAttackerDropping(t, eth.ETH68) }
+func TestBlockHeaderAttackerDropping68(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testBlockHeaderAttackerDropping(t, eth.ETH68, vmCfg)
+		})
+	}
+}
 
-func testBlockHeaderAttackerDropping(t *testing.T, protocol uint) {
+func testBlockHeaderAttackerDropping(t *testing.T, protocol uint, vmCfg vm.Config) {
 	// Define the disconnection requirement for individual hash fetch errors
 	tests := []struct {
 		result error
@@ -1032,10 +1054,22 @@ func testBlockHeaderAttackerDropping(t *testing.T, protocol uint) {
 
 // Tests that synchronisation progress (origin block number, current block number
 // and highest block number) is tracked and updated correctly.
-func TestSyncProgress68Full(t *testing.T) { testSyncProgress(t, eth.ETH68, FullSync) }
-func TestSyncProgress68Snap(t *testing.T) { testSyncProgress(t, eth.ETH68, SnapSync) }
+func TestSyncProgress68Full(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testSyncProgress(t, eth.ETH68, FullSync, vmCfg)
+		})
+	}
+}
+func TestSyncProgress68Snap(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testSyncProgress(t, eth.ETH68, SnapSync, vmCfg)
+		})
+	}
+}
 
-func testSyncProgress(t *testing.T, protocol uint, mode SyncMode) {
+func testSyncProgress(t *testing.T, protocol uint, mode SyncMode, vmCfg vm.Config) {
 	tester := newTesterWithVMConfig(t, vmCfg)
 	defer tester.terminate()
 
@@ -1108,10 +1142,22 @@ func checkProgress(t *testing.T, d *Downloader, stage string, want ethereum.Sync
 // Tests that synchronisation progress (origin block number and highest block
 // number) is tracked and updated correctly in case of a fork (or manual head
 // revertal).
-func TestForkedSyncProgress68Full(t *testing.T) { testForkedSyncProgress(t, eth.ETH68, FullSync) }
-func TestForkedSyncProgress68Snap(t *testing.T) { testForkedSyncProgress(t, eth.ETH68, SnapSync) }
+func TestForkedSyncProgress68Full(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testForkedSyncProgress(t, eth.ETH68, FullSync, vmCfg)
+		})
+	}
+}
+func TestForkedSyncProgress68Snap(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testForkedSyncProgress(t, eth.ETH68, SnapSync, vmCfg)
+		})
+	}
+}
 
-func testForkedSyncProgress(t *testing.T, protocol uint, mode SyncMode) {
+func testForkedSyncProgress(t *testing.T, protocol uint, mode SyncMode, vmCfg vm.Config) {
 	tester := newTesterWithVMConfig(t, vmCfg)
 	defer tester.terminate()
 
@@ -1178,10 +1224,22 @@ func testForkedSyncProgress(t *testing.T, protocol uint, mode SyncMode) {
 // Tests that if synchronisation is aborted due to some failure, then the progress
 // origin is not updated in the next sync cycle, as it should be considered the
 // continuation of the previous sync and not a new instance.
-func TestFailedSyncProgress68Full(t *testing.T) { testFailedSyncProgress(t, eth.ETH68, FullSync) }
-func TestFailedSyncProgress68Snap(t *testing.T) { testFailedSyncProgress(t, eth.ETH68, SnapSync) }
+func TestFailedSyncProgress68Full(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testFailedSyncProgress(t, eth.ETH68, FullSync, vmCfg)
+		})
+	}
+}
+func TestFailedSyncProgress68Snap(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testFailedSyncProgress(t, eth.ETH68, SnapSync, vmCfg)
+		})
+	}
+}
 
-func testFailedSyncProgress(t *testing.T, protocol uint, mode SyncMode) {
+func testFailedSyncProgress(t *testing.T, protocol uint, mode SyncMode, vmCfg vm.Config) {
 	tester := newTesterWithVMConfig(t, vmCfg)
 	defer tester.terminate()
 
@@ -1243,10 +1301,22 @@ func testFailedSyncProgress(t *testing.T, protocol uint, mode SyncMode) {
 
 // Tests that if an attacker fakes a chain height, after the attack is detected,
 // the progress height is successfully reduced at the next sync invocation.
-func TestFakedSyncProgress68Full(t *testing.T) { testFakedSyncProgress(t, eth.ETH68, FullSync) }
-func TestFakedSyncProgress68Snap(t *testing.T) { testFakedSyncProgress(t, eth.ETH68, SnapSync) }
+func TestFakedSyncProgress68Full(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testFakedSyncProgress(t, eth.ETH68, FullSync, vmCfg)
+		})
+	}
+}
+func TestFakedSyncProgress68Snap(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testFakedSyncProgress(t, eth.ETH68, SnapSync, vmCfg)
+		})
+	}
+}
 
-func testFakedSyncProgress(t *testing.T, protocol uint, mode SyncMode) {
+func testFakedSyncProgress(t *testing.T, protocol uint, mode SyncMode, vmCfg vm.Config) {
 	tester := newTesterWithVMConfig(t, vmCfg)
 	defer tester.terminate()
 

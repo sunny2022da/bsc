@@ -225,7 +225,7 @@ func generateTestChain() []*types.Block {
 	// Create a database pre-initialize with a genesis block
 	db := rawdb.NewMemoryDatabase()
 	genesis.MustCommit(db, triedb.NewDatabase(db, nil))
-	chain, _ := core.NewBlockChain(db, genesis, ethash.NewFaker(), core.DefaultConfig().WithVMConfig(vmCfg))
+	chain, _ := core.NewBlockChain(db, genesis, ethash.NewFaker(), core.DefaultConfig())
 	generate := func(i int, block *core.BlockGen) {
 		block.OffsetTime(5)
 		block.SetExtra([]byte("test"))

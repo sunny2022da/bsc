@@ -29,7 +29,6 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/core/vm"
-	"github.com/ethereum/go-ethereum/internal/vmtest"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/triedb"
 )
@@ -212,7 +211,8 @@ func newTestBlockchain(blocks []*types.Block) *core.BlockChain {
 		head = blocks[len(blocks)-1].Hash()
 	}
 	testBlockchainsLock.Lock()
-	if _, ok := testBlockchains[head]; !ok {
+	key := cacheKey{hash: head, enableMIR: false}
+	if _, ok := testBlockchains[key]; !ok {
 		testBlockchains[key] = new(testBlockchain)
 	}
 	tbc := testBlockchains[key]

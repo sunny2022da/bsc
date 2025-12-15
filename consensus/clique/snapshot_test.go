@@ -392,11 +392,15 @@ func testClique(t *testing.T, vmCfg vm.Config) {
 
 	// Run through the scenarios and test them
 	for i, tt := range tests {
-		t.Run(fmt.Sprint(i), tt.run)
+		tt := tt // capture for closure
+		vmCfgCopy := vmCfg // capture vmCfg for closure
+		t.Run(fmt.Sprint(i), func(t *testing.T) {
+			tt.runWithConfig(t, vmCfgCopy)
+		})
 	}
 }
 
-func (tt *cliqueTest) run(t *testing.T) {
+func (tt *cliqueTest) runWithConfig(t *testing.T, vmCfg vm.Config) {
 	// Create the account pool and generate the initial set of signers
 	accounts := newTesterAccountPool()
 

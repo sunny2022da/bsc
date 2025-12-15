@@ -42,37 +42,81 @@ func BenchmarkInsertChain_empty_memdb(b *testing.B) {
 	}
 }
 func BenchmarkInsertChain_empty_diskdb(b *testing.B) {
-	benchInsertChain(b, true, nil)
+	for _, vmCfg := range vmtest.Configs() {
+		b.Run(vmtest.Name(vmCfg), func(b *testing.B) {
+			benchInsertChain(b, true, nil, vmCfg)
+		})
+	}
 }
 func BenchmarkInsertChain_valueTx_memdb(b *testing.B) {
-	benchInsertChain(b, false, genValueTx(0))
+	for _, vmCfg := range vmtest.Configs() {
+		b.Run(vmtest.Name(vmCfg), func(b *testing.B) {
+			benchInsertChain(b, false, genValueTx(0), vmCfg)
+		})
+	}
 }
 func BenchmarkInsertChain_valueTx_diskdb(b *testing.B) {
-	benchInsertChain(b, true, genValueTx(0))
+	for _, vmCfg := range vmtest.Configs() {
+		b.Run(vmtest.Name(vmCfg), func(b *testing.B) {
+			benchInsertChain(b, true, genValueTx(0), vmCfg)
+		})
+	}
 }
 func BenchmarkInsertChain_valueTx_100kB_memdb(b *testing.B) {
-	benchInsertChain(b, false, genValueTx(100*1024))
+	for _, vmCfg := range vmtest.Configs() {
+		b.Run(vmtest.Name(vmCfg), func(b *testing.B) {
+			benchInsertChain(b, false, genValueTx(100*1024), vmCfg)
+		})
+	}
 }
 func BenchmarkInsertChain_valueTx_100kB_diskdb(b *testing.B) {
-	benchInsertChain(b, true, genValueTx(100*1024))
+	for _, vmCfg := range vmtest.Configs() {
+		b.Run(vmtest.Name(vmCfg), func(b *testing.B) {
+			benchInsertChain(b, true, genValueTx(100*1024), vmCfg)
+		})
+	}
 }
 func BenchmarkInsertChain_uncles_memdb(b *testing.B) {
-	benchInsertChain(b, false, genUncles)
+	for _, vmCfg := range vmtest.Configs() {
+		b.Run(vmtest.Name(vmCfg), func(b *testing.B) {
+			benchInsertChain(b, false, genUncles, vmCfg)
+		})
+	}
 }
 func BenchmarkInsertChain_uncles_diskdb(b *testing.B) {
-	benchInsertChain(b, true, genUncles)
+	for _, vmCfg := range vmtest.Configs() {
+		b.Run(vmtest.Name(vmCfg), func(b *testing.B) {
+			benchInsertChain(b, true, genUncles, vmCfg)
+		})
+	}
 }
 func BenchmarkInsertChain_ring200_memdb(b *testing.B) {
-	benchInsertChain(b, false, genTxRing(200))
+	for _, vmCfg := range vmtest.Configs() {
+		b.Run(vmtest.Name(vmCfg), func(b *testing.B) {
+			benchInsertChain(b, false, genTxRing(200), vmCfg)
+		})
+	}
 }
 func BenchmarkInsertChain_ring200_diskdb(b *testing.B) {
-	benchInsertChain(b, true, genTxRing(200))
+	for _, vmCfg := range vmtest.Configs() {
+		b.Run(vmtest.Name(vmCfg), func(b *testing.B) {
+			benchInsertChain(b, true, genTxRing(200), vmCfg)
+		})
+	}
 }
 func BenchmarkInsertChain_ring1000_memdb(b *testing.B) {
-	benchInsertChain(b, false, genTxRing(1000))
+	for _, vmCfg := range vmtest.Configs() {
+		b.Run(vmtest.Name(vmCfg), func(b *testing.B) {
+			benchInsertChain(b, false, genTxRing(1000), vmCfg)
+		})
+	}
 }
 func BenchmarkInsertChain_ring1000_diskdb(b *testing.B) {
-	benchInsertChain(b, true, genTxRing(1000))
+	for _, vmCfg := range vmtest.Configs() {
+		b.Run(vmtest.Name(vmCfg), func(b *testing.B) {
+			benchInsertChain(b, true, genTxRing(1000), vmCfg)
+		})
+	}
 }
 
 var (
