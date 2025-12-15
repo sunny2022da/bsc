@@ -279,6 +279,14 @@ func testCloseMiner(t *testing.T, vmCfg vm.Config) {
 // TestMinerSetEtherbase checks that etherbase becomes set even if mining isn't
 // possible at the moment
 func TestMinerSetEtherbase(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testMinerSetEtherbase(t, vmCfg)
+		})
+	}
+}
+
+func testMinerSetEtherbase(t *testing.T, vmCfg vm.Config) {
 	t.Parallel()
 	miner, mux, cleanup := createMiner(t, vmCfg)
 	defer cleanup(false)

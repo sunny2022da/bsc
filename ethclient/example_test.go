@@ -17,6 +17,7 @@
 package ethclient_test
 
 import (
+	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/node"
 )
 
