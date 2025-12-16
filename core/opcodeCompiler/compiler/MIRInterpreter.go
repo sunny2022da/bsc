@@ -1369,7 +1369,18 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 			return fmt.Errorf("BLOCKHASH missing operand")
 		}
 		num := it.evalValue(m.operands[0]).Uint64()
-		if it.env != nil && it.env.BlockHashFunc != nil {
+		// Apply EVM boundary check: BLOCKHASH can only access the most recent 256 blocks
+		// This matches the logic in core/vm/instructions.go opBlockhash
+		const blockhashLookback uint64 = 256
+		upper := it.env.BlockNumber
+		var lower uint64
+		if upper <= blockhashLookback {
+			lower = 0
+		} else {
+			lower = upper - blockhashLookback
+		}
+		// Only query if num is in valid range [lower, upper)
+		if num >= lower && num < upper && it.env != nil && it.env.BlockHashFunc != nil {
 			h := it.env.BlockHashFunc(num)
 			it.setResult(m, it.tmpA.Clear().SetBytes(h[:]))
 		} else {
