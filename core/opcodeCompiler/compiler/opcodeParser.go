@@ -375,20 +375,17 @@ func GenerateMIRCFG(hash common.Hash, code []byte) (*CFG, error) {
 			continue
 		}
 
-		// If block has no entry stack (missed by static analysis), try to seed from incoming stacks
-		// This handles dynamic jump targets that static analysis couldn't resolve.
+		// If block has no entry stack, try to seed from incoming stacks or static height.
+		// This handles both statically analyzed blocks and dynamic jump targets.
 		if bb.EntryStack() == nil {
 			// Check if we have static height from Pass 2
 			_, hasStaticHeight := heights[bb]
 
 			if !hasStaticHeight {
-				// We need an entry stack to build MIR (for PHIs).
-				// If we have incoming stacks from parents (discovered during build of parents), use one.
-				// Note: bb.IncomingStacks() is populated by AddIncomingStack called during parent build.
+				// Dynamic block: need to derive height from incoming stacks
 				incoming := bb.IncomingStacks()
 				if len(incoming) > 0 {
-					// Pick the first available stack
-					// Deterministic order iteration
+					// Pick the first available stack (deterministic order)
 					var parents []*MIRBasicBlock
 					for p := range incoming {
 						parents = append(parents, p)
@@ -396,26 +393,23 @@ func GenerateMIRCFG(hash common.Hash, code []byte) (*CFG, error) {
 					sort.Slice(parents, func(i, j int) bool {
 						return parents[i].FirstPC() < parents[j].FirstPC()
 					})
-
-					// Use stack from first parent
 					parentStack := incoming[parents[0]]
-					h := len(parentStack)
-					heights[bb] = h
-
-					// Optimization: if only one parent, inherit stack directly to avoid PHIs
-					// We must check static Parents() count, not just discovered incoming stacks,
-					// to avoid optimizing merge blocks prematurely.
-					if len(bb.Parents()) == 1 {
-						// Clone stack values
-						// We need to deep copy the slice, but values are pointers or structs?
-						// ValueStack is []Value.
-						newStack := make([]Value, len(parentStack))
-						copy(newStack, parentStack)
-						bb.SetEntryStack(newStack)
-					}
+					heights[bb] = len(parentStack)
 				} else {
 					// Unreachable and no known parents? Skip for now.
 					continue
+				}
+			}
+
+			// UNIFIED LOGIC: Single parent blocks inherit stack directly, no PHI needed.
+			// This applies to BOTH statically analyzed and dynamically discovered blocks.
+			// PHI nodes are only semantically correct when merging values from multiple paths.
+			if len(bb.Parents()) == 1 {
+				parent := bb.Parents()[0]
+				if parentStack := bb.IncomingStacks()[parent]; parentStack != nil {
+					newStack := make([]Value, len(parentStack))
+					copy(newStack, parentStack)
+					bb.SetEntryStack(newStack)
 				}
 			}
 		}
@@ -432,28 +426,25 @@ func GenerateMIRCFG(hash common.Hash, code []byte) (*CFG, error) {
 			}
 		}
 
-		// Create PHIs for entry stack if not already set
-		if bb.EntryStack() == nil {
+		// Create PHIs for entry stack ONLY if multiple parents exist.
+		// Single-parent blocks should have inherited the stack above.
+		if bb.EntryStack() == nil && len(bb.Parents()) > 1 {
 			entryStack := ValueStack{}
 			for i := 0; i < h; i++ {
-				// Create PHI
-				// Note: MIRInterpreter interprets phiStackIndex as index FROM TOP.
-				// Our loop i goes from 0 (bottom) to h-1 (top).
-				// So index from top = (h-1) - i.
+				// Create PHI for merging values from multiple parents
+				// phiStackIndex is index FROM TOP: (h-1) - i
 				phi := &MIR{
 					op:            MirPHI,
 					phiStackIndex: h - 1 - i,
 				}
-				// Ensure MIR instruction has correct PC context (start of block)
 				currentEVMBuildPC = bb.FirstPC()
-				// PHI doesn't map to a specific EVM op, but belongs to the block start
 				currentEVMBuildOp = 0
 				bb.appendMIR(phi)
 
 				val := Value{
 					kind:   Variable,
 					def:    phi,
-					liveIn: true, // Marked as live-in
+					liveIn: true,
 				}
 				entryStack.push(&val)
 			}
