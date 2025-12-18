@@ -647,7 +647,7 @@ func GenerateMIRCFG(hash common.Hash, code []byte) (*CFG, error) {
 
 		if len(children) > 0 {
 			bb.SetChildren(children)
-			// Update parent relationships
+			// Update parent relationships and set incoming stacks
 			for _, child := range children {
 				existingParents := child.Parents()
 				hasParent := false
@@ -660,7 +660,94 @@ func GenerateMIRCFG(hash common.Hash, code []byte) (*CFG, error) {
 				if !hasParent {
 					child.SetParents(append(existingParents, bb))
 				}
+				// Set incoming stack from parent's exit stack
+				if bb.ExitStack() != nil {
+					child.AddIncomingStack(bb, bb.ExitStack())
+				}
 			}
+		}
+	}
+
+	// Phase 1, Pass 7: Build newly discovered blocks
+	// After Phase 6 resolved PHI-based JUMP targets, some blocks may now have
+	// incoming stacks but weren't built. Build them now.
+	// Iterate until no new blocks are built (handles cascading discoveries).
+	for iteration := 0; iteration < 100; iteration++ { // Safety limit
+		built := 0
+
+		// Re-collect all blocks to include any state changes
+		// Use basicBlocks array to get ALL blocks including variants
+		var pass7Blocks []*MIRBasicBlock
+		for _, bb := range cfg.basicBlocks {
+			if bb != nil {
+				pass7Blocks = append(pass7Blocks, bb)
+			}
+		}
+
+		for _, bb := range pass7Blocks {
+			// Skip if already has instructions
+			if len(bb.Instructions()) > 0 {
+				continue
+			}
+			// Skip if no incoming stacks (truly unreachable)
+			incoming := bb.IncomingStacks()
+			if len(incoming) == 0 {
+				continue
+			}
+
+			// Derive stack height from incoming stacks
+			var h int
+			for _, stack := range incoming {
+				h = len(stack)
+				break
+			}
+
+			// Create entry stack with PHIs (same as Phase 3)
+			if bb.EntryStack() == nil {
+				entryStack := ValueStack{}
+				for i := 0; i < h; i++ {
+					phi := &MIR{
+						op:            MirPHI,
+						phiStackIndex: h - 1 - i,
+					}
+					currentEVMBuildPC = bb.FirstPC()
+					currentEVMBuildOp = 0
+					bb.appendMIR(phi)
+
+					val := Value{
+						kind:   Variable,
+						def:    phi,
+						liveIn: true,
+					}
+					entryStack.push(&val)
+				}
+				bb.SetEntryStack(entryStack.clone())
+			}
+
+			// Check if block starts with JUMPDEST and emit it first
+			if int(bb.FirstPC()) < len(cfg.rawCode) && ByteCode(cfg.rawCode[bb.FirstPC()]) == JUMPDEST {
+				currentEVMBuildPC = bb.FirstPC()
+				currentEVMBuildOp = byte(JUMPDEST)
+				mir := bb.CreateVoidMIR(MirJUMPDEST)
+				if mir != nil {
+					mir.genStackDepth = h
+				}
+			}
+
+			// Build the block
+			valStack := ValueStack{data: bb.EntryStack()}
+			err := cfg.buildBasicBlock(bb, &valStack, memoryAccessor, stateAccessor, nil)
+			if err != nil {
+				// Log error but continue - some blocks may legitimately fail
+				continue
+			}
+			bb.built = true
+			built++
+		}
+
+		// If no new blocks were built, we're done
+		if built == 0 {
+			break
 		}
 	}
 
