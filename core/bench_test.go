@@ -26,48 +26,97 @@ import (
 	"github.com/ethereum/go-ethereum/consensus/ethash"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/types"
-	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/ethdb/pebble"
+	"github.com/ethereum/go-ethereum/core/vm"
+	"github.com/ethereum/go-ethereum/internal/vmtest"
 	"github.com/ethereum/go-ethereum/params"
 )
 
 func BenchmarkInsertChain_empty_memdb(b *testing.B) {
-	benchInsertChain(b, false, nil)
+	for _, vmCfg := range vmtest.Configs() {
+		b.Run(vmtest.Name(vmCfg), func(b *testing.B) {
+			benchInsertChain(b, false, nil, vmCfg)
+		})
+	}
 }
 func BenchmarkInsertChain_empty_diskdb(b *testing.B) {
-	benchInsertChain(b, true, nil)
+	for _, vmCfg := range vmtest.Configs() {
+		b.Run(vmtest.Name(vmCfg), func(b *testing.B) {
+			benchInsertChain(b, true, nil, vmCfg)
+		})
+	}
 }
 func BenchmarkInsertChain_valueTx_memdb(b *testing.B) {
-	benchInsertChain(b, false, genValueTx(0))
+	for _, vmCfg := range vmtest.Configs() {
+		b.Run(vmtest.Name(vmCfg), func(b *testing.B) {
+			benchInsertChain(b, false, genValueTx(0), vmCfg)
+		})
+	}
 }
 func BenchmarkInsertChain_valueTx_diskdb(b *testing.B) {
-	benchInsertChain(b, true, genValueTx(0))
+	for _, vmCfg := range vmtest.Configs() {
+		b.Run(vmtest.Name(vmCfg), func(b *testing.B) {
+			benchInsertChain(b, true, genValueTx(0), vmCfg)
+		})
+	}
 }
 func BenchmarkInsertChain_valueTx_100kB_memdb(b *testing.B) {
-	benchInsertChain(b, false, genValueTx(100*1024))
+	for _, vmCfg := range vmtest.Configs() {
+		b.Run(vmtest.Name(vmCfg), func(b *testing.B) {
+			benchInsertChain(b, false, genValueTx(100*1024), vmCfg)
+		})
+	}
 }
 func BenchmarkInsertChain_valueTx_100kB_diskdb(b *testing.B) {
-	benchInsertChain(b, true, genValueTx(100*1024))
+	for _, vmCfg := range vmtest.Configs() {
+		b.Run(vmtest.Name(vmCfg), func(b *testing.B) {
+			benchInsertChain(b, true, genValueTx(100*1024), vmCfg)
+		})
+	}
 }
 func BenchmarkInsertChain_uncles_memdb(b *testing.B) {
-	benchInsertChain(b, false, genUncles)
+	for _, vmCfg := range vmtest.Configs() {
+		b.Run(vmtest.Name(vmCfg), func(b *testing.B) {
+			benchInsertChain(b, false, genUncles, vmCfg)
+		})
+	}
 }
 func BenchmarkInsertChain_uncles_diskdb(b *testing.B) {
-	benchInsertChain(b, true, genUncles)
+	for _, vmCfg := range vmtest.Configs() {
+		b.Run(vmtest.Name(vmCfg), func(b *testing.B) {
+			benchInsertChain(b, true, genUncles, vmCfg)
+		})
+	}
 }
 func BenchmarkInsertChain_ring200_memdb(b *testing.B) {
-	benchInsertChain(b, false, genTxRing(200))
+	for _, vmCfg := range vmtest.Configs() {
+		b.Run(vmtest.Name(vmCfg), func(b *testing.B) {
+			benchInsertChain(b, false, genTxRing(200), vmCfg)
+		})
+	}
 }
 func BenchmarkInsertChain_ring200_diskdb(b *testing.B) {
-	benchInsertChain(b, true, genTxRing(200))
+	for _, vmCfg := range vmtest.Configs() {
+		b.Run(vmtest.Name(vmCfg), func(b *testing.B) {
+			benchInsertChain(b, true, genTxRing(200), vmCfg)
+		})
+	}
 }
 func BenchmarkInsertChain_ring1000_memdb(b *testing.B) {
-	benchInsertChain(b, false, genTxRing(1000))
+	for _, vmCfg := range vmtest.Configs() {
+		b.Run(vmtest.Name(vmCfg), func(b *testing.B) {
+			benchInsertChain(b, false, genTxRing(1000), vmCfg)
+		})
+	}
 }
 func BenchmarkInsertChain_ring1000_diskdb(b *testing.B) {
-	benchInsertChain(b, true, genTxRing(1000))
+	for _, vmCfg := range vmtest.Configs() {
+		b.Run(vmtest.Name(vmCfg), func(b *testing.B) {
+			benchInsertChain(b, true, genTxRing(1000), vmCfg)
+		})
+	}
 }
 
 var (
@@ -177,7 +226,7 @@ func genUncles(i int, gen *BlockGen) {
 	}
 }
 
-func benchInsertChain(b *testing.B, disk bool, gen func(int, *BlockGen)) {
+func benchInsertChain(b *testing.B, disk bool, gen func(int, *BlockGen), vmCfg vm.Config) {
 	// Create the database in memory or in a temporary directory.
 	var db ethdb.Database
 	if !disk {
@@ -200,7 +249,7 @@ func benchInsertChain(b *testing.B, disk bool, gen func(int, *BlockGen)) {
 
 	// Time the insertion of the new chain.
 	// State and blocks are stored in the same DB.
-	chainman, _ := NewBlockChain(db, nil, gspec, nil, ethash.NewFaker(), vm.Config{}, nil, nil)
+	chainman, _ := NewBlockChain(db, gspec, ethash.NewFaker(), nil)
 	defer chainman.Stop()
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -326,9 +375,7 @@ func benchReadChain(b *testing.B, full bool, count uint64) {
 	genesis := &Genesis{Config: params.AllEthashProtocolChanges}
 	makeChainForBench(db, genesis, full, count)
 	db.Close()
-	cacheConfig := *defaultCacheConfig
-	cacheConfig.TrieDirtyDisabled = true
-
+	options := DefaultConfig().WithArchive(true)
 	b.ReportAllocs()
 	b.ResetTimer()
 
@@ -339,7 +386,7 @@ func benchReadChain(b *testing.B, full bool, count uint64) {
 		}
 		db = rawdb.NewDatabase(pdb)
 
-		chain, err := NewBlockChain(db, &cacheConfig, genesis, nil, ethash.NewFaker(), vm.Config{}, nil, nil)
+		chain, err := NewBlockChain(db, genesis, ethash.NewFaker(), options)
 		if err != nil {
 			b.Fatalf("error creating chain: %v", err)
 		}

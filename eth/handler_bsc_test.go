@@ -7,11 +7,12 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core"
-	"github.com/ethereum/go-ethereum/core/forkid"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/eth/protocols/bsc"
 	"github.com/ethereum/go-ethereum/eth/protocols/eth"
 	"github.com/ethereum/go-ethereum/event"
+	"github.com/ethereum/go-ethereum/core/vm"
+	"github.com/ethereum/go-ethereum/internal/vmtest"
 	"github.com/ethereum/go-ethereum/p2p"
 	"github.com/ethereum/go-ethereum/p2p/enode"
 )
@@ -36,13 +37,19 @@ func (h *testBscHandler) Handle(peer *bsc.Peer, packet bsc.Packet) error {
 	}
 }
 
-func TestSendVotes68(t *testing.T) { testSendVotes(t, eth.ETH68) }
+func TestSendVotes68(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testSendVotes(t, eth.ETH68, vmCfg)
+		})
+	}
+}
 
-func testSendVotes(t *testing.T, protocol uint) {
+func testSendVotes(t *testing.T, protocol uint, vmCfg vm.Config) {
 	t.Parallel()
 
 	// Create a message handler and fill the pool with big votes
-	handler := newTestHandler()
+	handler := newTestHandlerWithBlocksAndVMConfig(0, vmCfg)
 	defer handler.close()
 
 	insert := make([]*types.VoteEnvelope, 100)
@@ -120,12 +127,11 @@ func testSendVotes(t *testing.T, protocol uint) {
 
 	// Run the handshake locally to avoid spinning up a source handler
 	var (
-		genesis = handler.chain.Genesis()
-		head    = handler.chain.CurrentBlock()
-		td      = handler.chain.GetTd(head.Hash(), head.Number.Uint64())
+		head = handler.chain.CurrentBlock()
+		td   = handler.chain.GetTd(head.Hash(), head.Number.Uint64())
 	)
 	time.Sleep(200 * time.Millisecond)
-	if err := remoteEth.Handshake(1, td, head.Hash(), genesis.Hash(), forkid.NewIDWithChain(handler.chain), forkid.NewFilter(handler.chain), nil); err != nil {
+	if err := remoteEth.Handshake(1, handler.chain, eth.BlockRangeUpdatePacket{}, td, nil); err != nil {
 		t.Fatalf("failed to run protocol handshake: %d", err)
 	}
 	// After the handshake completes, the source handler should stream the sink
@@ -155,13 +161,19 @@ func testSendVotes(t *testing.T, protocol uint) {
 	}
 }
 
-func TestRecvVotes68(t *testing.T) { testRecvVotes(t, eth.ETH68) }
+func TestRecvVotes68(t *testing.T) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testRecvVotes(t, eth.ETH68, vmCfg)
+		})
+	}
+}
 
-func testRecvVotes(t *testing.T, protocol uint) {
+func testRecvVotes(t *testing.T, protocol uint, vmCfg vm.Config) {
 	t.Parallel()
 
 	// Create a message handler and fill the pool with big votes
-	handler := newTestHandler()
+	handler := newTestHandlerWithBlocksAndVMConfig(0, vmCfg)
 	defer handler.close()
 
 	protos := []p2p.Protocol{
@@ -222,12 +234,11 @@ func testRecvVotes(t *testing.T, protocol uint) {
 
 	// Run the handshake locally to avoid spinning up a source handler
 	var (
-		genesis = handler.chain.Genesis()
-		head    = handler.chain.CurrentBlock()
-		td      = handler.chain.GetTd(head.Hash(), head.Number.Uint64())
+		head = handler.chain.CurrentBlock()
+		td   = handler.chain.GetTd(head.Hash(), head.Number.Uint64())
 	)
 	time.Sleep(200 * time.Millisecond)
-	if err := remoteEth.Handshake(1, td, head.Hash(), genesis.Hash(), forkid.NewIDWithChain(handler.chain), forkid.NewFilter(handler.chain), nil); err != nil {
+	if err := remoteEth.Handshake(1, handler.chain, eth.BlockRangeUpdatePacket{}, td, nil); err != nil {
 		t.Fatalf("failed to run protocol handshake: %d", err)
 	}
 

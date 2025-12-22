@@ -18,6 +18,9 @@ import (
 )
 
 func TestMIRParity_USDT(t *testing.T) {
+	// Clear MIR cache to prevent CFG pollution from previous tests
+	compiler.ClearMIRCache()
+
 	// Decode USDT bytecode from benchmarks
 	realCode, err := hex.DecodeString(usdtHex[2:])
 	if err != nil {
@@ -84,7 +87,7 @@ func TestMIRParity_USDT(t *testing.T) {
 		}}
 		baseEnv := runtime.NewEnv(baseCfg)
 		baseAddr := common.BytesToAddress([]byte("contract_usdt_base"))
-		baseSender := vm.AccountRef(baseCfg.Origin)
+		baseSender := baseCfg.Origin
 		baseEnv.StateDB.CreateAccount(baseAddr)
 		baseEnv.StateDB.SetCode(baseAddr, realCode)
 		baseCallValue := uint256.NewInt(0)
@@ -103,7 +106,7 @@ func TestMIRParity_USDT(t *testing.T) {
 		})
 		mirEnv := runtime.NewEnv(mirCfg)
 		mirAddr := common.BytesToAddress([]byte("contract_usdt_mir"))
-		mirSender := vm.AccountRef(mirCfg.Origin)
+		mirSender := mirCfg.Origin
 		mirEnv.StateDB.CreateAccount(mirAddr)
 		mirEnv.StateDB.SetCode(mirAddr, realCode)
 		mirCallValue := uint256.NewInt(0)
@@ -203,7 +206,7 @@ func TestMIRParity_WBNB(t *testing.T) {
 		}}
 		baseEnv := runtime.NewEnv(baseCfg)
 		baseAddr := common.BytesToAddress([]byte("contract_wbnb_base"))
-		baseSender := vm.AccountRef(baseCfg.Origin)
+		baseSender := baseCfg.Origin
 		baseEnv.StateDB.CreateAccount(baseAddr)
 		baseEnv.StateDB.SetCode(baseAddr, code)
 		// per-call value and optional funding (for deposit)
@@ -229,7 +232,7 @@ func TestMIRParity_WBNB(t *testing.T) {
 		})
 		mirEnv := runtime.NewEnv(mirCfg)
 		mirAddr := common.BytesToAddress([]byte("contract_wbnb_mir"))
-		mirSender := vm.AccountRef(mirCfg.Origin)
+		mirSender := mirCfg.Origin
 		mirEnv.StateDB.CreateAccount(mirAddr)
 		mirEnv.StateDB.SetCode(mirAddr, code)
 		mirCallValue := uint256.NewInt(0)
@@ -244,7 +247,7 @@ func TestMIRParity_WBNB(t *testing.T) {
 			baseEnv.StateDB.CreateAccount(baseAddr)
 			baseEnv.StateDB.SetCode(baseAddr, code)
 			baseEnv.StateDB.AddBalance(baseCfg.Origin, uint256.MustFromBig(val), tracing.BalanceIncreaseGenesisBalance)
-			baseSender = vm.AccountRef(baseCfg.Origin)
+			baseSender = baseCfg.Origin
 			baseRet, baseGasLeft, baseErr = baseEnv.Call(baseSender, baseAddr, input, baseCfg.GasLimit, uint256.MustFromBig(val))
 		}
 		mirRet, mirGasLeft, mirErr := mirEnv.Call(mirSender, mirAddr, input, mirCfg.GasLimit, mirCallValue)
@@ -294,7 +297,7 @@ func TestMIRParity_Tiny(t *testing.T) {
 	// Base
 	baseEnv := runtime.NewEnv(baseCfg)
 	baseAddr := common.BytesToAddress([]byte("tiny_base"))
-	baseSender := vm.AccountRef(baseCfg.Origin)
+	baseSender := baseCfg.Origin
 	baseEnv.StateDB.CreateAccount(baseAddr)
 	baseEnv.StateDB.SetCode(baseAddr, code)
 	baseRet, baseGasLeft, baseErr := baseEnv.Call(baseSender, baseAddr, input, baseCfg.GasLimit, uint256.NewInt(0))
@@ -306,7 +309,7 @@ func TestMIRParity_Tiny(t *testing.T) {
 	compiler.EnableOpcodeParse()
 	mirEnv := runtime.NewEnv(mirCfg)
 	mirAddr := common.BytesToAddress([]byte("tiny_mir"))
-	mirSender := vm.AccountRef(mirCfg.Origin)
+	mirSender := mirCfg.Origin
 	mirEnv.StateDB.CreateAccount(mirAddr)
 	mirEnv.StateDB.SetCode(mirAddr, code)
 	mirRet, mirGasLeft, mirErr := mirEnv.Call(mirSender, mirAddr, input, mirCfg.GasLimit, uint256.NewInt(0))
@@ -361,7 +364,7 @@ func TestMIRGasTrace_USDT_Decimals(t *testing.T) {
 	// Base
 	baseEnv := runtime.NewEnv(baseCfg)
 	baseAddr := common.BytesToAddress([]byte("usdt_decimals_base"))
-	baseSender := vm.AccountRef(baseCfg.Origin)
+	baseSender := baseCfg.Origin
 	baseEnv.StateDB.CreateAccount(baseAddr)
 	baseEnv.StateDB.SetCode(baseAddr, code)
 	_, baseGasLeft, _ := baseEnv.Call(baseSender, baseAddr, input, baseCfg.GasLimit, uint256.NewInt(0))
@@ -370,7 +373,7 @@ func TestMIRGasTrace_USDT_Decimals(t *testing.T) {
 	compiler.EnableOpcodeParse()
 	mirEnv := runtime.NewEnv(mirCfg)
 	mirAddr := common.BytesToAddress([]byte("usdt_decimals_mir"))
-	mirSender := vm.AccountRef(mirCfg.Origin)
+	mirSender := mirCfg.Origin
 	mirEnv.StateDB.CreateAccount(mirAddr)
 	mirEnv.StateDB.SetCode(mirAddr, code)
 	_, mirGasLeft, _ := mirEnv.Call(mirSender, mirAddr, input, mirCfg.GasLimit, uint256.NewInt(0))

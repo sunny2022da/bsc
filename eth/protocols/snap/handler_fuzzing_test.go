@@ -29,9 +29,9 @@ import (
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/types"
-	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/p2p"
 	"github.com/ethereum/go-ethereum/p2p/enode"
+	"github.com/ethereum/go-ethereum/internal/vmtest"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
 	fuzz "github.com/google/gofuzz"
@@ -117,16 +117,17 @@ func getChain() *core.BlockChain {
 		Alloc:  ga,
 	}
 	_, blocks, _ := core.GenerateChainWithGenesis(gspec, ethash.NewFaker(), 2, func(i int, gen *core.BlockGen) {})
-	cacheConf := &core.CacheConfig{
-		TrieCleanLimit:      0,
-		TrieDirtyLimit:      0,
-		TrieTimeLimit:       5 * time.Minute,
-		TrieCleanNoPrefetch: true,
-		SnapshotLimit:       100,
-		SnapshotWait:        true,
+	options := &core.BlockChainConfig{
+		TrieCleanLimit: 0,
+		TrieDirtyLimit: 0,
+		TrieTimeLimit:  5 * time.Minute,
+		NoPrefetch:     true,
+		SnapshotLimit:  100,
+		SnapshotWait:   true,
 	}
 	trieRoot = blocks[len(blocks)-1].Root()
-	bc, _ := core.NewBlockChain(rawdb.NewMemoryDatabase(), cacheConf, gspec, nil, ethash.NewFaker(), vm.Config{}, nil, nil)
+	vmCfg := vmtest.Configs()[0]
+	bc, _ := core.NewBlockChain(rawdb.NewMemoryDatabase(), gspec, ethash.NewFaker(), options.WithVMConfig(vmCfg))
 	if _, err := bc.InsertChain(blocks); err != nil {
 		panic(err)
 	}

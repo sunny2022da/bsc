@@ -41,10 +41,11 @@ import (
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/types"
-	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/eth/downloader"
 	"github.com/ethereum/go-ethereum/event"
+	"github.com/ethereum/go-ethereum/core/vm"
+	"github.com/ethereum/go-ethereum/internal/vmtest"
 	"github.com/ethereum/go-ethereum/params"
 )
 
@@ -133,14 +134,22 @@ func (journal *VoteJournal) verifyJournal(size, lastLatestVoteNumber int) bool {
 }
 
 func TestValidVotePool(t *testing.T) {
-	testVotePool(t, true)
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testVotePool(t, true, vmCfg)
+		})
+	}
 }
 
 func TestInvalidVotePool(t *testing.T) {
-	testVotePool(t, false)
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			testVotePool(t, false, vmCfg)
+		})
+	}
 }
 
-func testVotePool(t *testing.T, isValidRules bool) {
+func testVotePool(t *testing.T, isValidRules bool, vmCfg vm.Config) {
 	walletPasswordDir, walletDir := setUpKeyManager(t)
 
 	genesis := &core.Genesis{
@@ -150,7 +159,7 @@ func testVotePool(t *testing.T, isValidRules bool) {
 
 	mux := new(event.TypeMux)
 	db := rawdb.NewMemoryDatabase()
-	chain, _ := core.NewBlockChain(db, nil, genesis, nil, ethash.NewFullFaker(), vm.Config{}, nil, nil)
+	chain, _ := core.NewBlockChain(db, genesis, ethash.NewFullFaker(), core.DefaultConfig().WithVMConfig(vmCfg))
 
 	var mockEngine consensus.PoSA
 	if isValidRules {
@@ -285,7 +294,7 @@ func testVotePool(t *testing.T, isValidRules bool) {
 	// Test future votes scenario: votes number within latestBlockHeader ~ latestBlockHeader + 11
 	futureVote := &types.VoteEnvelope{
 		Data: &types.VoteData{
-			TargetNumber: 294,
+			TargetNumber: 314,
 		},
 	}
 	if err := voteManager.signer.SignVote(futureVote); err != nil {
@@ -305,7 +314,7 @@ func testVotePool(t *testing.T, isValidRules bool) {
 	// Test duplicate vote case, shouldn'd be put into vote pool
 	duplicateVote := &types.VoteEnvelope{
 		Data: &types.VoteData{
-			TargetNumber: 294,
+			TargetNumber: 314,
 		},
 	}
 	if err := voteManager.signer.SignVote(duplicateVote); err != nil {
@@ -334,14 +343,14 @@ func testVotePool(t *testing.T, isValidRules bool) {
 		t.Fatalf("put vote failed")
 	}
 
-	// Test transfer votes from future to cur, latest block header is #308 after the following generation
-	// For the above BlockNumber 279, it did not have blockHash, should be assigned as well below.
-	curNumber := 288
+	// Test transfer votes from future to cur, latest block header is #328 after the following generation
+	// For the above BlockNumber 314, it did not have blockHash, should be assigned as well below.
+	curNumber := 308
 	var futureBlockHash common.Hash
 	for i := 0; i < 20; i++ {
 		bs, _ = core.GenerateChain(params.TestChainConfig, bs[len(bs)-1], ethash.NewFaker(), db, 1, nil)
 		curNumber += 1
-		if curNumber == 294 {
+		if curNumber == 314 {
 			futureBlockHash = bs[0].Hash()
 			futureVotesMap := votePool.futureVotes
 			voteBox := futureVotesMap[common.Hash{}]

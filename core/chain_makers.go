@@ -29,6 +29,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/systemcontracts"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/core/opcodeCompiler/compiler"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/params"
@@ -128,7 +129,7 @@ func (b *BlockGen) addTx(bc *BlockChain, vmConfig vm.Config, tx *types.Transacti
 	}
 	// Merge the tx-local access event into the "block-local" one, in order to collect
 	// all values, so that the witness can be built.
-	if b.statedb.GetTrie().IsVerkle() {
+	if b.statedb.Database().TrieDB().IsVerkle() {
 		b.statedb.AccessEvents().Merge(evm.AccessEvents)
 	}
 	b.txs = append(b.txs, tx)
@@ -168,6 +169,16 @@ func (b *BlockGen) AddTxWithChain(bc *BlockChain, tx *types.Transaction) {
 // The evm interpreter can be customized with the provided vm config.
 func (b *BlockGen) AddTxWithVMConfig(tx *types.Transaction, config vm.Config) {
 	b.addTx(nil, config, tx)
+}
+
+// AddTxWithVMConfigForTest adds a transaction to the generated block with custom vm.Config.
+// Unlike AddTxWithVMConfig, this method creates a proper ChainContext to support
+// all EVM features including blob gas calculation (EIP-4844).
+// This method is intended for testing purposes where vm.Config needs to be customized
+// (e.g., enabling MIR interpreter) and the genesis may have ExcessBlobGas set.
+func (b *BlockGen) AddTxWithVMConfigForTest(tx *types.Transaction, config vm.Config) {
+	bc := &BlockChain{chainConfig: b.cm.config}
+	b.addTx(bc, config, tx)
 }
 
 // GetBalance returns the balance of the given address at the generated block.
@@ -350,9 +361,13 @@ func (b *BlockGen) collectRequests(readonly bool) (requests [][]byte) {
 		blockContext := NewEVMBlockContext(b.header, b.cm, &b.header.Coinbase)
 		evm := vm.NewEVM(blockContext, statedb, b.cm.config, vm.Config{})
 		// EIP-7002
-		ProcessWithdrawalQueue(&requests, evm)
+		if err := ProcessWithdrawalQueue(&requests, evm); err != nil {
+			panic(fmt.Sprintf("could not process withdrawal requests: %v", err))
+		}
 		// EIP-7251
-		ProcessConsolidationQueue(&requests, evm)
+		if err := ProcessConsolidationQueue(&requests, evm); err != nil {
+			panic(fmt.Sprintf("could not process consolidation requests: %v", err))
+		}
 	}
 	return requests
 }
@@ -445,7 +460,7 @@ func GenerateChain(config *params.ChainConfig, parent *types.Block, engine conse
 		}
 
 		// Write state changes to db
-		root, _, err := statedb.Commit(b.header.Number.Uint64(), config.IsEIP158(b.header.Number), config.IsCancun(b.header.Number, b.header.Time))
+		root, err := statedb.Commit(b.header.Number.Uint64(), config.IsEIP158(b.header.Number), config.IsCancun(b.header.Number, b.header.Time))
 		if err != nil {
 			panic(fmt.Sprintf("state write error: %v", err))
 		}
@@ -511,6 +526,33 @@ func GenerateChainWithGenesis(genesis *Genesis, engine consensus.Engine, n int, 
 	return db, blocks, receipts
 }
 
+// GenerateChainWithGenesisAndVMConfig is similar to GenerateChainWithGenesis but allows
+// passing a custom vm.Config. The generator function receives the vmConfig so that
+// transactions can be added with the same configuration using AddTxWithVMConfigForTest.
+// This is intended for testing purposes where consistent vm.Config is needed across
+// block generation and validation (e.g., for MIR interpreter testing).
+func GenerateChainWithGenesisAndVMConfig(genesis *Genesis, engine consensus.Engine, n int, gen func(int, *BlockGen, vm.Config), vmCfg vm.Config) (ethdb.Database, []*types.Block, []types.Receipts) {
+	// Clear MIR cache only when MIR is enabled to prevent interference between tests
+	if vmCfg.EnableMIR {
+		compiler.ClearMIRCache()
+	}
+	db := rawdb.NewMemoryDatabase()
+	triedb := triedb.NewDatabase(db, triedb.HashDefaults)
+	defer triedb.Close()
+	_, err := genesis.Commit(db, triedb)
+	if err != nil {
+		panic(err)
+	}
+	// Wrap the generator to pass vmCfg
+	wrappedGen := func(i int, b *BlockGen) {
+		if gen != nil {
+			gen(i, b, vmCfg)
+		}
+	}
+	blocks, receipts := GenerateChain(genesis.Config, genesis.ToBlock(), engine, db, n, wrappedGen)
+	return db, blocks, receipts
+}
+
 func GenerateVerkleChain(config *params.ChainConfig, parent *types.Block, engine consensus.Engine, db ethdb.Database, trdb *triedb.Database, n int, gen func(int, *BlockGen)) ([]*types.Block, []types.Receipts, []*verkle.VerkleProof, []verkle.StateDiff) {
 	if config == nil {
 		config = params.TestChainConfig
@@ -537,6 +579,13 @@ func GenerateVerkleChain(config *params.ChainConfig, parent *types.Block, engine
 		if gen != nil {
 			gen(i, b)
 		}
+
+		requests := b.collectRequests(false)
+		if requests != nil {
+			reqHash := types.CalcRequestsHash(requests)
+			b.header.RequestsHash = &reqHash
+		}
+
 		body := &types.Body{
 			Transactions: b.txs,
 			Uncles:       b.uncles,
@@ -548,7 +597,7 @@ func GenerateVerkleChain(config *params.ChainConfig, parent *types.Block, engine
 		}
 
 		// Write state changes to DB.
-		root, _, err := statedb.Commit(b.header.Number.Uint64(), config.IsEIP158(b.header.Number), config.IsCancun(b.header.Number, b.header.Time))
+		root, err := statedb.Commit(b.header.Number.Uint64(), config.IsEIP158(b.header.Number), config.IsCancun(b.header.Number, b.header.Time))
 		if err != nil {
 			panic(fmt.Sprintf("state write error: %v", err))
 		}
@@ -601,7 +650,7 @@ func GenerateVerkleChain(config *params.ChainConfig, parent *types.Block, engine
 
 func GenerateVerkleChainWithGenesis(genesis *Genesis, engine consensus.Engine, n int, gen func(int, *BlockGen)) (common.Hash, ethdb.Database, []*types.Block, []types.Receipts, []*verkle.VerkleProof, []verkle.StateDiff) {
 	db := rawdb.NewMemoryDatabase()
-	cacheConfig := DefaultCacheConfigWithScheme(rawdb.PathScheme)
+	cacheConfig := DefaultConfig().WithStateScheme(rawdb.PathScheme)
 	cacheConfig.SnapshotLimit = 0
 	triedb := triedb.NewDatabase(db, cacheConfig.triedbConfig(true))
 	defer triedb.Close()

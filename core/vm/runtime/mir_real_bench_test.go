@@ -87,7 +87,7 @@ func BenchmarkMIRVsEVM_USDT(b *testing.B) {
 			}
 			evm := runtime.NewEnv(cfgBase)
 			address := common.BytesToAddress([]byte("contract_usdt"))
-			sender := vm.AccountRef(cfgBase.Origin)
+			sender := cfgBase.Origin
 			evm.StateDB.CreateAccount(address)
 			evm.StateDB.SetCode(address, realCode)
 
@@ -104,7 +104,7 @@ func BenchmarkMIRVsEVM_USDT(b *testing.B) {
 			}
 			evm := runtime.NewEnv(cfgMIR)
 			address := common.BytesToAddress([]byte("contract_usdt"))
-			sender := vm.AccountRef(cfgMIR.Origin)
+			sender := cfgMIR.Origin
 			evm.StateDB.CreateAccount(address)
 			evm.StateDB.SetCode(address, realCode)
 
@@ -166,7 +166,7 @@ func BenchmarkMIRVsEVM_WBNB(b *testing.B) {
 				}
 				evm := runtime.NewEnv(cfgBase)
 				address := common.BytesToAddress([]byte("contract_wbnb"))
-				sender := vm.AccountRef(cfgBase.Origin)
+				sender := cfgBase.Origin
 				evm.StateDB.CreateAccount(address)
 				evm.StateDB.SetCode(address, code)
 
@@ -187,7 +187,7 @@ func BenchmarkMIRVsEVM_WBNB(b *testing.B) {
 				}
 				evm := runtime.NewEnv(cfgMIR)
 				address := common.BytesToAddress([]byte("contract_wbnb"))
-				sender := vm.AccountRef(cfgMIR.Origin)
+				sender := cfgMIR.Origin
 				evm.StateDB.CreateAccount(address)
 				evm.StateDB.SetCode(address, code)
 
@@ -508,6 +508,9 @@ func TestDumpUSDTMIRAndEVM(t *testing.T) {
 
 // TestUSDT_MIRVsEVM_Parity compares outputs of MIR vs base EVM for key USDT selectors
 func TestUSDT_MIRVsEVM_Parity(t *testing.T) {
+	// Clear MIR cache to prevent CFG pollution from previous tests
+	compiler.ClearMIRCache()
+
 	// Decode USDT runtime bytecode
 	code, err := hex.DecodeString(usdtHex[2:])
 	if err != nil {
@@ -552,7 +555,7 @@ func TestUSDT_MIRVsEVM_Parity(t *testing.T) {
 		}
 		evm := runtime.NewEnv(cfg)
 		address := common.BytesToAddress([]byte(label))
-		sender := vm.AccountRef(cfg.Origin)
+		sender := cfg.Origin
 		evm.StateDB.CreateAccount(address)
 		evm.StateDB.SetCode(address, code)
 		ret, _, err := evm.Call(sender, address, input, cfg.GasLimit, uint256.MustFromBig(cfg.Value))
@@ -602,6 +605,9 @@ func TestUSDT_MIRVsEVM_Parity(t *testing.T) {
 // TestUSDT_MIR_Strict_ListFailures enables MIR strict mode (no fallback) and
 // lists any selectors that fail or mismatch versus base EVM.
 func TestUSDT_MIR_Strict_ListFailures(t *testing.T) {
+	// Clear MIR cache to prevent CFG pollution from previous tests
+	compiler.ClearMIRCache()
+
 	code, err := hex.DecodeString(usdtHex[2:])
 	if err != nil {
 		t.Fatalf("decode USDT hex: %v", err)
@@ -637,7 +643,7 @@ func TestUSDT_MIR_Strict_ListFailures(t *testing.T) {
 		}
 		evm := runtime.NewEnv(cfg)
 		address := common.BytesToAddress([]byte(label))
-		sender := vm.AccountRef(cfg.Origin)
+		sender := cfg.Origin
 		evm.StateDB.CreateAccount(address)
 		evm.StateDB.SetCode(address, code)
 		ret, _, err := evm.Call(sender, address, input, cfg.GasLimit, uint256.MustFromBig(cfg.Value))
@@ -697,7 +703,7 @@ func TestWBNB_MIR_Strict_ListFailures(t *testing.T) {
 		}
 		evm := runtime.NewEnv(cfg)
 		address := common.BytesToAddress([]byte(label))
-		sender := vm.AccountRef(cfg.Origin)
+		sender := cfg.Origin
 		evm.StateDB.CreateAccount(address)
 		evm.StateDB.SetCode(address, code)
 		ret, _, err := evm.Call(sender, address, input, cfg.GasLimit, uint256.MustFromBig(cfg.Value))
@@ -762,7 +768,7 @@ func TestUSDT_Transfer_EVMvsMIR(t *testing.T) {
 		}
 		evm := runtime.NewEnv(cfg)
 		address := common.BytesToAddress([]byte(label))
-		sender := vm.AccountRef(cfg.Origin)
+		sender := cfg.Origin
 		evm.StateDB.CreateAccount(address)
 		evm.StateDB.SetCode(address, code)
 		ret, _, err := evm.Call(sender, address, input, cfg.GasLimit, uint256.MustFromBig(cfg.Value))
@@ -927,7 +933,7 @@ func TestUSDT_MIR_Strict_Debug_Allowance(t *testing.T) {
 		}
 		evm := runtime.NewEnv(cfg)
 		addr := common.BytesToAddress([]byte(label))
-		sender := vm.AccountRef(cfg.Origin)
+		sender := cfg.Origin
 		evm.StateDB.CreateAccount(addr)
 		evm.StateDB.SetCode(addr, code)
 		ret, _, err := evm.Call(sender, addr, input, cfg.GasLimit, uint256.MustFromBig(cfg.Value))
@@ -1002,7 +1008,7 @@ func TestUSDT_MIR_Strict_Debug_Approve(t *testing.T) {
 		}
 		evm := runtime.NewEnv(cfg)
 		addr := common.BytesToAddress([]byte(label))
-		sender := vm.AccountRef(cfg.Origin)
+		sender := cfg.Origin
 		evm.StateDB.CreateAccount(addr)
 		evm.StateDB.SetCode(addr, code)
 		ret, _, err := evm.Call(sender, addr, input, cfg.GasLimit, uint256.MustFromBig(cfg.Value))
@@ -1018,6 +1024,9 @@ func TestUSDT_MIR_Strict_Debug_Approve(t *testing.T) {
 // TestUSDT_Strict_Parity_Allowance runs allowance once under strict mode and
 // asserts parity with base EVM (error and returndata).
 func TestUSDT_Strict_Parity_Allowance(t *testing.T) {
+	// Clear MIR cache to prevent CFG pollution from previous tests
+	compiler.ClearMIRCache()
+
 	code, err := hex.DecodeString(usdtHex[2:])
 	if err != nil {
 		t.Fatalf("decode USDT hex: %v", err)
@@ -1035,7 +1044,7 @@ func TestUSDT_Strict_Parity_Allowance(t *testing.T) {
 		}
 		evm := runtime.NewEnv(cfg)
 		addr := common.BytesToAddress([]byte(label))
-		sender := vm.AccountRef(cfg.Origin)
+		sender := cfg.Origin
 		evm.StateDB.CreateAccount(addr)
 		evm.StateDB.SetCode(addr, code)
 		ret, _, err := evm.Call(sender, addr, input, cfg.GasLimit, uint256.MustFromBig(cfg.Value))
@@ -1093,7 +1102,7 @@ func TestUSDT_Strict_Parity_Approve(t *testing.T) {
 		}
 		evm := runtime.NewEnv(cfg)
 		addr := common.BytesToAddress([]byte(label))
-		sender := vm.AccountRef(cfg.Origin)
+		sender := cfg.Origin
 		evm.StateDB.CreateAccount(addr)
 		evm.StateDB.SetCode(addr, code)
 		ret, _, err := evm.Call(sender, addr, input, cfg.GasLimit, uint256.MustFromBig(cfg.Value))
@@ -1142,7 +1151,7 @@ func TestUSDT_Strict_Parity_Name(t *testing.T) {
 		}
 		ev := runtime.NewEnv(cfg)
 		addr := common.BytesToAddress([]byte(label))
-		sender := vm.AccountRef(cfg.Origin)
+		sender := cfg.Origin
 		ev.StateDB.CreateAccount(addr)
 		ev.StateDB.SetCode(addr, code)
 		ret, _, err := ev.Call(sender, addr, input, cfg.GasLimit, uint256.MustFromBig(cfg.Value))
@@ -1190,7 +1199,7 @@ func TestUSDT_Strict_Parity_Symbol(t *testing.T) {
 		}
 		ev := runtime.NewEnv(cfg)
 		addr := common.BytesToAddress([]byte(label))
-		sender := vm.AccountRef(cfg.Origin)
+		sender := cfg.Origin
 		ev.StateDB.CreateAccount(addr)
 		ev.StateDB.SetCode(addr, code)
 		ret, _, err := ev.Call(sender, addr, input, cfg.GasLimit, uint256.MustFromBig(cfg.Value))
@@ -1238,7 +1247,7 @@ func TestUSDT_Strict_Parity_Decimals(t *testing.T) {
 		}
 		ev := runtime.NewEnv(cfg)
 		addr := common.BytesToAddress([]byte(label))
-		sender := vm.AccountRef(cfg.Origin)
+		sender := cfg.Origin
 		ev.StateDB.CreateAccount(addr)
 		ev.StateDB.SetCode(addr, code)
 		ret, _, err := ev.Call(sender, addr, input, cfg.GasLimit, uint256.MustFromBig(cfg.Value))
@@ -1286,7 +1295,7 @@ func TestUSDT_Strict_Parity_TotalSupply(t *testing.T) {
 		}
 		ev := runtime.NewEnv(cfg)
 		addr := common.BytesToAddress([]byte(label))
-		sender := vm.AccountRef(cfg.Origin)
+		sender := cfg.Origin
 		ev.StateDB.CreateAccount(addr)
 		ev.StateDB.SetCode(addr, code)
 		ret, _, err := ev.Call(sender, addr, input, cfg.GasLimit, uint256.MustFromBig(cfg.Value))
@@ -1334,7 +1343,7 @@ func TestUSDT_Strict_Parity_BalanceOf(t *testing.T) {
 		}
 		ev := runtime.NewEnv(cfg)
 		addr := common.BytesToAddress([]byte(label))
-		sender := vm.AccountRef(cfg.Origin)
+		sender := cfg.Origin
 		ev.StateDB.CreateAccount(addr)
 		ev.StateDB.SetCode(addr, code)
 		ret, _, err := ev.Call(sender, addr, input, cfg.GasLimit, uint256.MustFromBig(cfg.Value))
@@ -1386,7 +1395,7 @@ func TestUSDT_Strict_Parity_Transfer(t *testing.T) {
 		}
 		ev := runtime.NewEnv(cfg)
 		addr := common.BytesToAddress([]byte(label))
-		sender := vm.AccountRef(cfg.Origin)
+		sender := cfg.Origin
 		ev.StateDB.CreateAccount(addr)
 		ev.StateDB.SetCode(addr, code)
 		ret, _, err := ev.Call(sender, addr, input, cfg.GasLimit, uint256.MustFromBig(cfg.Value))
@@ -1435,7 +1444,7 @@ func TestWBNB_Strict_Parity_Name(t *testing.T) {
 		}
 		ev := runtime.NewEnv(cfg)
 		addr := common.BytesToAddress([]byte(label))
-		sender := vm.AccountRef(cfg.Origin)
+		sender := cfg.Origin
 		ev.StateDB.CreateAccount(addr)
 		ev.StateDB.SetCode(addr, code)
 		ret, _, err := ev.Call(sender, addr, input, cfg.GasLimit, uint256.MustFromBig(cfg.Value))
@@ -1483,7 +1492,7 @@ func TestWBNB_Strict_Parity_Symbol(t *testing.T) {
 		}
 		ev := runtime.NewEnv(cfg)
 		addr := common.BytesToAddress([]byte(label))
-		sender := vm.AccountRef(cfg.Origin)
+		sender := cfg.Origin
 		ev.StateDB.CreateAccount(addr)
 		ev.StateDB.SetCode(addr, code)
 		ret, _, err := ev.Call(sender, addr, input, cfg.GasLimit, uint256.MustFromBig(cfg.Value))
@@ -1533,7 +1542,7 @@ func TestWBNB_Strict_Parity_Decimals(t *testing.T) {
 		}
 		ev := runtime.NewEnv(cfg)
 		addr := common.BytesToAddress([]byte(label))
-		sender := vm.AccountRef(cfg.Origin)
+		sender := cfg.Origin
 		ev.StateDB.CreateAccount(addr)
 		ev.StateDB.SetCode(addr, code)
 		ret, _, err := ev.Call(sender, addr, input, cfg.GasLimit, uint256.MustFromBig(cfg.Value))
@@ -1581,7 +1590,7 @@ func TestWBNB_Strict_Parity_TotalSupply(t *testing.T) {
 		}
 		ev := runtime.NewEnv(cfg)
 		addr := common.BytesToAddress([]byte(label))
-		sender := vm.AccountRef(cfg.Origin)
+		sender := cfg.Origin
 		ev.StateDB.CreateAccount(addr)
 		ev.StateDB.SetCode(addr, code)
 		ret, _, err := ev.Call(sender, addr, input, cfg.GasLimit, uint256.MustFromBig(cfg.Value))
@@ -1630,7 +1639,7 @@ func TestWBNB_Strict_Parity_BalanceOf(t *testing.T) {
 		}
 		ev := runtime.NewEnv(cfg)
 		addr := common.BytesToAddress([]byte(label))
-		sender := vm.AccountRef(cfg.Origin)
+		sender := cfg.Origin
 		ev.StateDB.CreateAccount(addr)
 		ev.StateDB.SetCode(addr, code)
 		ret, _, err := ev.Call(sender, addr, input, cfg.GasLimit, uint256.MustFromBig(cfg.Value))
@@ -1680,7 +1689,7 @@ func TestWBNB_Strict_Parity_Allowance(t *testing.T) {
 		}
 		ev := runtime.NewEnv(cfg)
 		addr := common.BytesToAddress([]byte(label))
-		sender := vm.AccountRef(cfg.Origin)
+		sender := cfg.Origin
 		ev.StateDB.CreateAccount(addr)
 		ev.StateDB.SetCode(addr, code)
 		ret, _, err := ev.Call(sender, addr, input, cfg.GasLimit, uint256.MustFromBig(cfg.Value))
@@ -1736,7 +1745,7 @@ func TestWBNB_Strict_Parity_Approve(t *testing.T) {
 		}
 		ev := runtime.NewEnv(cfg)
 		addr := common.BytesToAddress([]byte(label))
-		sender := vm.AccountRef(cfg.Origin)
+		sender := cfg.Origin
 		ev.StateDB.CreateAccount(addr)
 		ev.StateDB.SetCode(addr, code)
 		ret, _, err := ev.Call(sender, addr, input, cfg.GasLimit, uint256.MustFromBig(cfg.Value))
@@ -1788,7 +1797,7 @@ func TestWBNB_Strict_Parity_Transfer(t *testing.T) {
 		}
 		ev := runtime.NewEnv(cfg)
 		addr := common.BytesToAddress([]byte(label))
-		sender := vm.AccountRef(cfg.Origin)
+		sender := cfg.Origin
 		ev.StateDB.CreateAccount(addr)
 		ev.StateDB.SetCode(addr, code)
 		ret, _, err := ev.Call(sender, addr, input, cfg.GasLimit, uint256.MustFromBig(cfg.Value))
@@ -1993,7 +2002,7 @@ func TestUSDT_Proxy_Call_Parity(t *testing.T) {
 		ev := runtime.NewEnv(cfg)
 		impl := common.BytesToAddress([]byte("usdt_impl_addr"))
 		caller := common.BytesToAddress([]byte(label))
-		sender := vm.AccountRef(cfg.Origin)
+		sender := cfg.Origin
 		ev.StateDB.CreateAccount(impl)
 		ev.StateDB.SetCode(impl, implCode)
 		ev.StateDB.CreateAccount(caller)
@@ -2088,7 +2097,7 @@ func TestUSDC_BSC_Proxy_Parity_NoArgs(t *testing.T) {
 		ev := runtime.NewEnv(cfg)
 		impl := common.BytesToAddress([]byte("usdc_impl_addr"))
 		proxy := common.BytesToAddress([]byte(label))
-		sender := vm.AccountRef(cfg.Origin)
+		sender := cfg.Origin
 		ev.StateDB.CreateAccount(impl)
 		ev.StateDB.SetCode(impl, implCode)
 		ev.StateDB.CreateAccount(proxy)

@@ -25,6 +25,8 @@ import (
 // once under base and once under MIR.
 func TestMIRUSDT_Allowance_EVMvsMIR_Single(t *testing.T) {
 	// Enable MIR opcode parsing
+	// Clear MIR cache to prevent pollution from other tests
+	compiler.ClearMIRCache()
 	compiler.EnableOpcodeParse()
 	// Optional debug logs (env var)
 	if os.Getenv("MIR_DEBUG") == "1" {
@@ -102,7 +104,7 @@ func TestMIRUSDT_Allowance_EVMvsMIR_Single(t *testing.T) {
 	input = append(input, zeroAddress...)
 
 	// Base call
-	senderB := vm.AccountRef(base.Origin)
+	senderB := base.Origin
 	var lastBasePC uint64
 	base.EVMConfig.Tracer = &tracing.Hooks{
 		OnOpcode: func(pc uint64, op byte, gas uint64, cost uint64, scope tracing.OpContext, rData []byte, depth int, err error) {
@@ -119,7 +121,7 @@ func TestMIRUSDT_Allowance_EVMvsMIR_Single(t *testing.T) {
 
 	// MIR call (enable parsing before run)
 	compiler.EnableOpcodeParse()
-	senderM := vm.AccountRef(mir.Origin)
+	senderM := mir.Origin
 
 	// Trace last PC for MIR
 	var lastMIRPC uint64

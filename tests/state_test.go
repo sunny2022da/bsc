@@ -54,18 +54,9 @@ func initMatcher(st *testMatcher) {
 	// Uses 1GB RAM per tested fork
 	st.skipLoad(`^stStaticCall/static_Call1MB`)
 
-	// Out-of-date EIP-2537 tests
-	// TODO (@s1na) reenable in the future
-	st.skipLoad(`^stEIP2537/`)
-
 	// Broken tests:
 	// EOF is not part of cancun
 	st.skipLoad(`^stEOF/`)
-
-	// The tests under Pyspecs are the ones that are published as execution-spec tests.
-	// We run these tests separately, no need to _also_ run them as part of the
-	// reference tests.
-	st.skipLoad(`^Pyspecs/`)
 }
 
 func TestState(t *testing.T) {
@@ -106,6 +97,14 @@ func TestExecutionSpecState(t *testing.T) {
 }
 
 func execStateTest(t *testing.T, st *testMatcher, test *StateTest) {
+	for _, vmCfg := range vmtest.Configs() {
+		t.Run(vmtest.Name(vmCfg), func(t *testing.T) {
+			execStateTestWithConfig(t, st, test, vmCfg)
+		})
+	}
+}
+
+func execStateTestWithConfig(t *testing.T, st *testMatcher, test *StateTest, baseVmCfg vm.Config) {
 	for _, subtest := range test.Subtests() {
 		key := fmt.Sprintf("%s/%d", subtest.Fork, subtest.Index)
 
@@ -307,8 +306,7 @@ func runBenchmark(b *testing.B, t *StateTest) {
 			evm.SetTxContext(txContext)
 
 			// Create "contract" for sender to cache code analysis.
-			sender := vm.GetContract(vm.AccountRef(msg.From), vm.AccountRef(msg.From),
-				nil, 0)
+			sender := vm.GetContract(msg.From, msg.From, nil, 0, nil)
 			defer vm.ReturnContract(sender)
 
 			var (
@@ -324,7 +322,7 @@ func runBenchmark(b *testing.B, t *StateTest) {
 				start := time.Now()
 
 				// Execute the message.
-				_, leftOverGas, err := evm.Call(sender, *msg.To, msg.Data, msg.GasLimit, uint256.MustFromBig(msg.Value))
+				_, leftOverGas, err := evm.Call(sender.Address(), *msg.To, msg.Data, msg.GasLimit, uint256.MustFromBig(msg.Value))
 				if err != nil {
 					b.Error(err)
 					return
