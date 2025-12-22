@@ -277,11 +277,11 @@ func (evm *EVM) Call(caller common.Address, addr common.Address, input []byte, g
 		if len(code) == 0 {
 			ret, err = nil, nil // gas is unchanged
 		} else {
-		addrCopy := addr
-		// If the account has no code, we can abort here
-		// The depth-check is already done, and precompiles handled above
-		contract := GetContract(caller, addrCopy, value, gas, evm.jumpDests)
-		defer ReturnContract(contract)
+			addrCopy := addr
+			// If the account has no code, we can abort here
+			// The depth-check is already done, and precompiles handled above
+			contract := GetContract(caller, addrCopy, value, gas, evm.jumpDests)
+			defer ReturnContract(contract)
 			codeHash := evm.resolveCodeHash(addrCopy)
 
 			if evm.Config.EnableMIR {
@@ -439,7 +439,7 @@ func (evm *EVM) DelegateCall(originCaller common.Address, caller common.Address,
 		addrCopy := addr
 		// Initialise a new contract and make initialise the delegate values
 		// Note: For delegatecall, originCaller is the caller, and caller is the address
-		contract := GetContract(originCaller, caller, nil, gas, evm.jumpDests)
+		contract := GetContract(originCaller, caller, value, gas, evm.jumpDests)
 		defer ReturnContract(contract)
 		code := evm.resolveCode(addrCopy)
 		codeHash := evm.resolveCodeHash(addrCopy)
