@@ -382,13 +382,10 @@ func GenerateMIRCFG(hash common.Hash, code []byte) (*CFG, error) {
 			_, hasStaticHeight := heights[bb]
 
 			if !hasStaticHeight {
-				// We need an entry stack to build MIR (for PHIs).
-				// If we have incoming stacks from parents (discovered during build of parents), use one.
-				// Note: bb.IncomingStacks() is populated by AddIncomingStack called during parent build.
+				// Dynamic block: need to derive height from incoming stacks
 				incoming := bb.IncomingStacks()
 				if len(incoming) > 0 {
-					// Pick the first available stack
-					// Deterministic order iteration
+					// Pick the first available stack (deterministic order)
 					var parents []*MIRBasicBlock
 					for p := range incoming {
 						parents = append(parents, p)
@@ -396,23 +393,8 @@ func GenerateMIRCFG(hash common.Hash, code []byte) (*CFG, error) {
 					sort.Slice(parents, func(i, j int) bool {
 						return parents[i].FirstPC() < parents[j].FirstPC()
 					})
-
-					// Use stack from first parent
 					parentStack := incoming[parents[0]]
-					h := len(parentStack)
-					heights[bb] = h
-
-					// Optimization: if only one parent, inherit stack directly to avoid PHIs
-					// We must check static Parents() count, not just discovered incoming stacks,
-					// to avoid optimizing merge blocks prematurely.
-					if len(bb.Parents()) == 1 {
-						// Clone stack values
-						// We need to deep copy the slice, but values are pointers or structs?
-						// ValueStack is []Value.
-						newStack := make([]Value, len(parentStack))
-						copy(newStack, parentStack)
-						bb.SetEntryStack(newStack)
-					}
+					heights[bb] = len(parentStack)
 				} else {
 					// Unreachable and no known parents? Skip for now.
 					continue
@@ -432,28 +414,26 @@ func GenerateMIRCFG(hash common.Hash, code []byte) (*CFG, error) {
 			}
 		}
 
-		// Create PHIs for entry stack if not already set
+		// Create PHIs for entry stack if not already set.
+		// We always create PHIs here because back-edges (loops) may add more parents later.
+		// Trivial PHIs (single operand) will be simplified in a post-processing pass.
 		if bb.EntryStack() == nil {
 			entryStack := ValueStack{}
 			for i := 0; i < h; i++ {
 				// Create PHI
-				// Note: MIRInterpreter interprets phiStackIndex as index FROM TOP.
-				// Our loop i goes from 0 (bottom) to h-1 (top).
-				// So index from top = (h-1) - i.
+				// phiStackIndex is index FROM TOP: (h-1) - i
 				phi := &MIR{
 					op:            MirPHI,
 					phiStackIndex: h - 1 - i,
 				}
-				// Ensure MIR instruction has correct PC context (start of block)
 				currentEVMBuildPC = bb.FirstPC()
-				// PHI doesn't map to a specific EVM op, but belongs to the block start
 				currentEVMBuildOp = 0
 				bb.appendMIR(phi)
 
 				val := Value{
 					kind:   Variable,
 					def:    phi,
-					liveIn: true, // Marked as live-in
+					liveIn: true,
 				}
 				entryStack.push(&val)
 			}
@@ -534,6 +514,240 @@ func GenerateMIRCFG(hash common.Hash, code []byte) (*CFG, error) {
 				}
 				phi.operands = append(phi.operands, valPtr)
 			}
+		}
+	}
+
+	// Phase 1, Pass 5: Simplify Trivial PHIs
+	// After all PHI operands are linked, simplify PHIs that have only one unique operand.
+	// This handles single-parent blocks where PHI is semantically unnecessary,
+	// allowing JUMP target resolution to trace through to the actual constant values.
+	for _, bb := range bbs {
+		for _, instr := range bb.Instructions() {
+			if instr.op != MirPHI {
+				continue
+			}
+			// Collect unique non-nil operands
+			var uniqueOps []*Value
+			for _, op := range instr.operands {
+				if op == nil {
+					continue
+				}
+				// Check if this operand is already in uniqueOps
+				isDup := false
+				for _, existing := range uniqueOps {
+					if existing != nil && equalValueForFlow(op, existing) {
+						isDup = true
+						break
+					}
+				}
+				if !isDup {
+					uniqueOps = append(uniqueOps, op)
+				}
+			}
+			// If only one unique operand, mark this PHI as trivial
+			// by setting a simplified value that can be traced through
+			if len(uniqueOps) == 1 && uniqueOps[0] != nil {
+				// Replace PHI operands with the single unique value
+				// This allows visitPhi to trace through to the actual value
+				instr.operands = []*Value{uniqueOps[0]}
+			}
+		}
+	}
+
+	// Phase 1, Pass 6: Resolve PHI-based JUMP/JUMPI targets
+	// Now that PHI operands are linked and simplified, re-analyze blocks with
+	// PHI-derived JUMP targets to discover their children.
+	for _, bb := range bbs {
+		// Find the last instruction - should be JUMP or JUMPI
+		instrs := bb.Instructions()
+		if len(instrs) == 0 {
+			continue
+		}
+		lastInst := instrs[len(instrs)-1]
+		if lastInst.op != MirJUMP && lastInst.op != MirJUMPI {
+			continue
+		}
+		// Skip if already has children (resolved during build)
+		if len(bb.Children()) > 0 {
+			continue
+		}
+		// Check if JUMP target is PHI-based
+		if len(lastInst.operands) == 0 || lastInst.operands[0] == nil {
+			continue
+		}
+		d := lastInst.operands[0]
+		if d.kind != Variable || d.def == nil || d.def.op != MirPHI {
+			continue
+		}
+
+		// Collect constant targets from PHI chain
+		targetSet := make(map[uint64]bool)
+		visited := make(map[*MIR]bool)
+
+		var collectTargets func(*Value, int)
+		collectTargets = func(v *Value, depth int) {
+			if v == nil || depth > 32 {
+				return
+			}
+			if v.kind == Konst {
+				if v.payload != nil {
+					var tpc uint64
+					for _, b := range v.payload {
+						tpc = (tpc << 8) | uint64(b)
+					}
+					targetSet[tpc] = true
+				} else if v.u != nil {
+					u, _ := v.u.Uint64WithOverflow()
+					targetSet[u] = true
+				}
+				return
+			}
+			if v.kind == Variable && v.def != nil {
+				if visited[v.def] {
+					return
+				}
+				visited[v.def] = true
+				if v.def.op == MirPHI {
+					for _, op := range v.def.operands {
+						collectTargets(op, depth+1)
+					}
+				} else {
+					if tpc, ok := tryResolveUint64ConstPC(v, 16); ok {
+						targetSet[tpc] = true
+					}
+				}
+				return
+			}
+		}
+
+		// Start from PHI operands
+		for _, op := range d.def.operands {
+			collectTargets(op, 0)
+		}
+
+		if len(targetSet) == 0 {
+			continue
+		}
+
+		// Build children for valid targets
+		children := make([]*MIRBasicBlock, 0, len(targetSet))
+		for tpc := range targetSet {
+			if tpc >= uint64(len(cfg.rawCode)) {
+				continue
+			}
+			if ByteCode(cfg.rawCode[tpc]) != JUMPDEST {
+				continue
+			}
+			targetBB := cfg.pcToBlock[uint(tpc)]
+			if targetBB == nil {
+				continue
+			}
+			children = append(children, targetBB)
+		}
+
+		if len(children) > 0 {
+			bb.SetChildren(children)
+			// Update parent relationships and set incoming stacks
+			for _, child := range children {
+				existingParents := child.Parents()
+				hasParent := false
+				for _, p := range existingParents {
+					if p == bb {
+						hasParent = true
+						break
+					}
+				}
+				if !hasParent {
+					child.SetParents(append(existingParents, bb))
+				}
+				// Set incoming stack from parent's exit stack
+				if bb.ExitStack() != nil {
+					child.AddIncomingStack(bb, bb.ExitStack())
+				}
+			}
+		}
+	}
+
+	// Phase 1, Pass 7: Build newly discovered blocks
+	// After Phase 6 resolved PHI-based JUMP targets, some blocks may now have
+	// incoming stacks but weren't built. Build them now.
+	// Iterate until no new blocks are built (handles cascading discoveries).
+	for iteration := 0; iteration < 100; iteration++ { // Safety limit
+		built := 0
+
+		// Re-collect all blocks to include any state changes
+		// Use basicBlocks array to get ALL blocks including variants
+		var pass7Blocks []*MIRBasicBlock
+		for _, bb := range cfg.basicBlocks {
+			if bb != nil {
+				pass7Blocks = append(pass7Blocks, bb)
+			}
+		}
+
+		for _, bb := range pass7Blocks {
+			// Skip if already has instructions
+			if len(bb.Instructions()) > 0 {
+				continue
+			}
+			// Skip if no incoming stacks (truly unreachable)
+			incoming := bb.IncomingStacks()
+			if len(incoming) == 0 {
+				continue
+			}
+
+			// Derive stack height from incoming stacks
+			var h int
+			for _, stack := range incoming {
+				h = len(stack)
+				break
+			}
+
+			// Create entry stack with PHIs (same as Phase 3)
+			if bb.EntryStack() == nil {
+				entryStack := ValueStack{}
+				for i := 0; i < h; i++ {
+					phi := &MIR{
+						op:            MirPHI,
+						phiStackIndex: h - 1 - i,
+					}
+					currentEVMBuildPC = bb.FirstPC()
+					currentEVMBuildOp = 0
+					bb.appendMIR(phi)
+
+					val := Value{
+						kind:   Variable,
+						def:    phi,
+						liveIn: true,
+					}
+					entryStack.push(&val)
+				}
+				bb.SetEntryStack(entryStack.clone())
+			}
+
+			// Check if block starts with JUMPDEST and emit it first
+			if int(bb.FirstPC()) < len(cfg.rawCode) && ByteCode(cfg.rawCode[bb.FirstPC()]) == JUMPDEST {
+				currentEVMBuildPC = bb.FirstPC()
+				currentEVMBuildOp = byte(JUMPDEST)
+				mir := bb.CreateVoidMIR(MirJUMPDEST)
+				if mir != nil {
+					mir.genStackDepth = h
+				}
+			}
+
+			// Build the block
+			valStack := ValueStack{data: bb.EntryStack()}
+			err := cfg.buildBasicBlock(bb, &valStack, memoryAccessor, stateAccessor, nil)
+			if err != nil {
+				// Log error but continue - some blocks may legitimately fail
+				continue
+			}
+			bb.built = true
+			built++
+		}
+
+		// If no new blocks were built, we're done
+		if built == 0 {
+			break
 		}
 	}
 
@@ -1227,42 +1441,63 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 				if len(mir.operands) > 0 && mir.operands[0] != nil {
 					d := mir.operands[0]
 					if d.kind == Variable && d.def != nil && d.def.op == MirPHI {
-						// Collect constant targets by walking the PHI operands (recursively through PHIs)
+						// Collect constant targets by walking the PHI operands (recursively through PHIs and Variables)
 						targetSet := make(map[uint64]bool)
 						unknown := false
 						visited := make(map[*MIR]bool)
-						var visitPhi func(*MIR)
-						visitPhi = func(phi *MIR) {
-							if phi == nil || visited[phi] {
+
+						// collectTargets recursively collects all possible constant values from a Value
+						var collectTargets func(*Value, int)
+						collectTargets = func(v *Value, depth int) {
+							if v == nil || depth > 32 {
+								unknown = true
 								return
 							}
-							visited[phi] = true
-							for _, ov := range phi.operands {
-								if ov == nil {
-									unknown = true
-									continue
-								}
-								if ov.kind == Konst && ov.payload != nil {
+							// Direct constant
+							if v.kind == Konst {
+								if v.payload != nil {
 									var tpc uint64
-									for _, b := range ov.payload {
+									for _, b := range v.payload {
 										tpc = (tpc << 8) | uint64(b)
 									}
-
 									targetSet[tpc] = true
-								} else if ov.kind == Variable && ov.def != nil && ov.def.op == MirPHI {
-									visitPhi(ov.def)
-								} else {
-									// Try a conservative constant evaluation of this operand
-									if tpc, ok := tryResolveUint64ConstPC(ov, 16); ok {
+								} else if v.u != nil {
+									u, _ := v.u.Uint64WithOverflow()
+									targetSet[u] = true
+								}
+								return
+							}
+							// Variable with def
+							if v.kind == Variable && v.def != nil {
+								if visited[v.def] {
+									return
+								}
+								visited[v.def] = true
 
+								if v.def.op == MirPHI {
+									// PHI node: collect from all operands
+									for _, op := range v.def.operands {
+										collectTargets(op, depth+1)
+									}
+								} else {
+									// Other operation: try to resolve as constant
+									if tpc, ok := tryResolveUint64ConstPC(v, 16); ok {
 										targetSet[tpc] = true
 									} else {
 										unknown = true
 									}
 								}
+								return
 							}
+							// Unknown kind
+							unknown = true
 						}
-						visitPhi(d.def)
+
+						// Start collection from the PHI
+						for _, op := range d.def.operands {
+							collectTargets(op, 0)
+						}
+						visited[d.def] = true
 						if unknown && len(targetSet) == 0 {
 
 							// Conservative end: no children, record exit
