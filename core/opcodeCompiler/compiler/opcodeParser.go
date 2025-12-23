@@ -3,6 +3,7 @@ package compiler
 import (
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/holiman/uint256"
@@ -2573,4 +2574,74 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 		}
 	}
 	return nil
+}
+
+// PrintCFGTopology prints the topology graph of basic blocks reachable by a selector.
+// It returns a DOT format string that can be visualized with Graphviz.
+func (c *CFG) PrintCFGTopology() string {
+	// Collect all nodes and edges
+	nodes := make(map[*MIRBasicBlock]bool)
+	edges := [][2]*MIRBasicBlock{}
+
+	// Add all blocks in the set
+	for _, bb := range c.basicBlocks {
+		if bb != nil {
+			nodes[bb] = true
+		}
+	}
+
+	// Collect edges (parent-child relationships) within the set
+	for _, bb := range c.basicBlocks {
+		if bb == nil {
+			continue
+		}
+		// Add parent -> current edges
+		for _, parent := range bb.Parents() {
+			if parent != nil {
+				edges = append(edges, [2]*MIRBasicBlock{parent, bb})
+			}
+		}
+		// Add current -> child edges
+		for _, child := range bb.Children() {
+			if child != nil {
+				edges = append(edges, [2]*MIRBasicBlock{bb, child})
+			}
+		}
+	}
+
+	// Build DOT format string
+	var buf strings.Builder
+	buf.WriteString(fmt.Sprintf("digraph CFG_Topology %s {\n", c.codeAddr.String()))
+	buf.WriteString("  rankdir=TB;\n")
+	buf.WriteString("  node [shape=box, fontname=Courier];\n\n")
+
+	// Add nodes
+	var sortedNodes []*MIRBasicBlock
+	for n := range nodes {
+		sortedNodes = append(sortedNodes, n)
+	}
+	sort.Slice(sortedNodes, func(i, j int) bool {
+		return sortedNodes[i].blockNum < sortedNodes[j].blockNum
+	})
+
+	for _, n := range sortedNodes {
+		label := fmt.Sprintf("BB%d\\nPC:%d..%d\\nparents:%d children:%d\\nins:%d",
+			n.blockNum, n.firstPC, n.lastPC, len(n.parents), len(n.children), len(n.Instructions()))
+		buf.WriteString(fmt.Sprintf("  \"BB_%d\" [label=\"%s\"];\n", n.blockNum, label))
+	}
+
+	buf.WriteString("\n")
+
+	// Add edges (deduplicate)
+	edgeMap := make(map[string]bool)
+	for _, e := range edges {
+		key := fmt.Sprintf("%d->%d", e[0].blockNum, e[1].blockNum)
+		if !edgeMap[key] {
+			edgeMap[key] = true
+			buf.WriteString(fmt.Sprintf("  \"BB_%d\" -> \"BB_%d\";\n", e[0].blockNum, e[1].blockNum))
+		}
+	}
+
+	buf.WriteString("}\n")
+	return buf.String()
 }
