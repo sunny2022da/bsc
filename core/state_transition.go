@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"math"
 	"math/big"
+	"os"
 	"slices"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -30,6 +31,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/crypto/kzg4844"
+	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/holiman/uint256"
 )
@@ -517,6 +519,24 @@ func (st *stateTransition) execute() (*ExecutionResult, error) {
 		// performing the resolution and warming.
 		if addr, ok := types.ParseDelegation(st.state.GetCode(*msg.To)); ok {
 			st.state.AddAddressToAccessList(addr)
+		}
+
+		// Debug: observe the exact gas remaining passed into EVM.Call for block 966 tx0.
+		if os.Getenv("MIR_TRACE_BLOCK966") == "1" &&
+			st.evm != nil && st.evm.Context.BlockNumber != nil && st.evm.Context.BlockNumber.Uint64() == 966 &&
+			msg.From == common.HexToAddress("0xfa5e36a04eef3152092099f352ddbe88953bb540") &&
+			msg.To != nil && *msg.To == common.HexToAddress("0xed24fc36d5ee211ea25a80239fb8c4cfd80f12ee") {
+			txIndex := -1
+			if idxDB, ok := st.state.(interface{ TxIndex() int }); ok {
+				txIndex = idxDB.TxIndex()
+			}
+			log.Warn("MIR_TRACE_BLOCK966 exec gas before EVM.Call",
+				"txIndex", txIndex,
+				"gasRemaining", st.gasRemaining,
+				"initialGas", st.initialGas,
+				"intrinsicAlreadyDeducted", st.initialGas-st.gasRemaining,
+				"refundCounter", st.state.GetRefund(),
+			)
 		}
 
 		// Execute the transaction's call.

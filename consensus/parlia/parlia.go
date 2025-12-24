@@ -2179,6 +2179,39 @@ func (p *Parlia) applyTransaction(
 		}
 		actualTx := (*receivedTxs)[0]
 		if !bytes.Equal(p.signer.Hash(actualTx).Bytes(), expectedHash.Bytes()) {
+			// Extra diagnostics for sync-time system tx mismatches. This helps identify
+			// whether the mismatch is due to (a) incorrect local state/gas accounting,
+			// (b) wrong ordering/contents of received system txs, or (c) a peer providing
+			// an inconsistent block body.
+			//
+			// This log only triggers on mismatch and is safe in production.
+			actualNonce := actualTx.Nonce()
+			actualTo := "<nil>"
+			if actualTx.To() != nil {
+				actualTo = actualTx.To().String()
+			}
+			log.Warn("System tx hash mismatch",
+				"block", header.Number.Uint64(),
+				"blockHash", header.Hash(),
+				"from", msg.From,
+				"expectedHash", expectedHash,
+				"actualHash", p.signer.Hash(actualTx),
+				"expectedNonce", expectedTx.Nonce(),
+				"actualNonce", actualNonce,
+				"expectedTo", expectedTx.To().String(),
+				"actualTo", actualTo,
+				"expectedValue", expectedTx.Value().String(),
+				"actualValue", actualTx.Value().String(),
+				"expectedGas", expectedTx.Gas(),
+				"actualGas", actualTx.Gas(),
+				"expectedGasPrice", expectedTx.GasPrice().String(),
+				"actualGasPrice", actualTx.GasPrice().String(),
+				"expectedDataLen", len(expectedTx.Data()),
+				"actualDataLen", len(actualTx.Data()),
+				"systemAddrBal", state.GetBalance(consensus.SystemAddress).String(),
+				"systemRewardBal", state.GetBalance(common.HexToAddress(systemcontracts.SystemRewardContract)).String(),
+				"receivedSystemTxsLeft", len(*receivedTxs),
+			)
 			return fmt.Errorf("expected tx hash %v, get %v, nonce %d, to %s, value %s, gas %d, gasPrice %s, data %s", expectedHash.String(), actualTx.Hash().String(),
 				expectedTx.Nonce(),
 				expectedTx.To().String(),

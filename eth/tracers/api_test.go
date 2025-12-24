@@ -61,6 +61,7 @@ type testBackend struct {
 	engine      consensus.Engine
 	chaindb     ethdb.Database
 	chain       *core.BlockChain
+	vmCfg       vm.Config
 
 	refHook func() // Hook is invoked when the requested state is referenced
 	relHook func() // Hook is invoked when the requested state is released
@@ -73,6 +74,7 @@ func newTestBackend(t *testing.T, n int, gspec *core.Genesis, generator func(i i
 		chainConfig: gspec.Config,
 		engine:      ethash.NewFaker(),
 		chaindb:     rawdb.NewMemoryDatabase(),
+		vmCfg:       vmCfg,
 	}
 	// Generate blocks for testing
 	_, blocks, _ := core.GenerateChainWithGenesis(gspec, backend.engine, n, generator)
@@ -96,6 +98,8 @@ func newTestBackend(t *testing.T, n int, gspec *core.Genesis, generator func(i i
 	backend.chain = chain
 	return backend
 }
+
+func (b *testBackend) VMConfig() vm.Config { return b.vmCfg }
 
 func (b *testBackend) HeaderByHash(ctx context.Context, hash common.Hash) (*types.Header, error) {
 	return b.chain.GetHeaderByHash(hash), nil

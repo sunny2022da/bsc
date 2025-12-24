@@ -223,7 +223,19 @@ func (c *CFG) createBB(pc uint, parent *MIRBasicBlock) *MIRBasicBlock {
 	if c.pcToBlock != nil {
 		if existing, ok := c.pcToBlock[pc]; ok {
 			if parent != nil {
-				existing.SetParents([]*MIRBasicBlock{parent})
+				// Do not clobber existing parents: loops/back-edges and multi-parent blocks rely on
+				// preserving all predecessors so PHIs can merge correct incoming values.
+				parents := existing.Parents()
+				found := false
+				for _, p := range parents {
+					if p == parent {
+						found = true
+						break
+					}
+				}
+				if !found {
+					existing.SetParents(append(parents, parent))
+				}
 			}
 			return existing
 		}
@@ -395,6 +407,17 @@ func GenerateMIRCFG(hash common.Hash, code []byte) (*CFG, error) {
 					})
 					parentStack := incoming[parents[0]]
 					heights[bb] = len(parentStack)
+
+					// If this block has exactly one static parent, inherit the parent's stack directly.
+					// This avoids creating unnecessary PHIs, and matches the behavior in `sunny_bsc`.
+					//
+					// NOTE: we intentionally key off `Parents()` (static CFG) rather than just
+					// `incoming` to avoid optimizing merge blocks prematurely.
+					if len(bb.Parents()) == 1 {
+						newStack := make([]Value, len(parentStack))
+						copy(newStack, parentStack)
+						bb.SetEntryStack(newStack)
+					}
 				} else {
 					// Unreachable and no known parents? Skip for now.
 					continue
@@ -526,6 +549,34 @@ func GenerateMIRCFG(hash common.Hash, code []byte) (*CFG, error) {
 			if instr.op != MirPHI {
 				continue
 			}
+			// Flatten PHI-of-PHI chains to avoid nested PHIs producing default/zero values at runtime.
+			// This is especially important for jump-table dispatch where the JUMP destination can be
+			// threaded through multiple PHIs across blocks.
+			ops := instr.operands
+			for depth := 0; depth < 4; depth++ {
+				expanded := false
+				var next []*Value
+				for _, op := range ops {
+					if op == nil {
+						continue
+					}
+					if op.kind == Variable && op.def != nil && op.def.op == MirPHI && len(op.def.operands) > 0 {
+						next = append(next, op.def.operands...)
+						expanded = true
+					} else {
+						next = append(next, op)
+					}
+					// Prevent operand explosion
+					if len(next) > 16 {
+						break
+					}
+				}
+				ops = next
+				if !expanded {
+					break
+				}
+			}
+			instr.operands = ops
 			// Collect unique non-nil operands
 			var uniqueOps []*Value
 			for _, op := range instr.operands {
@@ -1539,7 +1590,18 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 						oldExit := curBB.ExitStack()
 						curBB.SetExitStack(valueStack.clone())
 						for _, ch := range children {
-							ch.SetParents([]*MIRBasicBlock{curBB})
+							// Preserve existing parents (loops/back-edges and multi-parent blocks)
+							ps := ch.Parents()
+							found := false
+							for _, p := range ps {
+								if p == curBB {
+									found = true
+									break
+								}
+							}
+							if !found {
+								ch.SetParents(append(ps, curBB))
+							}
 							prev := ch.IncomingStacks()[curBB]
 							if prev == nil || !stacksEqual(prev, curBB.ExitStack()) {
 								ch.AddIncomingStack(curBB, curBB.ExitStack())
@@ -1650,7 +1712,18 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 							fallthroughBB := c.getVariantBlock(uint(i+1), depth, curBB)
 							curBB.SetChildren([]*MIRBasicBlock{fallthroughBB})
 							curBB.SetExitStack(valueStack.clone())
-							fallthroughBB.SetParents([]*MIRBasicBlock{curBB})
+							// Preserve existing parents (loops/back-edges and multi-parent blocks)
+							ps := fallthroughBB.Parents()
+							found := false
+							for _, p := range ps {
+								if p == curBB {
+									found = true
+									break
+								}
+							}
+							if !found {
+								fallthroughBB.SetParents(append(ps, curBB))
+							}
 							prev := fallthroughBB.IncomingStacks()[curBB]
 							if prev == nil || !stacksEqual(prev, curBB.ExitStack()) {
 								fallthroughBB.AddIncomingStack(curBB, curBB.ExitStack())

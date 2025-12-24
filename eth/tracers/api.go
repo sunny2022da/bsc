@@ -94,6 +94,9 @@ type Backend interface {
 	ChainDb() ethdb.Database
 	StateAtBlock(ctx context.Context, block *types.Block, reexec uint64, base *state.StateDB, readOnly bool, preferDisk bool) (*state.StateDB, StateReleaseFunc, error)
 	StateAtTransaction(ctx context.Context, block *types.Block, txIndex int, reexec uint64) (*types.Transaction, vm.BlockContext, *state.StateDB, StateReleaseFunc, error)
+	// VMConfig returns the vm.Config used by the backend for consensus execution.
+	// Tracing should mirror consensus execution as closely as possible.
+	VMConfig() vm.Config
 }
 
 // API is the collection of tracing APIs exposed over the private debugging endpoint.
@@ -409,7 +412,9 @@ func (api *API) traceChain(start, end *types.Block, config *TraceConfig, closed 
 			// Insert block's parent beacon block root in the state
 			// as per EIP-4788.
 			context := core.NewEVMBlockContext(next.Header(), api.chainContext(ctx), nil)
-			evm := vm.NewEVM(context, statedb, api.backend.ChainConfig(), vm.Config{})
+			vmCfg := api.backend.VMConfig()
+			vmCfg.Tracer = nil
+			evm := vm.NewEVM(context, statedb, api.backend.ChainConfig(), vmCfg)
 			if beaconRoot := next.BeaconRoot(); beaconRoot != nil {
 				core.ProcessBeaconBlockRoot(*beaconRoot, evm)
 			}
@@ -570,7 +575,9 @@ func (api *API) IntermediateRoots(ctx context.Context, hash common.Hash, config 
 		deleteEmptyObjects = chainConfig.IsEIP158(block.Number())
 		beforeSystemTx     = true
 	)
-	evm := vm.NewEVM(vmctx, statedb, chainConfig, vm.Config{})
+	vmCfg := api.backend.VMConfig()
+	vmCfg.Tracer = nil
+	evm := vm.NewEVM(vmctx, statedb, chainConfig, vmCfg)
 	if beaconRoot := block.BeaconRoot(); beaconRoot != nil {
 		core.ProcessBeaconBlockRoot(*beaconRoot, evm)
 	}
@@ -653,7 +660,9 @@ func (api *API) traceBlock(ctx context.Context, block *types.Block, config *Trac
 	// upgrade built-in system contract before normal txs if Feynman is not enabled
 	systemcontracts.TryUpdateBuildInSystemContract(api.backend.ChainConfig(), block.Number(), parent.Time(), block.Time(), statedb, true)
 	blockCtx := core.NewEVMBlockContext(block.Header(), api.chainContext(ctx), nil)
-	evm := vm.NewEVM(blockCtx, statedb, api.backend.ChainConfig(), vm.Config{})
+	vmCfg := api.backend.VMConfig()
+	vmCfg.Tracer = nil
+	evm := vm.NewEVM(blockCtx, statedb, api.backend.ChainConfig(), vmCfg)
 	if beaconRoot := block.BeaconRoot(); beaconRoot != nil {
 		core.ProcessBeaconBlockRoot(*beaconRoot, evm)
 	}
@@ -768,7 +777,9 @@ func (api *API) traceBlockParallel(ctx context.Context, block *types.Block, stat
 		beforeSystemTx = true
 	)
 	blockCtx := core.NewEVMBlockContext(block.Header(), api.chainContext(ctx), nil)
-	evm := vm.NewEVM(blockCtx, statedb, api.backend.ChainConfig(), vm.Config{})
+	vmCfg := api.backend.VMConfig()
+	vmCfg.Tracer = nil
+	evm := vm.NewEVM(blockCtx, statedb, api.backend.ChainConfig(), vmCfg)
 
 txloop:
 	for i, tx := range txs {
@@ -878,7 +889,9 @@ func (api *API) standardTraceBlockToFile(ctx context.Context, block *types.Block
 		chainConfig, canon = overrideConfig(chainConfig, config.Overrides)
 	}
 
-	evm := vm.NewEVM(vmctx, statedb, chainConfig, vm.Config{})
+	vmCfg := api.backend.VMConfig()
+	vmCfg.Tracer = nil
+	evm := vm.NewEVM(vmctx, statedb, chainConfig, vmCfg)
 	if beaconRoot := block.BeaconRoot(); beaconRoot != nil {
 		core.ProcessBeaconBlockRoot(*beaconRoot, evm)
 	}
@@ -931,10 +944,14 @@ func (api *API) standardTraceBlockToFile(ctx context.Context, block *types.Block
 		var (
 			writer = bufio.NewWriter(dump)
 			tracer = logger.NewJSONLogger(&logConfig, writer)
-			evm    = vm.NewEVM(vmctx, statedb, chainConfig, vm.Config{
-				Tracer:    tracer,
-				NoBaseFee: true,
-			})
+			evm = func() *vm.EVM {
+				vmCfg := api.backend.VMConfig()
+				// Ensure tracing is enabled for this execution.
+				vmCfg.Tracer = tracer
+				// Lower the basefee to 0 to avoid breaking EVM invariants (basefee < feecap).
+				vmCfg.NoBaseFee = true
+				return vm.NewEVM(vmctx, statedb, chainConfig, vmCfg)
+			}()
 		)
 		// Execute the transaction and flush any traces to disk
 		statedb.SetTxContext(tx.Hash(), i)
@@ -1162,7 +1179,12 @@ func (api *API) traceTx(ctx context.Context, tx *types.Transaction, message *cor
 		}
 	}
 	tracingStateDB := state.NewHookedState(statedb, tracer.Hooks)
-	evm := vm.NewEVM(vmctx, tracingStateDB, api.backend.ChainConfig(), vm.Config{Tracer: tracer.Hooks, NoBaseFee: true})
+	vmCfg := api.backend.VMConfig()
+	// Ensure tracing is enabled for this execution.
+	vmCfg.Tracer = tracer.Hooks
+	// Lower the basefee to 0 to avoid breaking EVM invariants (basefee < feecap).
+	vmCfg.NoBaseFee = true
+	evm := vm.NewEVM(vmctx, tracingStateDB, api.backend.ChainConfig(), vmCfg)
 	if precompiles != nil {
 		evm.SetPrecompiles(precompiles)
 	}

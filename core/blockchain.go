@@ -416,6 +416,12 @@ type BlockChain struct {
 	doubleSignMonitor *monitor.DoubleSignMonitor
 }
 
+// VMConfig returns the vm.Config used by this blockchain during block processing.
+// This is useful for tooling (e.g. tracers) that want to mirror consensus execution.
+func (bc *BlockChain) VMConfig() vm.Config {
+	return bc.cfg.VmConfig
+}
+
 // NewBlockChain returns a fully initialised block chain using information
 // available in the database. It initialises the default Ethereum Validator
 // and Processor.
@@ -820,7 +826,10 @@ func (bc *BlockChain) loadLastState() error {
 	bc.hc.SetCurrentHeader(headHeader)
 
 	// Initialize history pruning.
-	latest := max(headBlock.NumberU64(), headHeader.Number.Uint64())
+	latest := headBlock.NumberU64()
+	if headHeader.Number.Uint64() > latest {
+		latest = headHeader.Number.Uint64()
+	}
 	if err := bc.initializeHistoryPruning(latest); err != nil {
 		return err
 	}
@@ -2646,7 +2655,11 @@ func (bc *BlockChain) processBlock(parentRoot common.Hash, block *types.Block, s
 		snapshotCommitTimer.Update(statedb.SnapshotCommits) // Snapshot commits are complete, we can mark them
 		triedbCommitTimer.Update(statedb.TrieDBCommits)     // Trie database commits are complete, we can mark them
 	}
-	blockWriteTimer.Update(time.Since(wstart) - max(statedb.AccountCommits, statedb.StorageCommits) /* concurrent */ - statedb.SnapshotCommits - statedb.TrieDBCommits)
+	concurrent := statedb.AccountCommits
+	if statedb.StorageCommits > concurrent {
+		concurrent = statedb.StorageCommits
+	}
+	blockWriteTimer.Update(time.Since(wstart) - concurrent /* concurrent */ - statedb.SnapshotCommits - statedb.TrieDBCommits)
 	elapsed := time.Since(startTime) + 1 // prevent zero division
 	blockInsertTimer.Update(elapsed)
 	blockInsertTxSizeGauge.Update(int64(len(block.Transactions())))

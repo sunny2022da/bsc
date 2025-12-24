@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"os"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -33,6 +34,7 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
+	"github.com/holiman/uint256"
 )
 
 const largeTxGasLimit = 10000000 // 10M Gas, to measure the execution time of large tx
@@ -98,6 +100,18 @@ func (p *StateProcessor) Process(block *types.Block, statedb *state.StateDB, cfg
 	}
 	context = NewEVMBlockContext(header, p.chain, nil)
 	evm := vm.NewEVM(context, tracingStateDB, p.config, cfg)
+
+	// Debug aid: confirm the MIR_TRACE_BLOCK966 env var is actually reaching the running geth,
+	// and that we're processing the expected block under the expected EVM config.
+	if os.Getenv("MIR_TRACE_BLOCK966") == "1" && blockNumber.Uint64() == 966 {
+		log.Warn("MIR_TRACE_BLOCK966 enabled (process block)",
+			"block", blockNumber.Uint64(),
+			"blockHash", blockHash,
+			"enableMIR", cfg.EnableMIR,
+			"coinbase", header.Coinbase,
+			"txs", len(block.Transactions()),
+		)
+	}
 
 	if beaconRoot := block.BeaconRoot(); beaconRoot != nil {
 		ProcessBeaconBlockRoot(*beaconRoot, evm)
@@ -215,9 +229,57 @@ func ApplyTransactionWithEVM(msg *Message, gp *GasPool, statedb *state.StateDB, 
 		}
 	}
 	// Apply the transaction to the current state (included in the env).
+	trace966 := os.Getenv("MIR_TRACE_BLOCK966") == "1" &&
+		evm != nil && evm.ChainConfig() != nil && evm.ChainConfig().Parlia != nil &&
+		blockNumber != nil && blockNumber.Uint64() == 966 &&
+		tx != nil && tx.Hash() == common.HexToHash("0x51a2684dff1919c2dc9401b24d907cacdb35087acc16fcde95e9a1351509a25b")
+	var (
+		sysBefore    *uint256.Int
+		refundBefore uint64
+		intrinsic    uint64
+	)
+	if trace966 {
+		sysBefore = statedb.GetBalance(consensus.SystemAddress)
+		refundBefore = statedb.GetRefund()
+		rules := evm.ChainConfig().Rules(blockNumber, evm.Context.Random != nil, evm.Context.Time)
+		ig, igErr := IntrinsicGas(tx.Data(), tx.AccessList(), tx.SetCodeAuthorizations(), tx.To() == nil, rules.IsHomestead, rules.IsIstanbul, rules.IsShanghai)
+		if igErr != nil {
+			log.Warn("MIR_TRACE_BLOCK966 intrinsic gas calc failed", "err", igErr)
+		} else {
+			intrinsic = ig
+		}
+		log.Warn("MIR_TRACE_BLOCK966 tx start",
+			"enableMIR", evm.Config.EnableMIR,
+			"tx", tx.Hash(),
+			"from", msg.From,
+			"to", tx.To(),
+			"nonce", tx.Nonce(),
+			"gasLimit", tx.Gas(),
+			"gasPrice", tx.GasPrice(),
+			"dataLen", len(tx.Data()),
+			"intrinsic", intrinsic,
+			"sysBalBefore", sysBefore.String(),
+			"refundBefore", refundBefore,
+		)
+	}
 	result, err = ApplyMessage(evm, msg, gp)
 	if err != nil {
 		return nil, err
+	}
+	if trace966 {
+		sysAfter := statedb.GetBalance(consensus.SystemAddress)
+		refundAfter := statedb.GetRefund()
+		delta := new(uint256.Int).Sub(sysAfter, sysBefore)
+		log.Warn("MIR_TRACE_BLOCK966 tx result (pre-finalise)",
+			"enableMIR", evm.Config.EnableMIR,
+			"tx", tx.Hash(),
+			"vmerr", result.Err,
+			"usedGas", result.UsedGas,
+			"maxUsedGas", result.MaxUsedGas,
+			"sysBalAfter", sysAfter.String(),
+			"sysDelta", delta.String(),
+			"refundAfter", refundAfter,
+		)
 	}
 	// Update the state with pending changes.
 	var root []byte

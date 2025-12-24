@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -15,18 +16,49 @@ import (
 	"github.com/holiman/uint256"
 )
 
-// warmSlotKey identifies a warmed storage slot for the current contract address
-type warmSlotKey struct {
-	addr [20]byte
-	slot [32]byte
+func shouldTraceBlock966Tx0(evm *EVM, contract *Contract) bool {
+	if os.Getenv("MIR_TRACE_BLOCK966") != "1" {
+		return false
+	}
+	if evm == nil || evm.Context.BlockNumber == nil {
+		return false
+	}
+	if evm.Context.BlockNumber.Uint64() != 966 {
+		return false
+	}
+	// tx0 sender / callee
+	if evm.TxContext.Origin != common.HexToAddress("0xfa5e36a04eef3152092099f352ddbe88953bb540") {
+		return false
+	}
+	// Ensure it's tx index 0 when available.
+	if idxDB, ok := evm.StateDB.(interface{ TxIndex() int }); ok {
+		if idxDB.TxIndex() != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // mirGasProbe is an optional test hook to observe MIR gas after each instruction
 var mirGasProbe func(pc uint64, op byte, gasLeft uint64)
 
+// mirGasPreProbe is an optional test hook to observe MIR gas before charging an instruction.
+// This is especially useful when the instruction OOGs during gas charging and we never reach
+// the "after" probe.
+var mirGasPreProbe func(pc uint64, op byte, gasLeft uint64, isBlockEntry bool)
+
 // mirGasTimingHook, when set (testing only), receives time spent inside the
 // adapter's pre-op hook (i.e., gas accounting for the originating EVM opcode).
 var mirGasTimingHook func(pc uint64, op byte, dur time.Duration)
+
+// mirBlockEntryCountsProbe, when set (testing only), receives the opcode counts used for
+// block-entry charging, keyed by originating EVM opcode byte.
+var mirBlockEntryCountsProbe func(firstPC uint, counts map[byte]uint32)
+
+// mirGasChargeProbe, when set (testing only), receives how much gas MIR charged for a pre-op step.
+// Note: block-entry charging for elided opcodes is not attributed to their original op here; it is
+// applied during the block-entry step for the first MIR instruction of the block.
+var mirGasChargeProbe func(pc uint64, op byte, charged uint64, isBlockEntry bool)
 
 // SetMIRGasTimingHook installs a callback to observe MIR gas calculation time per-op (testing only).
 func SetMIRGasTimingHook(cb func(pc uint64, op byte, dur time.Duration)) { mirGasTimingHook = cb }
@@ -34,6 +66,21 @@ func SetMIRGasTimingHook(cb func(pc uint64, op byte, dur time.Duration)) { mirGa
 // SetMIRGasProbe installs a callback to observe MIR gas after each instruction (testing only)
 func SetMIRGasProbe(cb func(pc uint64, op byte, gasLeft uint64)) {
 	mirGasProbe = cb
+}
+
+// SetMIRGasPreProbe installs a callback to observe MIR gas before each instruction is charged (testing only).
+func SetMIRGasPreProbe(cb func(pc uint64, op byte, gasLeft uint64, isBlockEntry bool)) {
+	mirGasPreProbe = cb
+}
+
+// SetMIRBlockEntryCountsProbe installs a callback to observe opcode counts charged at block entry (testing only).
+func SetMIRBlockEntryCountsProbe(cb func(firstPC uint, counts map[byte]uint32)) {
+	mirBlockEntryCountsProbe = cb
+}
+
+// SetMIRGasChargeProbe installs a callback to observe MIR's gas deduction per pre-op step (testing only).
+func SetMIRGasChargeProbe(cb func(pc uint64, op byte, charged uint64, isBlockEntry bool)) {
+	mirGasChargeProbe = cb
 }
 
 // MIRInterpreterAdapter adapts MIRInterpreter to work with EVM's interpreter interface
@@ -46,7 +93,6 @@ type MIRInterpreterAdapter struct {
 	memShadow       *Memory
 	// Warm caches to avoid repeated EIP-2929 checks within a single Run
 	warmAccounts map[[20]byte]struct{}
-	warmSlots    map[warmSlotKey]struct{}
 	// storageCache caches SLOAD values within a single Run (key is 32-byte slot)
 	storageCache map[[32]byte][32]byte
 	// Track block entry gas charges per block (for GAS opcode to add back)
@@ -58,66 +104,76 @@ type MIRInterpreterAdapter struct {
 	// Dedup JUMPDEST charge at first instruction of landing block
 	lastJdPC           uint32
 	lastJdBlockFirstPC uint32
+	// Debug: last observed EVM pc/op/gas before MIR pre-op hook (to pinpoint OOG)
+	lastTracePC      uint64
+	lastTraceOp      byte
+	lastTraceGasLeft uint64
+	lastTraceAddr    common.Address
 }
 
-// countOpcodesInRange counts EVM opcodes in a given PC range
-func countOpcodesInRange(code []byte, firstPC, lastPC uint) map[byte]uint32 {
+// countOpcodesInBlock counts opcodes belonging to the given MIR basic block by scanning the
+// underlying bytecode from block.FirstPC until just before the earliest child block start
+// (or until a terminator is encountered).
+//
+// This avoids both:
+// - overcharging by scanning past the block into the next block, and
+// - undercharging when block.LastPC is earlier than the last EVM opcode in the block.
+func countOpcodesInBlock(code []byte, block *compiler.MIRBasicBlock) map[byte]uint32 {
 	counts := make(map[byte]uint32)
-	if code == nil || firstPC >= uint(len(code)) {
+	if block == nil || code == nil {
 		return counts
 	}
-	// If lastPC is 0 or invalid, find the next block boundary
-	if lastPC == 0 || lastPC <= firstPC || lastPC > uint(len(code)) {
-		// Find the next JUMPDEST or block terminator after firstPC
-		pc := firstPC
-		for pc < uint(len(code)) {
-			op := OpCode(code[pc])
-			// If we hit a JUMPDEST, this is likely the start of the next block
-			// (unless it's the first instruction, in which case it's the current block)
-			if op == JUMPDEST && pc > firstPC {
-				lastPC = pc
-				break
+	firstPC := block.FirstPC()
+	if firstPC >= uint(len(code)) {
+		return counts
+	}
+	// Determine an exclusive stop point from successor PCs.
+	//
+	// We want the earliest *forward* successor PC (i.e. > firstPC). This captures:
+	// - normal fallthrough blocks (single successor at next PC),
+	// - JUMPI blocks where the fallthrough successor is the smaller forward PC,
+	// while ignoring back-edges (loops) whose successor PC is < firstPC.
+	stopBefore := uint(len(code)) // exclusive
+	if ch := block.Children(); len(ch) > 0 {
+		for _, c := range ch {
+			if c == nil {
+				continue
 			}
-			// If we hit a block terminator (other than JUMPDEST), include it and stop
-			if op == STOP || op == RETURN || op == REVERT || op == SELFDESTRUCT {
-				lastPC = pc
-				break
+			cp := c.FirstPC()
+			if cp > firstPC && cp < stopBefore {
+				stopBefore = cp
 			}
-			// JUMP and JUMPI also terminate blocks (include them)
-			if op == JUMP || op == JUMPI {
-				lastPC = pc
-				break
-			}
-			// Skip PUSH opcodes
-			if op >= PUSH1 && op <= PUSH32 {
-				pushSize := int(op - PUSH1 + 1)
-				pc += uint(pushSize) + 1
-			} else {
-				pc++
-			}
-			// Safety: if we've gone too far, use end of code
-			if pc > uint(len(code)) {
-				lastPC = uint(len(code))
-				break
-			}
-		}
-		// If we didn't find a boundary, use end of code
-		if lastPC == 0 || lastPC <= firstPC {
-			lastPC = uint(len(code))
 		}
 	}
+
 	pc := firstPC
-	for pc <= lastPC && pc < uint(len(code)) {
-		op := OpCode(code[pc])
-		// Count the opcode
-		counts[byte(op)]++
-		// Skip PUSH opcodes (they have data bytes)
-		if op >= PUSH1 && op <= PUSH32 {
-			pushSize := int(op - PUSH1 + 1)
-			pc += uint(pushSize) + 1
-		} else {
-			pc++
+	for pc < uint(len(code)) {
+		// Stop at child boundary (exclusive).
+		if pc == stopBefore && pc > firstPC {
+			break
 		}
+		op := OpCode(code[pc])
+		// If we hit a JUMPDEST after the first instruction, it's the next block's entry.
+		if op == JUMPDEST && pc > firstPC {
+			break
+		}
+		counts[byte(op)]++
+
+		// Compute next PC (skipping PUSH data).
+		nextPC := pc + 1
+		if op >= PUSH1 && op <= PUSH32 {
+			nextPC = pc + 1 + uint(op-PUSH1+1)
+		}
+		// If the child boundary lands inside PUSH data, shift it forward to the next instruction boundary.
+		if stopBefore > pc && stopBefore < nextPC {
+			stopBefore = nextPC
+		}
+
+		// Terminators end the basic block (include them, then stop).
+		if op == STOP || op == RETURN || op == REVERT || op == SELFDESTRUCT || op == JUMP || op == JUMPI {
+			break
+		}
+		pc = nextPC
 	}
 	return counts
 }
@@ -206,6 +262,21 @@ func NewMIRInterpreterAdapter(evm *EVM) *MIRInterpreterAdapter {
 				adapter.evm.Config.Tracer.OnOpcode(uint64(ctx.M.EvmPC()), byte(evmOp), contract.Gas, 0, scope, nil, adapter.evm.depth, nil)
 			}
 		}
+		// IMPORTANT:
+		// Gas accounting must happen exactly once. The per-run hook installed in Run()
+		// already performs:
+		// - block-entry constant gas charging
+		// - per-op dynamic gas charging (including LOG1 at block 966 tx0)
+		//
+		// This "global" hook is therefore disabled for gas charging by default, and only
+		// used for tracing/timing. Double-charging dynamic gas here caused block 966 tx0
+		// to OOG at LOG1 (pc=5304).
+		if os.Getenv("MIR_LEGACY_PREOP_GAS") != "1" {
+			if mirGasTimingHook != nil {
+				mirGasTimingHook(uint64(ctx.M.EvmPC()), ctx.EvmOp, time.Since(timingStart))
+			}
+			return nil
+		}
 		// Block entry gas charging is handled by the per-run innerHook (installed in Run method)
 		// This hook only handles tracing and dynamic gas
 		// Constant gas is charged at block entry, so we don't charge it per instruction
@@ -288,17 +359,26 @@ func NewMIRInterpreterAdapter(evm *EVM) *MIRInterpreterAdapter {
 				if len(ctx.Operands) > 0 {
 					off := ctx.Operands[0].Uint64()
 					needed = off + 32
+				} else if ctx.MemorySize > 0 {
+					// Some MIR pre-op contexts may not populate Operands; fall back to computed MemorySize.
+					needed = ctx.MemorySize
 				}
 			case MSTORE8:
 				if len(ctx.Operands) > 0 {
 					off := ctx.Operands[0].Uint64()
 					needed = off + 1
+				} else if ctx.MemorySize > 0 {
+					needed = ctx.MemorySize
 				}
 			case RETURN, REVERT:
 				if len(ctx.Operands) >= 2 {
 					off := ctx.Operands[0].Uint64()
 					size := ctx.Operands[1].Uint64()
 					needed = off + size
+				} else if ctx.MemorySize > 0 {
+					// Some MIR instructions may not populate Operands in the pre-op context.
+					// Fall back to the interpreter-provided MemorySize (already computed in MIRInterpreter.exec).
+					needed = ctx.MemorySize
 				}
 			case CREATE, CREATE2:
 				// CREATE: value, offset, size
@@ -494,24 +574,66 @@ func NewMIRInterpreterAdapter(evm *EVM) *MIRInterpreterAdapter {
 				contract.Gas -= wordGas
 			}
 		case LOG0, LOG1, LOG2, LOG3, LOG4:
-			if ctx.MemorySize > 0 {
-				gas, err := memoryGasCost(adapter.memShadow, ctx.MemorySize)
-				if err != nil {
-					return err
+			// EVM LOG gas = mem expansion + LogGas + topics + data.
+			// Some MIR pre-op contexts may not populate MemorySize for LOG, so derive it
+			// from (offset,size) operands as a fallback.
+			memSize := ctx.MemorySize
+			if memSize == 0 && len(ctx.Operands) >= 2 {
+				off := ctx.Operands[0].Uint64()
+				size := ctx.Operands[1].Uint64()
+				needed := off + size
+				memSize = (needed + 31) / 32 * 32
+				if memSize < needed {
+					return ErrGasUintOverflow
 				}
-				n := int(evmOp - LOG0)
-				add := gas + uint64(n)*params.LogTopicGas
-				var size uint64
+			}
+			memGas, err := memoryGasCost(adapter.memShadow, memSize)
+			if err != nil {
+				return err
+			}
+			if os.Getenv("MIR_DEBUG_LOG_GAS") == "1" {
+				var off, sz uint64
 				if len(ctx.Operands) >= 2 {
-					size = ctx.Operands[1].Uint64()
+					off = ctx.Operands[0].Uint64()
+					sz = ctx.Operands[1].Uint64()
 				}
-				add += size * params.LogDataGas
-				if contract.Gas < add {
-					return ErrOutOfGas
+				fmt.Printf("MIR_LOG_GAS pc=%d op=0x%x memShadow=%d ctxMemSize=%d off=%d size=%d memSize=%d memGas=%d\n",
+					ctx.M.EvmPC(), byte(evmOp), adapter.memShadow.Len(), ctx.MemorySize, off, sz, memSize, memGas)
+			}
+			n := int(evmOp - LOG0)
+			add := memGas + params.LogGas + uint64(n)*params.LogTopicGas
+			var size uint64
+			if len(ctx.Operands) >= 2 {
+				size = ctx.Operands[1].Uint64()
+			}
+			add += size * params.LogDataGas
+			if contract.Gas < add {
+				if shouldTraceBlock966Tx0(adapter.evm, contract) {
+					var be uint64
+					var firstPC uint
+					if adapter.currentBlock != nil {
+						firstPC = adapter.currentBlock.FirstPC()
+						be = adapter.blockEntryGasCharges[adapter.currentBlock]
+					}
+					log.Warn("MIR_TRACE_BLOCK966 OOG at LOG",
+						"evmPC", ctx.M.EvmPC(),
+						"op", byte(evmOp),
+						"need", add,
+						"have", contract.Gas,
+						"topics", n,
+						"size", size,
+						"memSize", memSize,
+						"blockFirstPC", firstPC,
+						"blockEntryCharged", be,
+						"refund", adapter.evm.StateDB.GetRefund(),
+					)
 				}
-				contract.Gas -= add
-				resizeShadow(ctx.MemorySize)
-				adapter.mirInterpreter.EnsureMemorySize(ctx.MemorySize)
+				return ErrOutOfGas
+			}
+			contract.Gas -= add
+			if memSize > uint64(adapter.memShadow.Len()) {
+				resizeShadow(memSize)
+				adapter.mirInterpreter.EnsureMemorySize(memSize)
 			}
 		case SELFDESTRUCT:
 			var gas uint64
@@ -715,7 +837,6 @@ func NewMIRInterpreterAdapter(evm *EVM) *MIRInterpreterAdapter {
 	// Initialize a shadow memory for dynamic memory gas accounting
 	adapter.memShadow = NewMemory()
 	adapter.warmAccounts = make(map[[20]byte]struct{})
-	adapter.warmSlots = make(map[warmSlotKey]struct{})
 	adapter.storageCache = make(map[[32]byte][32]byte)
 	return adapter
 }
@@ -826,6 +947,20 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 		if ctx == nil {
 			return nil
 		}
+		// Test probe: observe gas BEFORE any MIR charging for this originating EVM opcode.
+		// Must run early so we still capture the failing opcode when we OOG during charging.
+		if mirGasPreProbe != nil && ctx.M != nil {
+			mirGasPreProbe(uint64(ctx.M.EvmPC()), ctx.EvmOp, contract.Gas, ctx.IsBlockEntry)
+		}
+		// Keep last seen MIR pc/op/gas so we can print a precise OOG location
+		// if MIR ends up returning ErrOutOfGas.
+		if ctx.M != nil {
+			adapter.lastTracePC = uint64(ctx.M.EvmPC())
+			adapter.lastTraceOp = ctx.EvmOp
+			adapter.lastTraceGasLeft = contract.Gas
+			adapter.lastTraceAddr = contract.Address()
+		}
+		gasBefore := contract.Gas
 		// Track if previous op was a JUMP/JUMPI to decide landing-time JUMPDEST charge
 		if ctx.M != nil {
 			if OpCode(ctx.EvmOp) == JUMP || OpCode(ctx.EvmOp) == JUMPI || ctx.M.Op() == compiler.MirJUMP || ctx.M.Op() == compiler.MirJUMPI {
@@ -851,20 +986,25 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 				if code != nil && firstPC >= 0 && firstPC < len(code) && OpCode(code[firstPC]) == JUMPDEST {
 					jg := params.JumpdestGas
 					if adapter.currentContract.Gas < jg {
+						if os.Getenv("MIR_DEBUG_BLOCKENTRY") == "1" {
+							fmt.Printf("MIR block-entry OOG on first JUMPDEST: firstPC=%d need=%d have=%d\n", ctx.Block.FirstPC(), jg, adapter.currentContract.Gas)
+						}
 						return ErrOutOfGas
 					}
 					adapter.currentContract.Gas -= jg
+					if mirGasChargeProbe != nil {
+						mirGasChargeProbe(uint64(ctx.Block.FirstPC()), byte(JUMPDEST), jg, true)
+					}
 					blockEntryTotalGas += jg
 					// remember we charged this (block-first JUMPDEST)
 					adapter.lastJdPC = uint32(ctx.Block.FirstPC())
 					adapter.lastJdBlockFirstPC = uint32(ctx.Block.FirstPC())
 				}
 			}
-			// Validate that we're only charging for the current block
-			// (ctx.Block should match the block we're entering)
-			// Charge block entry gas for all opcodes in the block
-			// Get counts from EVMOpCounts(), but validate against actual bytecode in block's PC range
-			// This fixes cases where EVMOpCounts() includes opcodes from other blocks
+			// Validate that we're only charging for the current block.
+			// Charge block entry gas for all opcodes in the block.
+			// Get counts from EVMOpCounts(), but validate against actual bytecode in block's PC range.
+			// This fixes cases where EVMOpCounts() includes opcodes from other blocks.
 			var counts map[byte]uint32
 			// Use currentContract instead of captured contract to handle nested calls correctly
 			currentContract := adapter.currentContract
@@ -872,38 +1012,89 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 				currentContract = contract
 			}
 			if currentContract.Code != nil && ctx.Block != nil {
-				// Count opcodes directly from bytecode in the block's PC range
-				firstPC := ctx.Block.FirstPC()
-				lastPC := ctx.Block.LastPC()
-				validatedCounts := countOpcodesInRange(currentContract.Code, firstPC, lastPC)
-				// Use validated counts instead of EVMOpCounts() to ensure accuracy
-				counts = validatedCounts
-
+				// Count opcodes directly from bytecode for this block.
+				counts = countOpcodesInBlock(currentContract.Code, ctx.Block)
 			} else {
-				// Fallback to EVMOpCounts() if we can't validate
 				counts = ctx.Block.EVMOpCounts()
 			}
 			if counts != nil {
-				// Track which opcodes have MIR instructions in this block
-				hasMIRInstruction := make(map[OpCode]bool)
-				if ctx.M != nil && ctx.M.EvmOp() != 0 {
-					hasMIRInstruction[OpCode(ctx.M.EvmOp())] = true
+				if mirBlockEntryCountsProbe != nil && ctx.Block != nil {
+					// Copy to avoid mutation surprises.
+					cp := make(map[byte]uint32, len(counts))
+					for k, v := range counts {
+						cp[k] = v
+					}
+					mirBlockEntryCountsProbe(ctx.Block.FirstPC(), cp)
 				}
-				// Also check all instructions in the block
+				// For each opcode, charge block-entry constant gas for the number of instances
+				// that did NOT result in a *real* MIR instruction execution (i.e., optimized away).
+				//
+				// IMPORTANT: We must exclude MirNOP/MirPHI from "emitted", because MirNOP is skipped at
+				// runtime (no per-instruction gas charging), and PHI is an internal MIR op.
+				emittedReal := make(map[byte]uint32)
 				if ctx.Block != nil {
 					for _, m := range ctx.Block.Instructions() {
-						if m != nil && m.EvmOp() != 0 {
-							hasMIRInstruction[OpCode(m.EvmOp())] = true
+						if m == nil {
+							continue
 						}
+						if m.Op() == compiler.MirNOP || m.Op() == compiler.MirPHI {
+							continue
+						}
+						if m.EvmOp() == 0 {
+							continue
+						}
+						emittedReal[m.EvmOp()]++
 					}
 				}
+				if os.Getenv("MIR_DEBUG_BLOCKENTRY") == "1" && ctx.Block != nil {
+					fmt.Printf("MIR block-entry debug: firstPC=%d lastPC=%d instr=%d hasMIR=%d\n",
+						ctx.Block.FirstPC(), ctx.Block.LastPC(), len(ctx.Block.Instructions()), len(emittedReal))
+				}
+				if os.Getenv("MIR_DEBUG_BLOCKENTRY_COUNTS") == "1" && ctx.Block != nil {
+					fp := ctx.Block.FirstPC()
+					var push, dup, swap, pop uint32
+					for opb, cnt := range counts {
+						op := OpCode(opb)
+						switch {
+						case op == POP:
+							pop += cnt
+						case op == PUSH0 || (op >= PUSH1 && op <= PUSH32):
+							push += cnt
+						case op >= DUP1 && op <= DUP16:
+							dup += cnt
+						case op >= SWAP1 && op <= SWAP16:
+							swap += cnt
+						}
+					}
+					fmt.Printf("MIR block-entry counts: firstPC=%d push=%d dup=%d swap=%d pop=%d\n", fp, push, dup, swap, pop)
+				}
+				// MIR_DEBUG_BLOCKENTRY_HASMIR_STACKOPS debug removed: block-entry charging now uses
+				// (EVMOpCounts - EmittedOpCounts) instead of a boolean hasMIRInstruction set.
 				for opb, cnt := range counts {
 					if cnt == 0 {
+						continue
+					}
+					// How many instances were optimized away?
+					miss := cnt
+					if e := emittedReal[opb]; e > 0 {
+						if e >= miss {
+							continue
+						}
+						miss = miss - e
+					}
+					if miss == 0 {
 						continue
 					}
 					op := OpCode(opb)
 					// Skip KECCAK256 constant gas at block entry (charged per instruction)
 					if op == KECCAK256 {
+						continue
+					}
+					// Skip LOG0-LOG4 constant gas at block entry.
+					// LOG opcodes are charged via the dynamic-gas path (LogGas + topics + data + mem expansion).
+					// Charging their constant part here would double-charge LogGas and can cause OOG divergence
+					// for transactions that consume the exact block-provided gas limit (e.g. block 249 tx0).
+					if op >= LOG0 && op <= LOG4 {
 						continue
 					}
 					// Skip JUMPDEST constant gas at block entry (always charged per instruction when executed)
@@ -920,72 +1111,117 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 						// EXP has both constant and dynamic gas
 						// If EXP has a MIR instruction, gas will be charged per instruction
 						// If EXP was optimized away (no MIR instruction), charge gas at block entry using operands from bytecode
-						if !hasMIRInstruction[EXP] {
-							// EXP was optimized away, but we still need to charge gas
-							// Get operands from the original bytecode to calculate dynamic gas
-							expGas := params.ExpGas // Start with constant gas
-							if currentContract.Code != nil {
+						if miss > 0 {
+							// EXP was optimized away, but we still need to charge gas. Dynamic EXP gas depends
+							// on the exponent size (in bytes), which is a stack value. In the optimized-away
+							// cases we care about (e.g. block 966 tx0), the exponent is a constant pushed
+							// immediately before EXP within the same basic block.
+							//
+							// We compute per-EXP gas by scanning the bytecode range of this basic block and
+							// extracting the exponent from the 2nd-most-recent PUSH before each EXP.
+							var totalGas uint64
+							perByte := params.ExpByteFrontier
+							if adapter.evm.chainRules.IsEIP158 {
+								perByte = params.ExpByteEIP158
+							}
+							if currentContract.Code != nil && ctx.Block != nil {
 								code := currentContract.Code
-								// Find EXP opcode (0x0a) in the bytecode and get its operands
-								for i := 0; i < len(code); i++ {
-									if OpCode(code[i]) == EXP {
-										// Found EXP at PC i, now get the two operands from PUSH instructions before it
-										// Trace back to find the two PUSH values
-										// Stack order: last pushed is on top, so EXP pops: top (base) then next (exponent)
-										var expVal *uint256.Int
-										// Trace backwards from EXP to find PUSH instructions
-										// The byte before EXP (i-1) is the data byte of the last PUSH
-										// We need to trace back to find both PUSH opcodes
-										pc := i - 1 // Last byte before EXP (data byte of first PUSH)
-										// Find first PUSH before EXP (base, top of stack)
-										// Trace back to find the PUSH opcode
-										for pc >= 0 && pc < len(code) {
-											// Check if current byte is a PUSH opcode
-											op := OpCode(code[pc])
-											if op >= PUSH1 && op <= PUSH32 {
-												pushSize := int(op - PUSH1 + 1)
-												// This is a PUSH opcode, data follows immediately
-												if pc+pushSize < len(code) {
-													// Move to before this PUSH to find the next one (exponent)
-													pc = pc - 1
-													// Get second operand (exponent) - second PUSH before EXP
-													for pc >= 0 && pc < len(code) {
-														op2 := OpCode(code[pc])
-														if op2 >= PUSH1 && op2 <= PUSH32 {
-															pushSize2 := int(op2 - PUSH1 + 1)
-															if pc+pushSize2 < len(code) {
-																// Read the pushed value (big-endian, right-aligned)
-																valBytes2 := make([]byte, 32)
-																copy(valBytes2[32-pushSize2:], code[pc+1:pc+1+pushSize2])
-																expVal = uint256.NewInt(0).SetBytes(valBytes2)
-															}
-															break
-														}
-														pc--
-													}
-												}
-												break
-											}
-											pc--
+								start := int(ctx.Block.FirstPC())
+								if start < 0 {
+									start = 0
+								}
+								if start > len(code) {
+									start = len(code)
+								}
+								// Determine an exclusive stop boundary similar to countOpcodesInBlock.
+								stopBefore := len(code)
+								if ch := ctx.Block.Children(); len(ch) > 0 {
+									for _, c := range ch {
+										if c == nil {
+											continue
 										}
-										// Calculate dynamic gas if we have the exponent
-										if expVal != nil {
-											expBytes := uint64((expVal.BitLen() + 7) / 8)
-											perByte := params.ExpByteFrontier
-											if adapter.evm.chainRules.IsEIP158 {
-												perByte = params.ExpByteEIP158
-											}
-											expGas = params.ExpGas + perByte*expBytes
+										cp := int(c.FirstPC())
+										if cp > start && cp < stopBefore {
+											stopBefore = cp
 										}
-										break
 									}
 								}
+								opStarts := make([]int, 0, 64)
+								charged := uint32(0)
+								for pc := start; pc < len(code); {
+									if pc == stopBefore && pc > start {
+										break
+									}
+									opStarts = append(opStarts, pc)
+									evmop := OpCode(code[pc])
+									if evmop == JUMPDEST && pc > start {
+										break
+									}
+									if evmop == EXP {
+										// Find the exponent PUSH: EXP pops base (top) then exponent (next),
+										// so exponent is the 2nd-most-recent PUSH before this EXP.
+										var expVal *uint256.Int
+										foundPush := 0
+										for j := len(opStarts) - 2; j >= 0 && foundPush < 2; j-- {
+											ppc := opStarts[j]
+											pop := OpCode(code[ppc])
+											if pop >= PUSH1 && pop <= PUSH32 {
+												pushSize := int(pop - PUSH1 + 1)
+												if ppc+1+pushSize <= len(code) {
+													if foundPush == 1 {
+														valBytes := make([]byte, 32)
+														copy(valBytes[32-pushSize:], code[ppc+1:ppc+1+pushSize])
+														expVal = uint256.NewInt(0).SetBytes(valBytes)
+													}
+													foundPush++
+												}
+											}
+										}
+										expBytes := uint64(0)
+										if expVal != nil {
+											expBytes = uint64((expVal.BitLen() + 7) / 8)
+										}
+										expGas := params.ExpGas + perByte*expBytes
+										totalGas += expGas
+										charged++
+										if charged >= miss {
+											break
+										}
+									}
+									// Advance to next opcode boundary (skip PUSH data).
+									nextPC := pc + 1
+									if evmop >= PUSH1 && evmop <= PUSH32 {
+										nextPC = pc + 1 + int(evmop-PUSH1+1)
+									}
+									if stopBefore > pc && stopBefore < nextPC {
+										stopBefore = nextPC
+									}
+									if evmop == STOP || evmop == RETURN || evmop == REVERT || evmop == SELFDESTRUCT || evmop == JUMP || evmop == JUMPI {
+										break
+									}
+									pc = nextPC
+								}
+							} else {
+								// Fallback: charge constant only (dynamic unknown). This is conservative in the
+								// sense it avoids spurious OOG from overcharging.
+								totalGas = params.ExpGas * uint64(miss)
 							}
-							totalGas := expGas * uint64(cnt)
 							if currentContract.Gas < totalGas {
+								if os.Getenv("MIR_DEBUG_BLOCKENTRY") == "1" {
+									var fp, lp uint
+									if ctx.Block != nil {
+										fp = ctx.Block.FirstPC()
+										lp = ctx.Block.LastPC()
+									}
+									fmt.Printf("MIR block-entry OOG on EXP(optimized-away): firstPC=%d lastPC=%d cnt=%d need=%d have=%d\n",
+										fp, lp, cnt, totalGas, currentContract.Gas)
+								}
 								return ErrOutOfGas
 							}
 							currentContract.Gas -= totalGas
+							if mirGasChargeProbe != nil {
+								mirGasChargeProbe(uint64(ctx.Block.FirstPC()), byte(EXP), totalGas, true)
+							}
 							blockEntryTotalGas += totalGas
 						}
 						// Skip EXP constant gas at block entry if it has a MIR instruction (will be charged per instruction)
@@ -993,11 +1229,23 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 					}
 					jt := (*adapter.table)[op]
 					if jt != nil && jt.constantGas > 0 {
-						total := jt.constantGas * uint64(cnt)
+						total := jt.constantGas * uint64(miss)
 						if currentContract.Gas < total {
+							if os.Getenv("MIR_DEBUG_BLOCKENTRY") == "1" {
+								var fp, lp uint
+								if ctx.Block != nil {
+									fp = ctx.Block.FirstPC()
+									lp = ctx.Block.LastPC()
+								}
+								fmt.Printf("MIR block-entry OOG: firstPC=%d lastPC=%d op=0x%x cnt=%d constGas=%d need=%d have=%d\n",
+									fp, lp, byte(op), cnt, jt.constantGas, total, currentContract.Gas)
+							}
 							return ErrOutOfGas
 						}
 						currentContract.Gas -= total
+						if mirGasChargeProbe != nil {
+							mirGasChargeProbe(uint64(ctx.Block.FirstPC()), byte(op), total, true)
+						}
 						blockEntryTotalGas += total
 					}
 				}
@@ -1009,12 +1257,84 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 		}
 		// Determine originating EVM opcode for this MIR
 		evmOp := OpCode(ctx.EvmOp)
+		// Defensive mapping: some MIR ops may not carry the originating EVM opcode byte
+		// (ctx.EvmOp==0). In that case, derive it from the MIR op so constant gas accounting
+		// remains correct.
+		if evmOp == 0 && ctx.M != nil {
+			switch ctx.M.Op() {
+			case compiler.MirSUB:
+				evmOp = SUB
+			}
+		}
 		// Emit tracer OnOpcode before charging to maintain step-count parity
 		if adapter.evm != nil && adapter.evm.Config.Tracer != nil && adapter.evm.Config.Tracer.OnOpcode != nil {
 			scope := &ScopeContext{Memory: adapter.memShadow, Stack: nil, Contract: contract}
 			adapter.evm.Config.Tracer.OnOpcode(uint64(ctx.M.EvmPC()), byte(evmOp), contract.Gas, 0, scope, nil, adapter.evm.depth, nil)
 		}
-		// Constant gas is charged at block entry; JUMPDEST is charged at block entry of landing blocks.
+		// Constant gas:
+		// - For opcodes with MIR instructions: charged per-instruction (except special cases below).
+		// - For opcodes without MIR instructions (e.g. PUSH/DUP/SWAP optimized away): charged at block entry above.
+		if ctx.M != nil && !ctx.IsBlockEntry {
+			// EXP and GAS have special handling below; JUMPDEST is handled via dedicated logic.
+			if evmOp != 0 && evmOp != EXP && evmOp != GAS && evmOp != JUMPDEST {
+				if adapter.table != nil && (*adapter.table)[evmOp] != nil {
+					cg := (*adapter.table)[evmOp].constantGas
+					if shouldTraceBlock966Tx0(adapter.evm, contract) && ctx.M != nil && ctx.M.EvmPC() == 5304 && evmOp == LOG1 {
+						// Print a pinpoint snapshot of what we're about to charge at LOG1 (block 966 tx0).
+						// This helps determine whether we are OOG due to the jump-table constant gas,
+						// or due to dynamic LOG gas (mem + topics + data).
+						var off, sz uint64
+						if len(ctx.Operands) >= 2 {
+							off = ctx.Operands[0].Uint64()
+							sz = ctx.Operands[1].Uint64()
+						}
+						needed := off + sz
+						if needed == 0 && ctx.MemorySize > 0 {
+							needed = ctx.MemorySize
+						}
+						memSize := (needed + 31) / 32 * 32
+						var memGas uint64
+						if adapter.memShadow != nil && memSize > uint64(adapter.memShadow.Len()) {
+							if g, err := memoryGasCost(adapter.memShadow, memSize); err == nil {
+								memGas = g
+							}
+						}
+						dynNeed := memGas + params.LogGas + params.LogTopicGas + sz*params.LogDataGas
+						log.Warn("MIR_TRACE_BLOCK966 LOG1 precharge",
+							"addr", contract.Address(),
+							"gas", contract.Gas,
+							"jumpTableConstGas", cg,
+							"memShadow", func() int {
+								if adapter.memShadow == nil {
+									return 0
+								}
+								return adapter.memShadow.Len()
+							}(),
+							"ctxMemSize", ctx.MemorySize,
+							"off", off,
+							"size", sz,
+							"memSize", memSize,
+							"memGas", memGas,
+							"dynNeed", dynNeed,
+						)
+					}
+					if cg > 0 {
+						if contract.Gas < cg {
+							if shouldTraceBlock966Tx0(adapter.evm, contract) && ctx.M != nil && ctx.M.EvmPC() == 5304 && evmOp == LOG1 {
+								log.Warn("MIR_TRACE_BLOCK966 OOG at LOG1 constant gas",
+									"addr", contract.Address(),
+									"have", contract.Gas,
+									"need", cg,
+								)
+							}
+							return ErrOutOfGas
+						}
+						contract.Gas -= cg
+					}
+				}
+			}
+		}
+		// JUMPDEST is charged at block entry of landing blocks.
 		// Charge JUMPDEST exactly when executed (matches base EVM semantics).
 		// For zero-size landing blocks, MIR synthesizes a JUMPDEST pre-op at block-entry:
 		// in that case, charge at block-entry; for normal blocks, charge on instruction (IsBlockEntry=false).
@@ -1454,8 +1774,9 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 				adapter.mirInterpreter.EnsureMemorySize(memSize)
 			}
 		case KECCAK256:
-			// KECCAK256 has constant gas (30) + memory gas + word gas
-			// Constant gas is charged per instruction (not at block entry)
+			// KECCAK256 has dynamic gas = memory expansion + word gas.
+			// NOTE: constant gas (params.Keccak256Gas) is charged via the generic
+			// per-instruction constant-gas path above.
 			var offset, size uint64
 			if len(ctx.Operands) >= 2 {
 				offset = ctx.Operands[0].Uint64()
@@ -1469,7 +1790,7 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 			}
 
 			wordGas := toWord(size) * params.Keccak256WordGas
-			totalGas := params.Keccak256Gas + wordGas
+			totalGas := wordGas
 			// Memory expansion gas (if any)
 			if memSize > uint64(adapter.memShadow.Len()) {
 				gas, err := memoryGasCost(adapter.memShadow, memSize)
@@ -1496,7 +1817,12 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 				offset = ctx.Operands[0].Uint64()
 				size = ctx.Operands[1].Uint64()
 			}
-			needed := offset + size
+			// Match native EVM memory-expansion semantics: if size==0, there is no memory expansion
+			// regardless of offset (e.g. LOG1 with size=0).
+			needed := uint64(0)
+			if size != 0 {
+				needed = offset + size
+			}
 			memSize := (needed + 31) / 32 * 32
 			if memSize < needed {
 				return ErrGasUintOverflow
@@ -1568,6 +1894,27 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 					return err
 				}
 				if contract.Gas < gas {
+					if shouldTraceBlock966Tx0(adapter.evm, contract) {
+						// Replicate the gasSStore key/value decode for logging.
+						key := st.Back(0).Bytes32()
+						val := st.Back(1)
+						cur := adapter.evm.StateDB.GetState(contract.Address(), key)
+						committed := adapter.evm.StateDB.GetCommittedState(contract.Address(), key)
+						log.Warn("MIR_TRACE_BLOCK966 OOG at SSTORE",
+							"evmPC", ctx.M.EvmPC(),
+							"need", gas,
+							"have", contract.Gas,
+							"key", common.Hash(key),
+							"valSign", val.Sign(),
+							"cur", cur,
+							"committed", committed,
+							"isPetersburg", adapter.evm.chainRules.IsPetersburg,
+							"isConstantinople", adapter.evm.chainRules.IsConstantinople,
+							"isBerlin", adapter.evm.chainRules.IsBerlin,
+							"isLondon", adapter.evm.chainRules.IsLondon,
+							"refund", adapter.evm.StateDB.GetRefund(),
+						)
+					}
 					return ErrOutOfGas
 				}
 				contract.Gas -= gas
@@ -1651,6 +1998,13 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 		if mirGasProbe != nil {
 			mirGasProbe(uint64(ctx.M.EvmPC()), ctx.EvmOp, contract.Gas)
 		}
+		if mirGasChargeProbe != nil && ctx.M != nil {
+			charged := uint64(0)
+			if gasBefore >= contract.Gas {
+				charged = gasBefore - contract.Gas
+			}
+			mirGasChargeProbe(uint64(ctx.M.EvmPC()), ctx.EvmOp, charged, ctx.IsBlockEntry)
+		}
 		return nil
 	}
 	// Save current beforeOp hook to restore after this execution
@@ -1691,12 +2045,29 @@ func (adapter *MIRInterpreterAdapter) Run(contract *Contract, input []byte, read
 	if entryBlockHasContent || hasCode {
 		result, err := adapter.mirInterpreter.RunCFGWithResolver(cfg, bbs[0])
 		if err != nil {
-			if err == compiler.ErrMIRFallback {
-				if compiler.DebugLogsEnabled {
-					fmt.Printf("⚠️ MIR fallback requested: contract=%s error=%v\n", contract.Address().Hex(), err)
+			// High-signal OOG pinpointing for block 966 tx0: log the last MIR pc/op we saw.
+			if err == ErrOutOfGas && shouldTraceBlock966Tx0(adapter.evm, contract) {
+				var be uint64
+				var firstPC uint
+				if adapter.currentBlock != nil {
+					firstPC = adapter.currentBlock.FirstPC()
+					be = adapter.blockEntryGasCharges[adapter.currentBlock]
 				}
-				return nil, fmt.Errorf("MIR fallback requested but disabled: %w", err)
+				log.Warn("MIR_TRACE_BLOCK966 OOG",
+					"addr", adapter.lastTraceAddr,
+					"evmPC", adapter.lastTracePC,
+					"op", fmt.Sprintf("0x%x", adapter.lastTraceOp),
+					"gasLeftBeforeHook", adapter.lastTraceGasLeft,
+					"blockFirstPC", firstPC,
+					"blockEntryCharged", be,
+					"origin", adapter.evm.TxContext.Origin,
+				)
 			}
+			// Mirror canonical EVM invalid-jump semantics (do not surface MIR_FALLBACK here).
+			if err == compiler.ErrInvalidJumpDestination {
+				return result, ErrInvalidJump
+			}
+			// No fallback: surface MIR errors directly so MIR bugs are not masked.
 			// Map compiler.errREVERT to vm.ErrExecutionReverted to preserve gas
 			if errors.Is(err, compiler.GetErrREVERT()) {
 				return result, ErrExecutionReverted
@@ -1742,6 +2113,8 @@ func (adapter *MIRInterpreterAdapter) setupExecutionEnvironment(contract *Contra
 		}
 		// Reset return data
 		adapter.mirInterpreter.ResetReturnData()
+		// Reset execution caches/results to avoid cross-call value leakage
+		adapter.mirInterpreter.ResetExecutionState()
 	}
 
 	// Reset warm caches per top-level Run
@@ -1760,13 +2133,6 @@ func (adapter *MIRInterpreterAdapter) setupExecutionEnvironment(contract *Contra
 			delete(adapter.storageCache, k)
 		}
 	}
-	if adapter.warmSlots == nil {
-		adapter.warmSlots = make(map[warmSlotKey]struct{})
-	} else {
-		for k := range adapter.warmSlots {
-			delete(adapter.warmSlots, k)
-		}
-	}
 
 	// Set address context
 	{
@@ -1777,6 +2143,19 @@ func (adapter *MIRInterpreterAdapter) setupExecutionEnvironment(contract *Contra
 		copy(env.Self[:], addr[:])
 		copy(env.Caller[:], caller[:])
 		copy(env.Origin[:], origin[:])
+
+		// Debug: trace call context for ERC20 transfer(selector 0xa9059cbb).
+		// This helps diagnose "transfer from the zero address" / balance divergence between repos.
+		if os.Getenv("MIR_TRACE_CALL_CONTEXT") == "1" && len(input) >= 4 &&
+			input[0] == 0xa9 && input[1] == 0x05 && input[2] == 0x9c && input[3] == 0xbb {
+			// Use stdout to ensure visibility in `go test -v` output.
+			cv := "nil"
+			if contract.Value() != nil {
+				cv = contract.Value().String()
+			}
+			fmt.Printf("MIR_CALLCTX transfer self=%s caller=%s origin=%s callValue=%s calldataLen=%d\n",
+				addr.Hex(), caller.Hex(), origin.Hex(), cv, len(input))
+		}
 	}
 
 	// Set gas price from transaction context

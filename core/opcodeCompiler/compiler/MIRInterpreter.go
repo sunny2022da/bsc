@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
 	"runtime/debug"
 	"time"
 
@@ -157,6 +158,22 @@ type MIRInterpreter struct {
 	lastCopyDest uint64
 	lastCopyOff  uint64
 	lastCopySize uint64
+
+	// PHI last-value cache keyed by (evmPC, phiStackIndex).
+	// This is more stable than (evmPC, idx) because idx can drift across variants/rebuilds.
+	phiLastBySlot map[uint64]map[int]*uint256.Int
+
+	// Debug-only: limit jump trace spam
+	jumpTraceCount uint32
+
+	// Debug-only: limit USDT loop prints
+	usdtLoopTraceCount uint32
+
+	// Debug-only: limit storage trace prints
+	usdtStorageTraceCount uint32
+
+	// Debug-only: limit SUB trace prints
+	usdtSubTraceCount uint32
 }
 
 // mirGlobalTracer is an optional global tracer invoked for each MIR instruction.
@@ -174,25 +191,11 @@ func init() {
 	mirHandlers[byte(MirJUMP)] = mirHandleJUMP
 	mirHandlers[byte(MirJUMPI)] = mirHandleJUMPI
 	mirHandlers[byte(MirMLOAD)] = mirHandleMLOAD
-	mirHandlers[byte(MirADD)] = mirHandleADD
-	mirHandlers[byte(MirMUL)] = mirHandleMUL
-	mirHandlers[byte(MirSUB)] = mirHandleSUB
-	mirHandlers[byte(MirDIV)] = mirHandleDIV
-	mirHandlers[byte(MirSDIV)] = mirHandleSDIV
-	mirHandlers[byte(MirMOD)] = mirHandleMOD
-	mirHandlers[byte(MirSMOD)] = mirHandleSMOD
-	mirHandlers[byte(MirEXP)] = mirHandleEXP
-	mirHandlers[byte(MirAND)] = mirHandleAND
-	mirHandlers[byte(MirOR)] = mirHandleOR
-	mirHandlers[byte(MirXOR)] = mirHandleXOR
-	mirHandlers[byte(MirSHL)] = mirHandleSHL
-	mirHandlers[byte(MirSHR)] = mirHandleSHR
-	mirHandlers[byte(MirSAR)] = mirHandleSAR
-	mirHandlers[byte(MirEQ)] = mirHandleEQ
-	mirHandlers[byte(MirLT)] = mirHandleLT
-	mirHandlers[byte(MirGT)] = mirHandleGT
-	mirHandlers[byte(MirSLT)] = mirHandleSLT
-	mirHandlers[byte(MirSGT)] = mirHandleSGT
+	// IMPORTANT: Do NOT fast-dispatch arithmetic/bitwise ops via mirHandlers.
+	// The generic `execArithmetic` path mirrors EVM operand ordering and has been validated
+	// against consensus-sensitive workloads. The fast handlers rely on `preOpOps` reuse and
+	// can accidentally swap operand order depending on how operands are encoded in MIR,
+	// leading to corrupted ABI decoding (e.g. address/amount) and invalid jump targets.
 	mirHandlers[byte(MirMSTORE)] = mirHandleMSTORE
 	mirHandlers[byte(MirMSTORE8)] = mirHandleMSTORE8
 	mirHandlers[byte(MirMCOPY)] = mirHandleMCOPY
@@ -201,9 +204,6 @@ func init() {
 	mirHandlers[byte(MirKECCAK256)] = mirHandleKECCAK
 	mirHandlers[byte(MirCALLDATALOAD)] = mirHandleCALLDATALOAD
 	mirHandlers[byte(MirRETURNDATALOAD)] = mirHandleRETURNDATALOAD
-	mirHandlers[byte(MirISZERO)] = mirHandleISZERO
-	mirHandlers[byte(MirNOT)] = mirHandleNOT
-	mirHandlers[byte(MirBYTE)] = mirHandleBYTE
 
 	// DUP operations
 	for i := MirOperation(0); i < 16; i++ {
@@ -233,6 +233,7 @@ func NewMIRInterpreter(env *MIRExecutionEnv) *MIRInterpreter {
 		phiResultsBySig:    make(map[uint64]map[int]map[*MIRBasicBlock]*uint256.Int, 32),
 		phiLastPredBySig:   make(map[uint64]map[int]*MIRBasicBlock, 32),
 		globalResultsBySig: make(map[uint64]map[int]*uint256.Int, 64),
+		phiLastBySlot:      make(map[uint64]map[int]*uint256.Int, 64),
 	}
 }
 
@@ -531,6 +532,11 @@ func (it *MIRInterpreter) RunCFGWithResolver(cfg *CFG, entry *MIRBasicBlock) ([]
 			delete(it.phiResultsBySig, k)
 		}
 	}
+	if it.phiLastBySlot != nil {
+		for k := range it.phiLastBySlot {
+			delete(it.phiLastBySlot, k)
+		}
+	}
 	if it.env != nil && it.env.ResolveBB == nil && cfg != nil {
 		// Build a lightweight resolver using cfg.pcToBlock and cfg.pcToVariants
 		// CRITICAL FIX: Context-aware variant selection based on predecessor and parent matching
@@ -672,6 +678,8 @@ func (it *MIRInterpreter) RunCFGWithResolver(cfg *CFG, entry *MIRBasicBlock) ([]
 						// Publish on fallthrough, too
 						//log.Warn("MIR publish before fallthrough", "from_block", bb.blockNum)
 						it.publishLiveOut(bb)
+						// Preserve predecessor for successor PHI resolution.
+						it.prevBB = bb
 						if children[0] == bb {
 							MirDebugWarn("MIR: self-loop fallthrough detected; rerunning block", "blockNum", bb.blockNum)
 							bb = children[0]
@@ -764,11 +772,15 @@ func (it *MIRInterpreter) RunCFGWithResolver(cfg *CFG, entry *MIRBasicBlock) ([]
 				}
 				return it.returndata, nil
 			}
+			// Preserve predecessor for successor PHI resolution.
+			it.prevBB = bb
 			bb = it.nextBB
 			continue
 		}
 		switch err {
 		case errJUMP:
+			// Preserve predecessor for successor PHI resolution.
+			it.prevBB = bb
 			bb = it.nextBB
 			continue
 		case errSTOP:
@@ -792,6 +804,10 @@ var (
 	// ErrMIRFallback signals the adapter to fallback to the stock EVM interpreter
 	// when MIR cannot safely continue (e.g., invalid jump destination resolution).
 	ErrMIRFallback = errors.New("MIR_FALLBACK")
+	// ErrInvalidJumpDestination mirrors the stock EVM "invalid jump destination" error.
+	// We return this when the jump target is invalid per EVM rules (not a JUMPDEST / in push-data),
+	// so MIR matches native behavior without relying on fallback.
+	ErrInvalidJumpDestination = errors.New("invalid jump destination")
 )
 
 // GetErrREVERT returns the errREVERT error for external packages to check
@@ -1248,6 +1264,12 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 
 		key := it.evalValue(m.operands[0])
 		val := it.evalValue(m.operands[1])
+		if os.Getenv("MIR_TRACE_USDT_SSTORE") == "1" && len(it.env.Calldata) >= 4 &&
+			it.env.Calldata[0] == 0xa9 && it.env.Calldata[1] == 0x05 && it.env.Calldata[2] == 0x9c && it.env.Calldata[3] == 0xbb {
+			kb := key.Bytes32()
+			vb := val.Bytes32()
+			fmt.Printf("MIR_USDT_SSTORE evmPC=%d key=%x val=%x\n", m.evmPC, kb[:], vb[:])
+		}
 		it.sstore(key, val)
 		return nil
 
@@ -1405,6 +1427,10 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 			it.scratch32[i] = 0
 		}
 		copy(it.scratch32[12:], it.env.Caller[:])
+		if os.Getenv("MIR_TRACE_CALLER") == "1" && len(it.env.Calldata) >= 4 &&
+			it.env.Calldata[0] == 0xa9 && it.env.Calldata[1] == 0x05 && it.env.Calldata[2] == 0x9c && it.env.Calldata[3] == 0xbb {
+			fmt.Printf("MIR_CALLER evmPC=%d caller=%x word=%x\n", m.evmPC, it.env.Caller[:], it.scratch32[:])
+		}
 		it.setResult(m, it.tmpA.Clear().SetBytes(it.scratch32[:]))
 		return nil
 	case MirORIGIN:
@@ -1412,6 +1438,10 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 			it.scratch32[i] = 0
 		}
 		copy(it.scratch32[12:], it.env.Origin[:])
+		if os.Getenv("MIR_TRACE_CALLER") == "1" && len(it.env.Calldata) >= 4 &&
+			it.env.Calldata[0] == 0xa9 && it.env.Calldata[1] == 0x05 && it.env.Calldata[2] == 0x9c && it.env.Calldata[3] == 0xbb {
+			fmt.Printf("MIR_ORIGIN evmPC=%d origin=%x word=%x\n", m.evmPC, it.env.Origin[:], it.scratch32[:])
+		}
 		it.setResult(m, it.tmpA.Clear().SetBytes(it.scratch32[:]))
 		return nil
 	case MirGASPRICE:
@@ -1495,8 +1525,22 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 			return fmt.Errorf("CALLDATALOAD missing offset")
 		}
 		off := it.evalValue(m.operands[0])
+		// Debug: trace CALLDATALOAD offsets/results.
+		if os.Getenv("MIR_TRACE_CALLDATA") == "1" {
+			sel := []byte{}
+			if len(it.env.Calldata) >= 4 {
+				sel = it.env.Calldata[:4]
+			}
+			if off.IsUint64() {
+				fmt.Printf("MIR_CALLDATALOAD evmPC=%d off=%d calldataLen=%d selector=%x\n", m.evmPC, off.Uint64(), len(it.env.Calldata), sel)
+			} else {
+				fmt.Printf("MIR_CALLDATALOAD evmPC=%d off(non-u64)=%s calldataLen=%d selector=%x\n", m.evmPC, off.String(), len(it.env.Calldata), sel)
+			}
+		}
 		it.readCalldata32Into(off, &it.scratch32)
-		//log.Warn("MIR CALLDATALOAD", "calldata", fmt.Sprintf("%x", it.env.Calldata), "off", off, "scratch32", fmt.Sprintf("%x", it.scratch32))
+		if os.Getenv("MIR_TRACE_CALLDATA") == "1" {
+			fmt.Printf("MIR_CALLDATALOAD evmPC=%d word=%x\n", m.evmPC, it.scratch32[:])
+		}
 		it.setResult(m, it.tmpA.Clear().SetBytes(it.scratch32[:]))
 		return nil
 	case MirCALLDATASIZE:
@@ -1519,6 +1563,14 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 		sz := it.preOpOps[2]
 		if sz == nil {
 			sz = it.evalValue(m.operands[2])
+		}
+		if os.Getenv("MIR_TRACE_CALLDATA") == "1" {
+			sel := []byte{}
+			if len(it.env.Calldata) >= 4 {
+				sel = it.env.Calldata[:4]
+			}
+			fmt.Printf("MIR_CALLDATACOPY evmPC=%d dest=%d off=%d size=%d calldataLen=%d selector=%x\n",
+				m.evmPC, dest.Uint64(), off.Uint64(), sz.Uint64(), len(it.env.Calldata), sel)
 		}
 		it.calldataCopy(dest, off, sz)
 		return nil
@@ -1714,6 +1766,17 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 		}
 		view := it.readMemView(off2, sz2)
 		it.returndata = append(it.returndata[:0], view...)
+		if os.Getenv("MIR_TRACE_REVERT") == "1" {
+			sel := []byte{}
+			if len(it.env.Calldata) >= 4 {
+				sel = it.env.Calldata[:4]
+			}
+			head := it.returndata
+			if len(head) > 64 {
+				head = head[:64]
+			}
+			fmt.Printf("MIR_REVERT evmPC=%d selector=%x retLen=%d retHead=%x\n", m.evmPC, sel, len(it.returndata), head)
+		}
 		return errREVERT
 	case MirCALL:
 		// operands: gas, addr, value, inOffset, inSize, outOffset, outSize
@@ -2126,6 +2189,35 @@ func mirHandleJUMP(it *MIRInterpreter, m *MIR) error {
 		return ErrMIRFallback
 	}
 	udest, _ := dest.Uint64WithOverflow()
+	if os.Getenv("MIR_TRACE_JUMP") == "1" && udest == 0 && len(m.operands) > 0 {
+		opv := m.operands[0]
+		fmt.Printf("MIR_JUMP_DEST_ZERO fromEvmPC=%d opvKind=%v\n", m.evmPC, opv.kind)
+		if opv != nil && opv.def != nil {
+			fmt.Printf("MIR_JUMP_DEST_ZERO defOp=%s defEvmPC=%d defIdx=%d defOperands=%d\n",
+				opv.def.op.String(), opv.def.evmPC, opv.def.idx, len(opv.def.operands))
+			if opv.def.op == MirPHI {
+				for i, alt := range opv.def.operands {
+					if alt == nil {
+						fmt.Printf("MIR_JUMP_DEST_ZERO phiAlt[%d]=<nil>\n", i)
+						continue
+					}
+					v := it.evalValue(alt)
+					u, _ := v.Uint64WithOverflow()
+					ok := it.env != nil && it.env.CheckJumpdest != nil && it.env.CheckJumpdest(u)
+					defOp := "<nil>"
+					defPC := uint(0)
+					defIdx := -1
+					if alt.def != nil {
+						defOp = alt.def.op.String()
+						defPC = alt.def.evmPC
+						defIdx = alt.def.idx
+					}
+					fmt.Printf("MIR_JUMP_DEST_ZERO phiAlt[%d] kind=%v defOp=%s defEvmPC=%d defIdx=%d val=%s u=%d isJumpdest=%v\n",
+						i, alt.kind, defOp, defPC, defIdx, v.Hex(), u, ok)
+				}
+			}
+		}
+	}
 	// Cache resolved PHI-based destination to stabilize later uses across blocks.
 	// However, avoid pinning when the destination is a self-loop to the current block's entry;
 	// allowing re-evaluation on the next iteration can let the dispatcher progress.
@@ -2156,29 +2248,17 @@ func mirHandleJUMPI(it *MIRInterpreter, m *MIR) error {
 	}
 	cond := it.evalValue(m.operands[1])
 
+	if os.Getenv("MIR_TRACE_USDT_FROM") == "1" && m != nil && m.evmPC == 2694 &&
+		len(it.env.Calldata) >= 4 && it.env.Calldata[0] == 0xa9 && it.env.Calldata[1] == 0x05 && it.env.Calldata[2] == 0x9c && it.env.Calldata[3] == 0xbb {
+		cb := cond.Bytes32()
+		fmt.Printf("MIR_USDT_JUMPI evmPC=2694 cond=%x isZero=%v\n", cb[:], cond.IsZero())
+	}
+
 	if cond.IsZero() {
-		// fallthrough: use children[1] which is the fallthrough block for JUMPI
-		children := it.currentBB.Children()
-		// In our builder, children[0] is fallthrough BB for JUMPI, targets follow.
-		if len(children) >= 1 && children[0] != nil {
-			it.nextBB = children[0]
-			it.publishLiveOut(it.currentBB)
-			return nil // Return nil to indicate success (no error), loop continues
-		}
-		// Fallback: try to resolve fallthrough block directly
-		dest := m.evmPC + 1
-		udest := uint64(dest)
-		it.nextBB = it.env.ResolveBB(udest)
-		if it.nextBB != nil {
-			it.publishLiveOut(it.currentBB)
-			return errJUMP
-		}
-		// If we can't resolve the block and children[1] doesn't exist,
-		// return nil to let RunCFGWithResolver handle fallthrough via children logic
-		// This should only happen if the CFG is malformed
-		it.nextBB = nil
-		it.publishLiveOut(it.currentBB)
-		return nil
+		// Fallthrough: resolve via scheduleJump so variant selection can use predecessor context.
+		// This avoids executing a mismatched stack-depth variant for fallthrough-heavy loops.
+		fallthroughPC := uint64(m.evmPC + 1)
+		return it.scheduleJump(fallthroughPC, m, true)
 	}
 	dest, ok := it.resolveJumpDestValue(m.operands[0])
 	if !ok {
@@ -2192,10 +2272,56 @@ func mirHandleJUMPI(it *MIRInterpreter, m *MIR) error {
 
 // mirHandlePHI sets the result to the first available incoming value.
 func mirHandlePHI(it *MIRInterpreter, m *MIR) error {
-	// If we can, take the exact value from the immediate predecessor's exit stack
+	// Prefer edge-specific incoming stack snapshots when available.
+	// These are computed during CFG build for each predecessor->successor edge and are more
+	// reliable than raw predecessor exit-stack defs for PHI resolution.
+	if it.prevBB != nil && it.currentBB != nil && m.phiStackIndex >= 0 {
+		incoming := it.currentBB.IncomingStacks()
+		if incoming != nil {
+			if stack, ok := incoming[it.prevBB]; ok && stack != nil {
+				idxFromTop := m.phiStackIndex
+				if idxFromTop < len(stack) {
+					src := stack[len(stack)-1-idxFromTop]
+					if os.Getenv("MIR_TRACE_JUMP") == "1" && it.currentBB != nil && it.currentBB.firstPC == 1172 {
+						defOp := "<nil>"
+						defPC := uint(0)
+						defIdx := -1
+						if src.def != nil {
+							defOp = src.def.op.String()
+							defPC = src.def.evmPC
+							defIdx = src.def.idx
+						}
+						fmt.Printf("MIR_PHI_INCOMING bbFirstPC=%d phiIdxFromTop=%d prevBBFirstPC=%d srcKind=%v defOp=%s defEvmPC=%d defIdx=%d\n",
+							it.currentBB.firstPC, idxFromTop, it.prevBB.firstPC, src.kind, defOp, defPC, defIdx)
+					}
+					src.liveIn = true
+					val := it.evalValue(&src)
+					it.setResult(m, val)
+					// Record last PHI value by (evmPC, phiStackIndex) to avoid idx/variant drift.
+					if val != nil && m != nil && m.evmPC != 0 {
+						if it.phiLastBySlot != nil {
+							if it.phiLastBySlot[uint64(m.evmPC)] == nil {
+								it.phiLastBySlot[uint64(m.evmPC)] = make(map[int]*uint256.Int)
+							}
+							it.phiLastBySlot[uint64(m.evmPC)][m.phiStackIndex] = new(uint256.Int).Set(val)
+						}
+					}
+					if m != nil && val != nil {
+						if it.phiResults[m] == nil {
+							it.phiResults[m] = make(map[*MIRBasicBlock]*uint256.Int)
+						}
+						it.phiResults[m][it.prevBB] = new(uint256.Int).Set(val)
+						it.phiLastPred[m] = it.prevBB
+					}
+					return nil
+				}
+			}
+		}
+	}
+
+	// Fallback: take the value from the immediate predecessor's exit stack
 	if it.prevBB != nil {
 		exit := it.prevBB.ExitStack()
-
 		if exit != nil && m.phiStackIndex >= 0 {
 			idxFromTop := m.phiStackIndex
 			if idxFromTop < len(exit) {
@@ -2206,6 +2332,14 @@ func mirHandlePHI(it *MIRInterpreter, m *MIR) error {
 
 				val := it.evalValue(&src)
 				it.setResult(m, val)
+				if val != nil && m != nil && m.evmPC != 0 {
+					if it.phiLastBySlot != nil {
+						if it.phiLastBySlot[uint64(m.evmPC)] == nil {
+							it.phiLastBySlot[uint64(m.evmPC)] = make(map[int]*uint256.Int)
+						}
+						it.phiLastBySlot[uint64(m.evmPC)][m.phiStackIndex] = new(uint256.Int).Set(val)
+					}
+				}
 				// Record PHI result with predecessor sensitivity for future uses
 				if m != nil {
 					if it.phiResults[m] == nil {
@@ -2231,29 +2365,6 @@ func mirHandlePHI(it *MIRInterpreter, m *MIR) error {
 					}
 				}
 				return nil
-			}
-		}
-		// Try incoming stacks as fallback before operand selection
-		if it.currentBB != nil && m.phiStackIndex >= 0 {
-			incoming := it.currentBB.IncomingStacks()
-			if incoming != nil {
-				if stack, ok := incoming[it.prevBB]; ok && stack != nil {
-					idxFromTop := m.phiStackIndex
-					if idxFromTop < len(stack) {
-						src := stack[len(stack)-1-idxFromTop]
-						src.liveIn = true
-						val := it.evalValue(&src)
-						it.setResult(m, val)
-						if m != nil && val != nil {
-							if it.phiResults[m] == nil {
-								it.phiResults[m] = make(map[*MIRBasicBlock]*uint256.Int)
-							}
-							it.phiResults[m][it.prevBB] = new(uint256.Int).Set(val)
-							it.phiLastPred[m] = it.prevBB
-						}
-						return nil
-					}
-				}
 			}
 		}
 	}
@@ -2446,6 +2557,10 @@ func mirHandleSHL(it *MIRInterpreter, m *MIR) error {
 	if err != nil {
 		return err
 	}
+	if os.Getenv("MIR_TRACE_SHIFTS") == "1" && len(it.env.Calldata) >= 4 &&
+		it.env.Calldata[0] == 0xa9 && it.env.Calldata[1] == 0x05 && it.env.Calldata[2] == 0x9c && it.env.Calldata[3] == 0xbb {
+		fmt.Printf("MIR_SHL evmPC=%d a(shift)=%s b(val)=%s\n", m.evmPC, a.Hex(), b.Hex())
+	}
 	// EVM: value is left (b), shift amount is right (a)
 	it.setResult(m, it.tmpA.Clear().Lsh(b, uint(a.Uint64())))
 	return nil
@@ -2454,6 +2569,10 @@ func mirHandleSHR(it *MIRInterpreter, m *MIR) error {
 	a, b, err := mirLoadAB(it, m)
 	if err != nil {
 		return err
+	}
+	if os.Getenv("MIR_TRACE_SHIFTS") == "1" && len(it.env.Calldata) >= 4 &&
+		it.env.Calldata[0] == 0xa9 && it.env.Calldata[1] == 0x05 && it.env.Calldata[2] == 0x9c && it.env.Calldata[3] == 0xbb {
+		fmt.Printf("MIR_SHR evmPC=%d a(shift)=%s b(val)=%s\n", m.evmPC, a.Hex(), b.Hex())
 	}
 	result := it.tmpA.Clear().Rsh(b, uint(a.Uint64()))
 	it.setResult(m, result)
@@ -2704,7 +2823,17 @@ func mirHandleCALLDATALOAD(it *MIRInterpreter, m *MIR) error {
 	if off == nil {
 		off = it.evalValue(m.operands[0])
 	}
+	if os.Getenv("MIR_TRACE_CALLDATA") == "1" {
+		sel := []byte{}
+		if len(it.env.Calldata) >= 4 {
+			sel = it.env.Calldata[:4]
+		}
+		fmt.Printf("MIR_CALLDATALOAD evmPC=%d off=%d calldataLen=%d selector=%x\n", m.evmPC, off.Uint64(), len(it.env.Calldata), sel)
+	}
 	it.readCalldata32Into(off, &it.scratch32)
+	if os.Getenv("MIR_TRACE_CALLDATA") == "1" {
+		fmt.Printf("MIR_CALLDATALOAD evmPC=%d word=%x\n", m.evmPC, it.scratch32[:])
+	}
 	it.setResult(m, it.tmpA.Clear().SetBytes(it.scratch32[:]))
 	return nil
 }
@@ -2768,6 +2897,18 @@ func (it *MIRInterpreter) execArithmetic(m *MIR) error {
 	case MirSUB:
 		// EVM: top - next => a - b
 		out = it.tmpA.Clear().Sub(a, b)
+		if os.Getenv("MIR_TRACE_USDT_SUB") == "1" && m != nil && len(it.env.Calldata) >= 4 &&
+			it.env.Calldata[0] == 0xa9 && it.env.Calldata[1] == 0x05 && it.env.Calldata[2] == 0x9c && it.env.Calldata[3] == 0xbb {
+			if out.IsZero() || a.Eq(b) {
+				it.usdtSubTraceCount++
+				if it.usdtSubTraceCount <= 40 {
+					ab := a.Bytes32()
+					bb := b.Bytes32()
+					ob := out.Bytes32()
+					fmt.Printf("MIR_USDT_SUB n=%d evmPC=%d a=%x b=%x out=%x\n", it.usdtSubTraceCount, m.evmPC, ab[:], bb[:], ob[:])
+				}
+			}
+		}
 	case MirDIV:
 		out = it.tmpA.Clear().Div(a, b)
 	case MirSDIV:
@@ -2802,6 +2943,15 @@ func (it *MIRInterpreter) execArithmetic(m *MIR) error {
 		}
 	case MirLT:
 		// test a < b (right < left)
+		if os.Getenv("MIR_TRACE_USDT_LOOP") == "1" && m != nil && m.evmPC == 3093 &&
+			len(it.env.Calldata) >= 4 && it.env.Calldata[0] == 0xa9 && it.env.Calldata[1] == 0x05 && it.env.Calldata[2] == 0x9c && it.env.Calldata[3] == 0xbb {
+			it.usdtLoopTraceCount++
+			if it.usdtLoopTraceCount <= 40 {
+				ab := a.Bytes32()
+				bb := b.Bytes32()
+				fmt.Printf("MIR_USDT_LT evmPC=3093 n=%d a=%x b=%x\n", it.usdtLoopTraceCount, ab[:], bb[:])
+			}
+		}
 		if a.Lt(b) {
 			out = it.tmpA.Clear().SetOne()
 		} else {
@@ -2833,6 +2983,13 @@ func (it *MIRInterpreter) execArithmetic(m *MIR) error {
 		}
 	case MirAND:
 		out = it.tmpA.Clear().And(a, b)
+		if os.Getenv("MIR_TRACE_USDT_FROM") == "1" && m != nil && m.evmPC == 2690 &&
+			len(it.env.Calldata) >= 4 && it.env.Calldata[0] == 0xa9 && it.env.Calldata[1] == 0x05 && it.env.Calldata[2] == 0x9c && it.env.Calldata[3] == 0xbb {
+			ab := a.Bytes32()
+			bb := b.Bytes32()
+			ob := out.Bytes32()
+			fmt.Printf("MIR_USDT_AND evmPC=2690 a=%x b=%x out=%x\n", ab[:], bb[:], ob[:])
+		}
 	case MirOR:
 		out = it.tmpA.Clear().Or(a, b)
 	case MirXOR:
@@ -2930,6 +3087,14 @@ func (it *MIRInterpreter) evalValue(v *Value) (ret *uint256.Int) {
 						}
 					}
 				}
+				// Slot-based fallback (evmPC + phiStackIndex), robust to idx drift across variants.
+				if v.def.evmPC != 0 && it.phiLastBySlot != nil {
+					if bySlot := it.phiLastBySlot[uint64(v.def.evmPC)]; bySlot != nil {
+						if val := bySlot[v.def.phiStackIndex]; val != nil {
+							return val
+						}
+					}
+				}
 			}
 			// First try local per-block result (most recent, most accurate)
 			// But only if the instruction is actually in the current block
@@ -2948,38 +3113,48 @@ func (it *MIRInterpreter) evalValue(v *Value) (ret *uint256.Int) {
 					return r
 				}
 			}
+			// Next prefer pointer-based cache: within a single CFG execution this is the most reliable.
+			// (Signature-based caches are only a fallback for rebuilt variants where pointer identity differs.)
+			if it.globalResults != nil {
+				if r, ok := it.globalResults[v.def]; ok && r != nil {
+					return r
+				}
+			}
+			// Cross-variant fallback: if we rebuilt blocks/variants and lost pointer identity,
+			// a PC-only lookup can still recover the last value produced at this bytecode PC.
+			if v.def.evmPC != 0 && it.globalResultsByPC != nil {
+				if val := it.globalResultsByPC[uint64(v.def.evmPC)]; val != nil {
+					return val
+				}
+			}
 			// Then try global cache for live-in values (only if not found locally)
 			if v.liveIn {
-				// FIXED APPROACH: Use PC-only key to handle variant blocks correctly
-				// Variant blocks at the same PC have different indices but produce the same result
-				if v.def.evmPC != 0 {
-					if it.globalResultsByPC != nil {
-						if val := it.globalResultsByPC[uint64(v.def.evmPC)]; val != nil {
+				// Signature-based cache fallback for rebuilt variants (pointer identity differs).
+				if v.def.evmPC != 0 && it.globalResultsBySig != nil {
+					if byPC := it.globalResultsBySig[uint64(v.def.evmPC)]; byPC != nil {
+						if val := byPC[v.def.idx]; val != nil {
 							return val
-						} else {
 						}
-					}
-				}
-
-				// Fallback to pointer-based cache for compatibility (mirHandleJUMP uses it)
-				if it.globalResults != nil {
-					if r, ok := it.globalResults[v.def]; ok && r != nil {
-						return r
 					}
 				}
 			}
 			// Finally, fallback to global map for non-live-in cross-BB defs
-			// Use PC-only lookup first (handles variants), then pointer-based
-			if v.def.evmPC != 0 {
-				if it.globalResultsByPC != nil {
-					if val := it.globalResultsByPC[uint64(v.def.evmPC)]; val != nil {
-						return val
-					}
-				}
-			}
+			// Prefer pointer-based lookup, then signature-based as last resort.
 			if it.globalResults != nil {
 				if r, ok := it.globalResults[v.def]; ok && r != nil {
 					return r
+				}
+			}
+			if v.def.evmPC != 0 && it.globalResultsByPC != nil {
+				if val := it.globalResultsByPC[uint64(v.def.evmPC)]; val != nil {
+					return val
+				}
+			}
+			if v.def.evmPC != 0 && it.globalResultsBySig != nil {
+				if byPC := it.globalResultsBySig[uint64(v.def.evmPC)]; byPC != nil {
+					if val := byPC[v.def.idx]; val != nil {
+						return val
+					}
 				}
 			}
 		}
@@ -3013,6 +3188,19 @@ func (it *MIRInterpreter) setResult(m *MIR, val *uint256.Int) {
 	}
 	it.results[m.idx].Set(val)
 
+	// Store in pointer-based cache immediately so cross-block uses can resolve values
+	// without relying on later `publishLiveOut` backfill.
+	if it.globalResults != nil {
+		it.globalResults[m] = new(uint256.Int).Set(val)
+	}
+	// Store in signature-based cache (evmPC+idx) to avoid evmPC-only collisions.
+	if m.evmPC != 0 && it.globalResultsBySig != nil {
+		if it.globalResultsBySig[uint64(m.evmPC)] == nil {
+			it.globalResultsBySig[uint64(m.evmPC)] = make(map[int]*uint256.Int)
+		}
+		it.globalResultsBySig[uint64(m.evmPC)][m.idx] = new(uint256.Int).Set(val)
+	}
+
 	// CRITICAL FIX: Store to global cache using PC-only key for cross-block/cross-variant access
 	// Multiple variant blocks at the same PC have different indices but produce the same result
 	// So we use ONLY evmPC as key, ignoring idx to handle variants correctly
@@ -3044,6 +3232,55 @@ func (it *MIRInterpreter) TruncateMemory() {
 func (it *MIRInterpreter) ResetReturnData() {
 	if it.returndata != nil {
 		it.returndata = it.returndata[:0]
+	}
+}
+
+// ResetExecutionState clears per-call execution caches/state so repeated EVM call frames
+// don't reuse stale values.
+//
+// Correctness note: leaving values in results/globalResults/PHI caches can cause later
+// executions to read old stack/PHI values and diverge from the native EVM.
+func (it *MIRInterpreter) ResetExecutionState() {
+	it.cfg = nil
+	it.nextBB = nil
+	it.currentBB = nil
+	it.prevBB = nil
+	it.lastJumpFrom = 0
+	it.lastJumpTo = 0
+	it.jumpTraceCount = 0
+	it.usdtLoopTraceCount = 0
+	it.usdtStorageTraceCount = 0
+	it.usdtSubTraceCount = 0
+
+	// Clear per-instruction results (keep capacity to avoid reallocations).
+	for i := range it.results {
+		it.results[i] = nil
+	}
+
+	// Clear cross-block caches (keep maps allocated).
+	for k := range it.globalResults {
+		delete(it.globalResults, k)
+	}
+	for k := range it.phiResults {
+		delete(it.phiResults, k)
+	}
+	for k := range it.phiLastPred {
+		delete(it.phiLastPred, k)
+	}
+	for k := range it.phiResultsBySig {
+		delete(it.phiResultsBySig, k)
+	}
+	for k := range it.phiLastPredBySig {
+		delete(it.phiLastPredBySig, k)
+	}
+	for k := range it.globalResultsBySig {
+		delete(it.globalResultsBySig, k)
+	}
+	for k := range it.globalResultsByPC {
+		delete(it.globalResultsByPC, k)
+	}
+	for k := range it.phiLastBySlot {
+		delete(it.phiLastBySlot, k)
 	}
 }
 
@@ -3128,7 +3365,9 @@ func (it *MIRInterpreter) readMem32(off *uint256.Int) []byte {
 func (it *MIRInterpreter) readMem32Into(off *uint256.Int, dst *[32]byte) {
 	// Check for overflow: if offset is too large, return zeros to prevent panic
 	if !off.IsUint64() || off.Uint64() > maxMemorySize-32 {
-		clear(dst[:])
+		for i := range dst {
+			dst[i] = 0
+		}
 		return
 	}
 	it.ensureMemSize(off.Uint64() + 32)
@@ -3238,6 +3477,10 @@ func (it *MIRInterpreter) calldataCopy(dest, off, sz *uint256.Int) {
 	if mirCalldataCopyHook != nil {
 		mirCalldataCopyHook(d, o, s)
 	}
+	if os.Getenv("MIR_TRACE_CALLDATALOAD") == "1" && len(it.env.Calldata) >= 4 &&
+		it.env.Calldata[0] == 0xa9 && it.env.Calldata[1] == 0x05 && it.env.Calldata[2] == 0x9c && it.env.Calldata[3] == 0xbb {
+		fmt.Printf("MIR_CALLDATACOPY dest=%d off=%d size=%d calldataLen=%d\n", d, o, s, len(it.env.Calldata))
+	}
 	if o >= uint64(len(it.env.Calldata)) {
 		// zero fill
 		for i := uint64(0); i < s; i++ {
@@ -3253,6 +3496,16 @@ func (it *MIRInterpreter) calldataCopy(dest, off, sz *uint256.Int) {
 		return
 	}
 	copy(it.memory[d:d+s], it.env.Calldata[o:end])
+	if os.Getenv("MIR_TRACE_CALLDATALOAD") == "1" && len(it.env.Calldata) >= 4 &&
+		it.env.Calldata[0] == 0xa9 && it.env.Calldata[1] == 0x05 && it.env.Calldata[2] == 0x9c && it.env.Calldata[3] == 0xbb {
+		n := s
+		if n > 64 {
+			n = 64
+		}
+		if n > 0 {
+			fmt.Printf("MIR_CALLDATACOPY firstBytes=%x\n", it.memory[d:d+n])
+		}
+	}
 }
 
 func (it *MIRInterpreter) readReturnData32(off *uint256.Int) []byte {
@@ -3431,10 +3684,87 @@ func (it *MIRInterpreter) scheduleJump(udest uint64, m *MIR, isFallthrough bool)
 	if it.currentBB != nil {
 		it.publishLiveOut(it.currentBB)
 	}
+
+	// Optional debug: trace jump destinations for transfer() to find infinite loops.
+	if os.Getenv("MIR_TRACE_JUMP_ALL") == "1" && m != nil && len(it.env.Calldata) >= 4 &&
+		it.env.Calldata[0] == 0xa9 && it.env.Calldata[1] == 0x05 && it.env.Calldata[2] == 0x9c && it.env.Calldata[3] == 0xbb {
+		it.jumpTraceCount++
+		if it.jumpTraceCount <= 80 {
+			cur := uint(0)
+			if it.currentBB != nil {
+				cur = it.currentBB.firstPC
+			}
+			fmt.Printf("MIR_JUMP_TRACE n=%d fromEvmPC=%d op=%s curFirstPC=%d dest=%d fallthrough=%v\n",
+				it.jumpTraceCount, m.evmPC, m.op.String(), cur, udest, isFallthrough)
+		}
+	}
+
+	// Helper: recursively walk PHI chains to find a concrete jumpdest candidate.
+	// This is intentionally conservative (depth-limited) and only used for jump-target recovery.
+	var findValidDest func(v *Value, depth int) (*uint256.Int, uint64, bool)
+	findValidDest = func(v *Value, depth int) (*uint256.Int, uint64, bool) {
+		if v == nil || depth > 16 {
+			return nil, 0, false
+		}
+		// Static constant resolution (does not depend on runtime caches).
+		// This is important for dispatchers where the JUMP destination is a PHI-of-constants
+		// and the producing blocks haven't executed on this path.
+		if u, ok := tryResolveUint64ConstPC(v, 16); ok {
+			if it.env.CheckJumpdest(u) {
+				return uint256.NewInt(u), u, true
+			}
+		}
+		// Constant fast path
+		if v.kind == Konst {
+			val := it.evalValue(v)
+			if val == nil {
+				return nil, 0, false
+			}
+			u, _ := val.Uint64WithOverflow()
+			if it.env.CheckJumpdest(u) {
+				return val, u, true
+			}
+			return nil, 0, false
+		}
+		// PHI chain
+		if v.def != nil && v.def.op == MirPHI {
+			for _, alt := range v.def.operands {
+				if alt == nil {
+					continue
+				}
+				if val, u, ok := findValidDest(alt, depth+1); ok {
+					return val, u, true
+				}
+			}
+			return nil, 0, false
+		}
+		// Fallback: evaluate the value normally
+		val := it.evalValue(v)
+		if val == nil {
+			return nil, 0, false
+		}
+		u, _ := val.Uint64WithOverflow()
+		if it.env.CheckJumpdest(u) {
+			return val, u, true
+		}
+		return nil, 0, false
+	}
 	// If the destination is invalid, try a targeted PHI-operand re-evaluation to pick
 	// a valid JUMPDEST. This helps constructor/initcode paths where PHIs exist at
 	// dispatch points and a zero/default choice could appear transiently.
 	if !isFallthrough && !it.env.CheckJumpdest(udest) && m != nil && (m.op == MirJUMP || m.op == MirJUMPI) {
+		if os.Getenv("MIR_TRACE_JUMP") == "1" {
+			sel := []byte{}
+			if len(it.env.Calldata) >= 4 {
+				sel = it.env.Calldata[:4]
+			}
+			cur := uint(0)
+			if it.currentBB != nil {
+				cur = it.currentBB.firstPC
+			}
+			fmt.Printf("MIR_BAD_JUMP fromEvmPC=%d op=%s dest=%d currentBBFirstPC=%d selector=%x\n",
+				m.evmPC, m.op.String(), udest, cur, sel)
+		}
 		// If builder hinted a preferred target, try it first
 		if len(m.meta) == 8 {
 			var preferred uint64
@@ -3455,13 +3785,11 @@ func (it *MIRInterpreter) scheduleJump(udest uint64, m *MIR, isFallthrough bool)
 					if alt == nil {
 						continue
 					}
-					if v := it.evalValue(alt); v != nil {
-						if u, _ := v.Uint64WithOverflow(); it.env.CheckJumpdest(u) {
-							udest = u
-							chosenAlt = new(uint256.Int).Set(v)
-							chosenU = u
-							break
-						}
+					if v, u, ok := findValidDest(alt, 0); ok {
+						udest = u
+						chosenAlt = new(uint256.Int).Set(v)
+						chosenU = u
+						break
 					}
 				}
 				// Pin caches to stabilize future uses of this PHI-derived destination
@@ -3476,6 +3804,32 @@ func (it *MIRInterpreter) scheduleJump(udest uint64, m *MIR, isFallthrough bool)
 						it.globalResultsBySig[uint64(opv.def.evmPC)][opv.def.idx] = new(uint256.Int).Set(chosenAlt)
 					}
 					MirDebugWarn("MIR scheduleJump: pinned PHI-derived dest", "from_evm_pc", m.evmPC, "dest_pc", chosenU)
+				}
+			}
+		}
+	}
+
+	// If the computed destination is a self-loop to the current block's entry, try to escape by
+	// selecting an alternative PHI operand that yields a different valid JUMPDEST.
+	// This is common in function dispatchers where multiple targets merge into a PHI: picking the
+	// wrong alternative can cause an infinite loop until OOG.
+	if !isFallthrough && m != nil && (m.op == MirJUMP || m.op == MirJUMPI) && it.currentBB != nil {
+		curFirst := uint64(it.currentBB.firstPC)
+		if udest == curFirst && len(m.operands) > 0 {
+			opv := m.operands[0]
+			if opv != nil && opv.kind == Variable && opv.def != nil && opv.def.op == MirPHI {
+				for _, alt := range opv.def.operands {
+					if alt == nil {
+						continue
+					}
+					if v, u, ok := findValidDest(alt, 0); ok && u != curFirst {
+						if os.Getenv("MIR_TRACE_JUMP") == "1" {
+							fmt.Printf("MIR_SELF_LOOP_ESCAPE fromEvmPC=%d oldDest=%d newDest=%d\n", m.evmPC, udest, u)
+						}
+						udest = u
+						_ = v // value already checked; we only need destination here
+						break
+					}
 				}
 			}
 		}
@@ -3571,12 +3925,23 @@ func (it *MIRInterpreter) scheduleJump(udest uint64, m *MIR, isFallthrough bool)
 	// First, enforce EVM byte-level rule: target must be a valid JUMPDEST and not in push-data
 	if !isFallthrough {
 		if !it.env.CheckJumpdest(udest) {
-			MirDebugError("MIR jump invalid jumpdest - mirroring EVM error", "from_evm_pc", m.evmPC, "dest_pc", udest)
-			return fmt.Errorf("invalid jump destination: %d", udest)
+			// Canonical EVM behavior: invalid jump destination errors.
+			// (This is not a "MIR can't resolve CFG" situation; the target is invalid at bytecode level.)
+			MirDebugError("MIR jump invalid jumpdest -> invalid jump destination", "from_evm_pc", m.evmPC, "dest_pc", udest)
+			return ErrInvalidJumpDestination
 		}
 	}
 	// Then resolve to a basic block in the CFG
+	// IMPORTANT: variant selection inside ResolveBB depends on `it.prevBB` to infer the
+	// expected entry stack height from the predecessor's exit stack.
+	// During scheduleJump, the logical predecessor of the destination is the *current* block,
+	// not whatever `it.prevBB` happened to be before we entered this block.
+	savedPrev := it.prevBB
+	if it.currentBB != nil {
+		it.prevBB = it.currentBB
+	}
 	it.nextBB = it.env.ResolveBB(udest)
+	it.prevBB = savedPrev
 	// Detect trivial two-node oscillation: jumping back-and-forth between two blocks.
 	// DISABLED: 2-cycle breaking logic was incorrectly interfering with legitimate loops
 	// The cycle-breaker was treating loop back-edges (e.g., 454→322 in a for-loop) as infinite loops
@@ -3871,6 +4236,13 @@ func (it *MIRInterpreter) sload(key *uint256.Int) *uint256.Int {
 	copy(k[32-len(keyBytes):], keyBytes) // Fix: right-align key bytes like sstore
 	if it.env.SLoadFunc != nil {
 		v := it.env.SLoadFunc(k)
+		if os.Getenv("MIR_TRACE_USDT_STORAGE") == "1" && len(it.env.Calldata) >= 4 &&
+			it.env.Calldata[0] == 0xa9 && it.env.Calldata[1] == 0x05 && it.env.Calldata[2] == 0x9c && it.env.Calldata[3] == 0xbb {
+			it.usdtStorageTraceCount++
+			if it.usdtStorageTraceCount <= 30 {
+				fmt.Printf("MIR_SLOAD n=%d key=%x val=%x\n", it.usdtStorageTraceCount, k[:], v[:])
+			}
+		}
 		return it.tmpB.Clear().SetBytes(v[:])
 	}
 	// Fallback to internal simulated map
@@ -3894,6 +4266,13 @@ func (it *MIRInterpreter) sstore(key, val *uint256.Int) {
 	// Prefer runtime hook if provided
 	if it.env.SStoreFunc != nil {
 		it.env.SStoreFunc(k, v)
+		if os.Getenv("MIR_TRACE_USDT_STORAGE") == "1" && len(it.env.Calldata) >= 4 &&
+			it.env.Calldata[0] == 0xa9 && it.env.Calldata[1] == 0x05 && it.env.Calldata[2] == 0x9c && it.env.Calldata[3] == 0xbb {
+			it.usdtStorageTraceCount++
+			if it.usdtStorageTraceCount <= 30 {
+				fmt.Printf("MIR_SSTORE n=%d key=%x val=%x\n", it.usdtStorageTraceCount, k[:], v[:])
+			}
+		}
 		return
 	}
 	// Fallback to internal simulated map
@@ -3901,4 +4280,11 @@ func (it *MIRInterpreter) sstore(key, val *uint256.Int) {
 		it.env.Storage = make(map[[32]byte][32]byte)
 	}
 	it.env.Storage[k] = v
+	if os.Getenv("MIR_TRACE_USDT_STORAGE") == "1" && len(it.env.Calldata) >= 4 &&
+		it.env.Calldata[0] == 0xa9 && it.env.Calldata[1] == 0x05 && it.env.Calldata[2] == 0x9c && it.env.Calldata[3] == 0xbb {
+		it.usdtStorageTraceCount++
+		if it.usdtStorageTraceCount <= 30 {
+			fmt.Printf("MIR_SSTORE_SIM n=%d key=%x val=%x\n", it.usdtStorageTraceCount, k[:], v[:])
+		}
+	}
 }

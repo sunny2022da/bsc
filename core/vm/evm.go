@@ -284,7 +284,11 @@ func (evm *EVM) Call(caller common.Address, addr common.Address, input []byte, g
 			defer ReturnContract(contract)
 			codeHash := evm.resolveCodeHash(addrCopy)
 
-			if evm.Config.EnableMIR {
+			// If either the callee or the caller is a system contract, force native execution.
+			// System contracts often act as dispatchers and can trigger deep call trees; to
+			// keep consensus-critical accounting stable, we conservatively disable MIR for
+			// any call *from* or *to* a system contract.
+			if evm.Config.EnableMIR && !params.IsSystemContract(addrCopy) && !params.IsSystemContract(caller) {
 				prepareMIR(evm, codeHash, code, contract)
 				if !contract.HasMIRCode() {
 					return nil, gas, fmt.Errorf("MIR enabled but CFG not available for contract %s (codeHash=%s, codeLen=%d)", addrCopy.Hex(), codeHash.Hex()[:16], len(code))
@@ -373,7 +377,7 @@ func (evm *EVM) CallCode(caller common.Address, addr common.Address, input []byt
 		code := evm.resolveCode(addrCopy)
 		codeHash := evm.resolveCodeHash(addrCopy)
 
-		if evm.Config.EnableMIR {
+		if evm.Config.EnableMIR && !params.IsSystemContract(addrCopy) && !params.IsSystemContract(caller) {
 			prepareMIR(evm, codeHash, code, contract)
 			if !contract.HasMIRCode() {
 				return nil, gas, fmt.Errorf("MIR enabled but CFG not available (codeHash=%s)", codeHash.Hex()[:16])
@@ -444,7 +448,7 @@ func (evm *EVM) DelegateCall(originCaller common.Address, caller common.Address,
 		code := evm.resolveCode(addrCopy)
 		codeHash := evm.resolveCodeHash(addrCopy)
 
-		if evm.Config.EnableMIR {
+		if evm.Config.EnableMIR && !params.IsSystemContract(addrCopy) && !params.IsSystemContract(caller) {
 			prepareMIR(evm, codeHash, code, contract)
 			if !contract.HasMIRCode() {
 				return nil, gas, fmt.Errorf("MIR enabled but CFG not available (codeHash=%s)", codeHash.Hex()[:16])
@@ -525,7 +529,7 @@ func (evm *EVM) StaticCall(caller common.Address, addr common.Address, input []b
 		code := evm.resolveCode(addrCopy)
 		codeHash := evm.resolveCodeHash(addrCopy)
 
-		if evm.Config.EnableMIR {
+		if evm.Config.EnableMIR && !params.IsSystemContract(addrCopy) && !params.IsSystemContract(caller) {
 			prepareMIR(evm, codeHash, code, contract)
 			if !contract.HasMIRCode() {
 				return nil, gas, fmt.Errorf("MIR enabled but CFG not available for StaticCall (codeHash=%s)", codeHash.Hex()[:16])
@@ -727,9 +731,14 @@ func (evm *EVM) initNewContract(contract *Contract, address common.Address) ([]b
 		evm.UseBaseInterpreter()
 	}
 
-	// We may run initcode via MIR if enabled.
+	// NOTE: Do NOT run initcode via MIR.
+	//
+	// Initcode execution affects consensus (receipt root, bloom, etc.). We've observed
+	// consensus divergence on real blocks where contract creation succeeds under the
+	// native interpreter but fails under MIR, producing mismatching receipts/bloom.
+	// Until MIR creation-code execution is proven fully correct, force native here.
 	contract.optimized = false
-	useMIR := evm.Config.EnableMIR && evm.mirInterpreter != nil
+	useMIR := false
 
 	var ret []byte
 	var err error

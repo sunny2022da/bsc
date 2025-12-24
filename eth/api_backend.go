@@ -55,6 +55,12 @@ type EthAPIBackend struct {
 	gpo                 *gasprice.Oracle
 }
 
+// VMConfig returns the vm.Config used for consensus execution by the underlying blockchain.
+// This enables tracers to mirror consensus behavior (e.g. MIR enabled/disabled).
+func (b *EthAPIBackend) VMConfig() vm.Config {
+	return b.eth.blockchain.VMConfig()
+}
+
 // ChainConfig returns the active chain configuration.
 func (b *EthAPIBackend) ChainConfig() *params.ChainConfig {
 	return b.eth.blockchain.Config()
