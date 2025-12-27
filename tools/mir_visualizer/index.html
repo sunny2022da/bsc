@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>EVM MIR Visualizer</title>
+    <style>
+        body { font-family: sans-serif; margin: 20px; display: flex; flex-direction: column; height: 95vh; }
+        #container { display: flex; flex: 1; gap: 20px; }
+        #input-pane { width: 30%; display: flex; flex-direction: column; }
+        #output-pane { flex: 1; border: 1px solid #ccc; overflow: auto; background: #f9f9f9; padding: 10px; }
+        textarea { flex: 1; font-family: monospace; resize: none; margin-bottom: 10px; }
+        button { padding: 10px; background: #007bff; color: white; border: none; cursor: pointer; }
+        button:hover { background: #0056b3; }
+        #error { color: red; margin-top: 10px; }
+    </style>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/viz.js/2.1.2/viz.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/viz.js/2.1.2/full.render.js"></script>
+</head>
+<body>
+    <h1>EVM MIR Control Flow Graph</h1>
+    <div id="container">
+        <div id="input-pane">
+            <h3>Bytecode (Hex)</h3>
+            <textarea id="bytecode" placeholder="0x6001600201..."></textarea>
+            <button onclick="visualize()">Visualize</button>
+            <div id="error"></div>
+        </div>
+        <div id="output-pane">
+            <div id="graph"></div>
+        </div>
+    </div>
+
+    <script>
+        const viz = new Viz();
+
+        async function visualize() {
+            const bytecode = document.getElementById('bytecode').value;
+            const errorDiv = document.getElementById('error');
+            const graphDiv = document.getElementById('graph');
+            
+            errorDiv.textContent = '';
+            graphDiv.innerHTML = 'Generating...';
+
+            try {
+                const response = await fetch('/visualize', {
+                    method: 'POST',
+                    body: bytecode
+                });
+
+                if (!response.ok) {
+                    throw new Error(await response.text());
+                }
+
+                const dot = await response.text();
+                
+                viz.renderSVGElement(dot)
+                    .then(element => {
+                        graphDiv.innerHTML = '';
+                        graphDiv.appendChild(element);
+                    })
+                    .catch(error => {
+                        graphDiv.innerHTML = '';
+                        errorDiv.textContent = 'Render error: ' + error;
+                    });
+
+            } catch (err) {
+                graphDiv.innerHTML = '';
+                errorDiv.textContent = err.message;
+            }
+        }
+    </script>
+</body>
+</html>
+
