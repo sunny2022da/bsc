@@ -179,6 +179,10 @@ func (c *CFG) buildBasicBlock(block *MIRBasicBlock, validJumpDests map[uint]bool
 		// Global tracking for MIR generation
 		currentEVMBuildPC = pc
 		currentEVMBuildOp = byte(op)
+		// Count every originating EVM opcode for gas parity bookkeeping
+		if block.evmOpCounts != nil {
+			block.evmOpCounts[byte(op)]++
+		}
 
 		// 2. Check for Basic Block Boundaries (Implicit)
 		// If we are NOT at the start of the block, but we hit a JUMPDEST,
@@ -189,11 +193,20 @@ func (c *CFG) buildBasicBlock(block *MIRBasicBlock, validJumpDests map[uint]bool
 			block.SetChildren([]*MIRBasicBlock{nextBlock})
 			nextBlock.SetParents([]*MIRBasicBlock{block})
 
-			// Emit a Jump to it (Conceptually a fallthrough)
-			block.CreateControlFlowMIR(MirJUMP, stack)
+			// Record block end. This is a fallthrough edge, not an executed JUMP opcode.
+			block.SetLastPC(pc)
+			// Record exit stack snapshot (used by later PHI/merge logic)
+			block.SetExitStack(stack.clone())
 
 			block.built = true
 			return nil
+		}
+
+		// 2.5 Handle no-op JUMPDEST (valid instruction, may only appear at block start here)
+		if op == compiler.JUMPDEST {
+			// We don't need to emit MIR for JUMPDEST; it is a marker.
+			pc++
+			continue
 		}
 
 		// 3. Dispatch Opcode Groups
@@ -201,6 +214,409 @@ func (c *CFG) buildBasicBlock(block *MIRBasicBlock, validJumpDests map[uint]bool
 		switch {
 		case isStackOp(op): // PUSH, DUP, SWAP, POP
 			pc, err = c.handleStackOp(block, op, stack, pc)
+		case isUnaryOp(op):
+			// Map EVM unary opcode to MIR op by meaning
+			var mirOp MirOperation
+			switch op {
+			case compiler.NOT:
+				mirOp = MirNOT
+			case compiler.ISZERO:
+				mirOp = MirISZERO
+			default:
+				return fmt.Errorf("unhandled unary opcode: %x at %d", op, pc)
+			}
+			block.CreateUnaryOpMIR(mirOp, stack)
+			pc++
+		case isTernaryOp(op):
+			var mirOp MirOperation
+			switch op {
+			case compiler.ADDMOD:
+				mirOp = MirADDMOD
+			case compiler.MULMOD:
+				mirOp = MirMULMOD
+			default:
+				return fmt.Errorf("unhandled ternary opcode: %x at %d", op, pc)
+			}
+			block.CreateTernaryOpMIR(mirOp, stack)
+			pc++
+		case isBinaryOp(op):
+			// Most binary ops share the same numeric encoding for MIR up to 0x5e.
+			// Map explicitly for clarity and to avoid relying on enum alignment.
+			var mirOp MirOperation
+			switch op {
+			case compiler.ADD:
+				mirOp = MirADD
+			case compiler.MUL:
+				mirOp = MirMUL
+			case compiler.SUB:
+				mirOp = MirSUB
+			case compiler.DIV:
+				mirOp = MirDIV
+			case compiler.SDIV:
+				mirOp = MirSDIV
+			case compiler.MOD:
+				mirOp = MirMOD
+			case compiler.SMOD:
+				mirOp = MirSMOD
+			case compiler.EXP:
+				mirOp = MirEXP
+			case compiler.SIGNEXTEND:
+				mirOp = MirSIGNEXT
+			case compiler.LT:
+				mirOp = MirLT
+			case compiler.GT:
+				mirOp = MirGT
+			case compiler.SLT:
+				mirOp = MirSLT
+			case compiler.SGT:
+				mirOp = MirSGT
+			case compiler.EQ:
+				mirOp = MirEQ
+			case compiler.AND:
+				mirOp = MirAND
+			case compiler.OR:
+				mirOp = MirOR
+			case compiler.XOR:
+				mirOp = MirXOR
+			case compiler.BYTE:
+				mirOp = MirBYTE
+			case compiler.SHL:
+				mirOp = MirSHL
+			case compiler.SHR:
+				mirOp = MirSHR
+			case compiler.SAR:
+				mirOp = MirSAR
+			case compiler.KECCAK256:
+				mirOp = MirKECCAK256
+			default:
+				return fmt.Errorf("unhandled binary opcode: %x at %d", op, pc)
+			}
+			block.CreateBinOpMIR(mirOp, stack)
+			pc++
+		case isMemoryOp(op):
+			switch op {
+			case compiler.MLOAD:
+				// MLOAD pops: offset, pushes: value
+				offset := stack.pop()
+				mir := new(MIR)
+				mir.op = MirMLOAD
+				mir.operands = []*Value{&offset}
+				stack.push(mir.Result())
+				mir = block.appendMIR(mir)
+				mir.genStackDepth = stack.size()
+			case compiler.MSTORE:
+				// MSTORE pops: offset(top), value. No return value.
+				offset := stack.pop()
+				value := stack.pop()
+				mir := new(MIR)
+				mir.op = MirMSTORE
+				mir.operands = []*Value{&offset, &value}
+				mir = block.appendMIR(mir)
+				mir.genStackDepth = stack.size()
+			case compiler.MSTORE8:
+				// MSTORE8 pops: offset(top), value. No return value.
+				offset := stack.pop()
+				value := stack.pop()
+				mir := new(MIR)
+				mir.op = MirMSTORE8
+				mir.operands = []*Value{&offset, &value}
+				mir = block.appendMIR(mir)
+				mir.genStackDepth = stack.size()
+			case compiler.MSIZE:
+				// MSIZE pushes current memory size. No pops.
+				mir := new(MIR)
+				mir.op = MirMSIZE
+				stack.push(mir.Result())
+				mir = block.appendMIR(mir)
+				mir.genStackDepth = stack.size()
+			case compiler.MCOPY:
+				// MCOPY pops: dst, src, size (EIP-5656). No return value.
+				dst := stack.pop()
+				src := stack.pop()
+				sz := stack.pop()
+				mir := new(MIR)
+				mir.op = MirMCOPY
+				mir.operands = []*Value{&dst, &src, &sz}
+				mir = block.appendMIR(mir)
+				mir.genStackDepth = stack.size()
+			default:
+				return fmt.Errorf("unhandled memory opcode: %x at %d", op, pc)
+			}
+			pc++
+		case isStorageOp(op):
+			switch op {
+			case compiler.SLOAD:
+				// SLOAD pops: key, pushes: value
+				key := stack.pop()
+				mir := new(MIR)
+				mir.op = MirSLOAD
+				mir.operands = []*Value{&key}
+				stack.push(mir.Result())
+				mir = block.appendMIR(mir)
+				mir.genStackDepth = stack.size()
+			case compiler.SSTORE:
+				// SSTORE pops: key(top), value. No return value.
+				key := stack.pop()
+				value := stack.pop()
+				mir := new(MIR)
+				mir.op = MirSSTORE
+				mir.operands = []*Value{&key, &value}
+				mir = block.appendMIR(mir)
+				mir.genStackDepth = stack.size()
+			case compiler.TLOAD:
+				// TLOAD pops: key, pushes: value
+				key := stack.pop()
+				mir := new(MIR)
+				mir.op = MirTLOAD
+				mir.operands = []*Value{&key}
+				stack.push(mir.Result())
+				mir = block.appendMIR(mir)
+				mir.genStackDepth = stack.size()
+			case compiler.TSTORE:
+				// TSTORE pops: key(top), value. No return value.
+				key := stack.pop()
+				value := stack.pop()
+				mir := new(MIR)
+				mir.op = MirTSTORE
+				mir.operands = []*Value{&key, &value}
+				mir = block.appendMIR(mir)
+				mir.genStackDepth = stack.size()
+			default:
+				return fmt.Errorf("unhandled storage opcode: %x at %d", op, pc)
+			}
+			pc++
+		case isBlockInfoOp(op):
+			// Closure/tx/env info ops handled by CreateBlockInfoMIR
+			block.CreateBlockInfoMIR(MirOperation(byte(op)), stack)
+			pc++
+		case isBlockOp(op):
+			// Block ops handled by CreateBlockOpMIR
+			block.CreateBlockOpMIR(MirOperation(byte(op)), stack)
+			pc++
+		case isLogOp(op):
+			block.CreateLogMIR(MirLOG0+MirOperation(op-compiler.LOG0), stack)
+			pc++
+		case isSystemCallOp(op):
+			// Implement core CALL/CREATE family with correct stack effects.
+			// Note: opcode values in compiler package differ from MirOperation for some calls.
+			switch op {
+			case compiler.CALL:
+				outSize := stack.pop()
+				outOff := stack.pop()
+				inSize := stack.pop()
+				inOff := stack.pop()
+				value := stack.pop()
+				to := stack.pop()
+				gas := stack.pop()
+				mir := new(MIR)
+				mir.op = MirCALL
+				mir.operands = []*Value{&gas, &to, &value, &inOff, &inSize, &outOff, &outSize}
+				stack.push(mir.Result())
+				mir = block.appendMIR(mir)
+				mir.genStackDepth = stack.size()
+			case compiler.CALLCODE:
+				outSize := stack.pop()
+				outOff := stack.pop()
+				inSize := stack.pop()
+				inOff := stack.pop()
+				value := stack.pop()
+				to := stack.pop()
+				gas := stack.pop()
+				mir := new(MIR)
+				mir.op = MirCALLCODE
+				mir.operands = []*Value{&gas, &to, &value, &inOff, &inSize, &outOff, &outSize}
+				stack.push(mir.Result())
+				mir = block.appendMIR(mir)
+				mir.genStackDepth = stack.size()
+			case compiler.DELEGATECALL:
+				outSize := stack.pop()
+				outOff := stack.pop()
+				inSize := stack.pop()
+				inOff := stack.pop()
+				to := stack.pop()
+				gas := stack.pop()
+				mir := new(MIR)
+				mir.op = MirDELEGATECALL
+				mir.operands = []*Value{&gas, &to, &inOff, &inSize, &outOff, &outSize}
+				stack.push(mir.Result())
+				mir = block.appendMIR(mir)
+				mir.genStackDepth = stack.size()
+			case compiler.STATICCALL:
+				outSize := stack.pop()
+				outOff := stack.pop()
+				inSize := stack.pop()
+				inOff := stack.pop()
+				to := stack.pop()
+				gas := stack.pop()
+				mir := new(MIR)
+				mir.op = MirSTATICCALL
+				mir.operands = []*Value{&gas, &to, &inOff, &inSize, &outOff, &outSize}
+				stack.push(mir.Result())
+				mir = block.appendMIR(mir)
+				mir.genStackDepth = stack.size()
+			case compiler.CREATE:
+				sz := stack.pop()
+				off := stack.pop()
+				value := stack.pop()
+				mir := new(MIR)
+				mir.op = MirCREATE
+				mir.operands = []*Value{&value, &off, &sz}
+				stack.push(mir.Result())
+				mir = block.appendMIR(mir)
+				mir.genStackDepth = stack.size()
+			case compiler.CREATE2:
+				salt := stack.pop()
+				sz := stack.pop()
+				off := stack.pop()
+				value := stack.pop()
+				mir := new(MIR)
+				mir.op = MirCREATE2
+				mir.operands = []*Value{&value, &off, &sz, &salt}
+				stack.push(mir.Result())
+				mir = block.appendMIR(mir)
+				mir.genStackDepth = stack.size()
+			case compiler.EXTCALL:
+				// Treat as system op: stack semantics are chain-specific; placeholder to keep CFG build going.
+				mir := new(MIR)
+				mir.op = MirEXTCALL
+				mir = block.appendMIR(mir)
+				mir.genStackDepth = stack.size()
+			case compiler.EXTDELEGATECALL:
+				mir := new(MIR)
+				mir.op = MirEXTDELEGATECALL
+				mir = block.appendMIR(mir)
+				mir.genStackDepth = stack.size()
+			case compiler.EXTSTATICCALL:
+				mir := new(MIR)
+				mir.op = MirEXTSTATICCALL
+				mir = block.appendMIR(mir)
+				mir.genStackDepth = stack.size()
+			default:
+				return fmt.Errorf("unhandled system/call opcode: %x at %d", op, pc)
+			}
+			pc++
+		// Terminators / control flow
+		case op == compiler.STOP:
+			// STOP: end execution, no operands
+			mir := new(MIR)
+			mir.op = MirSTOP
+			block.appendMIR(mir)
+			block.SetLastPC(pc + 1)
+			block.SetExitStack(stack.clone())
+			block.built = true
+			return nil
+		case op == compiler.RETURN:
+			// RETURN pops: offset, size
+			offset := stack.pop()
+			size := stack.pop()
+			mir := new(MIR)
+			mir.op = MirRETURN
+			mir.operands = []*Value{&offset, &size}
+			block.appendMIR(mir)
+			block.SetLastPC(pc + 1)
+			block.SetExitStack(stack.clone())
+			block.built = true
+			return nil
+		case op == compiler.REVERT:
+			// REVERT pops: offset, size
+			offset := stack.pop()
+			size := stack.pop()
+			mir := new(MIR)
+			mir.op = MirREVERT
+			mir.operands = []*Value{&offset, &size}
+			block.appendMIR(mir)
+			block.SetLastPC(pc + 1)
+			block.SetExitStack(stack.clone())
+			block.built = true
+			return nil
+		case op == compiler.SELFDESTRUCT:
+			// SELFDESTRUCT pops: address
+			addr := stack.pop()
+			mir := new(MIR)
+			mir.op = MirSELFDESTRUCT
+			mir.operands = []*Value{&addr}
+			block.appendMIR(mir)
+			block.SetLastPC(pc + 1)
+			block.SetExitStack(stack.clone())
+			block.built = true
+			return nil
+		case op == compiler.INVALID:
+			// INVALID: immediate exceptional halt
+			mir := new(MIR)
+			mir.op = MirINVALID
+			block.appendMIR(mir)
+			block.SetLastPC(pc + 1)
+			block.SetExitStack(stack.clone())
+			block.built = true
+			return nil
+		case op == compiler.JUMP:
+			// JUMP pops: dest
+			dest := stack.pop()
+			mir := new(MIR)
+			mir.op = MirJUMP
+			mir.operands = []*Value{&dest}
+			block.appendMIR(mir)
+
+			// Resolve successor if constant; otherwise mark as unresolved for runtime backfill.
+			if dest.kind == Konst {
+				target := uint(0)
+				if dest.u != nil {
+					target = uint(dest.u.Uint64())
+				} else {
+					target = uint(dest.ConstValue())
+				}
+				if !validJumpDests[target] {
+					return fmt.Errorf("invalid jumpdest 0x%x at pc %d", target, pc)
+				}
+				targetBlock := c.getOrCreateBlock(target)
+				block.SetChildren([]*MIRBasicBlock{targetBlock})
+				targetBlock.SetParents([]*MIRBasicBlock{block})
+			} else {
+				block.unresolvedJump = true
+			}
+
+			block.SetLastPC(pc + 1)
+			block.SetExitStack(stack.clone())
+			block.built = true
+			return nil
+		case op == compiler.JUMPI:
+			// JUMPI pops: dest, cond (note: CreateJumpMIR in MIRBasicBlock.go pops dest then cond)
+			dest := stack.pop()
+			cond := stack.pop()
+			mir := new(MIR)
+			mir.op = MirJUMPI
+			mir.operands = []*Value{&dest, &cond}
+			block.appendMIR(mir)
+
+			// Fallthrough successor (pc+1)
+			fallthroughPC := pc + 1
+			fallthroughBlock := c.getOrCreateBlock(fallthroughPC)
+			block.SetChildren([]*MIRBasicBlock{fallthroughBlock})
+			fallthroughBlock.SetParents([]*MIRBasicBlock{block})
+
+			// Branch successor if constant dest
+			if dest.kind == Konst {
+				target := uint(0)
+				if dest.u != nil {
+					target = uint(dest.u.Uint64())
+				} else {
+					target = uint(dest.ConstValue())
+				}
+				if !validJumpDests[target] {
+					return fmt.Errorf("invalid jumpdest 0x%x at pc %d", target, pc)
+				}
+				targetBlock := c.getOrCreateBlock(target)
+				block.SetChildren([]*MIRBasicBlock{targetBlock})
+				targetBlock.SetParents([]*MIRBasicBlock{block})
+			} else {
+				// Dynamic target: keep fallthrough edge; runtime will resolve jump target and backfill CFG.
+				block.unresolvedJump = true
+			}
+
+			block.SetLastPC(pc + 1)
+			block.SetExitStack(stack.clone())
+			block.built = true
+			return nil
 		default:
 			// Placeholder for now
 			return fmt.Errorf("unsupported opcode: %x at %d", op, pc)
@@ -213,6 +629,8 @@ func (c *CFG) buildBasicBlock(block *MIRBasicBlock, validJumpDests map[uint]bool
 
 	// End of code reached without explicit terminator
 	block.CreateSystemOpMIR(MirSTOP, stack)
+	block.SetLastPC(pc)
+	block.SetExitStack(stack.clone())
 	block.built = true
 	return nil
 }
@@ -220,13 +638,20 @@ func (c *CFG) buildBasicBlock(block *MIRBasicBlock, validJumpDests map[uint]bool
 // Helpers
 
 func isStackOp(op compiler.ByteCode) bool {
-	return (op >= compiler.PUSH1 && op <= compiler.PUSH32) ||
+	return (op == compiler.PUSH0) ||
+		(op >= compiler.PUSH1 && op <= compiler.PUSH32) ||
 		(op >= compiler.DUP1 && op <= compiler.DUP16) ||
 		(op >= compiler.SWAP1 && op <= compiler.SWAP16) ||
 		(op == compiler.POP)
 }
 
 func (c *CFG) handleStackOp(block *MIRBasicBlock, op compiler.ByteCode, stack *ValueStack, pc uint) (uint, error) {
+	// PUSH0 pushes a single zero byte (EIP-3855)
+	if op == compiler.PUSH0 {
+		block.CreatePushMIR(0, []byte{0x00}, stack)
+		return pc + 1, nil
+	}
+
 	// Handle PUSH specially because it has immediate data
 	if op >= compiler.PUSH1 && op <= compiler.PUSH32 {
 		size := uint(op - compiler.PUSH1 + 1)
@@ -251,4 +676,65 @@ func (c *CFG) handleStackOp(block *MIRBasicBlock, op compiler.ByteCode, stack *V
 
 	block.CreateStackOpMIR(mirOp, stack)
 	return pc + 1, nil
+}
+
+func isLogOp(op compiler.ByteCode) bool {
+	return op >= compiler.LOG0 && op <= compiler.LOG4
+}
+
+func isUnaryOp(op compiler.ByteCode) bool {
+	return op == compiler.NOT || op == compiler.ISZERO
+}
+
+func isTernaryOp(op compiler.ByteCode) bool {
+	return op == compiler.ADDMOD || op == compiler.MULMOD
+}
+
+func isBinaryOp(op compiler.ByteCode) bool {
+	// Arithmetic & bitwise & compare & shifts & byte & signextend & keccak
+	switch op {
+	case compiler.ADD, compiler.MUL, compiler.SUB, compiler.DIV, compiler.SDIV, compiler.MOD, compiler.SMOD,
+		compiler.EXP, compiler.SIGNEXTEND,
+		compiler.LT, compiler.GT, compiler.SLT, compiler.SGT, compiler.EQ,
+		compiler.AND, compiler.OR, compiler.XOR, compiler.BYTE, compiler.SHL, compiler.SHR, compiler.SAR,
+		compiler.KECCAK256:
+		return true
+	default:
+		return false
+	}
+}
+
+func isMemoryOp(op compiler.ByteCode) bool {
+	switch op {
+	case compiler.MLOAD, compiler.MSTORE, compiler.MSTORE8, compiler.MSIZE, compiler.MCOPY:
+		return true
+	default:
+		return false
+	}
+}
+
+func isStorageOp(op compiler.ByteCode) bool {
+	return op == compiler.SLOAD || op == compiler.SSTORE || op == compiler.TLOAD || op == compiler.TSTORE
+}
+
+func isBlockInfoOp(op compiler.ByteCode) bool {
+	// closure state + a few misc producers/consumers handled by CreateBlockInfoMIR
+	return (op >= compiler.ADDRESS && op <= compiler.EXTCODEHASH) ||
+		op == compiler.PC || op == compiler.GAS
+}
+
+func isBlockOp(op compiler.ByteCode) bool {
+	// block environment ops
+	return op >= compiler.BLOCKHASH && op <= compiler.BLOBBASEFEE
+}
+
+func isSystemCallOp(op compiler.ByteCode) bool {
+	// CALL-family + CREATE-family + STATICCALL (note: opcode values may differ from MIR op enum)
+	switch op {
+	case compiler.CREATE, compiler.CALL, compiler.CALLCODE, compiler.DELEGATECALL, compiler.CREATE2, compiler.STATICCALL,
+		compiler.EXTCALL, compiler.EXTDELEGATECALL, compiler.EXTSTATICCALL:
+		return true
+	default:
+		return false
+	}
 }

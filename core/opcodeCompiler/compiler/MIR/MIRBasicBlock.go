@@ -63,6 +63,9 @@ type MIRBasicBlock struct {
 	// Build bookkeeping
 	built  bool // set true after first successful build
 	queued bool // true if currently enqueued for (re)build
+	// Control-flow bookkeeping: indicates this block ends in a jump whose destination
+	// cannot be resolved at build time (dynamic JUMP/JUMPI). Interpreter may backfill CFG.
+	unresolvedJump bool
 }
 
 func (b *MIRBasicBlock) Size() uint {
