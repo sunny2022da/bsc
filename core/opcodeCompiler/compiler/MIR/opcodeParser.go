@@ -19,6 +19,9 @@ type CFG struct {
 
 	// Mapping from EVM PC to the BasicBlock starting at that PC
 	pcToBlock map[uint]*MIRBasicBlock
+
+	// Cached valid JUMPDEST map (computed once from rawCode)
+	jumpDests map[uint]bool
 }
 
 func NewCFG(hash common.Hash, code []byte) (c *CFG) {
@@ -29,7 +32,19 @@ func NewCFG(hash common.Hash, code []byte) (c *CFG) {
 	c.basicBlockCount = 0
 
 	c.pcToBlock = make(map[uint]*MIRBasicBlock)
+	c.jumpDests = nil
 	return c
+}
+
+// JumpDests returns the cached map of valid JUMPDEST PCs, computing it once if needed.
+func (c *CFG) JumpDests() map[uint]bool {
+	if c == nil {
+		return nil
+	}
+	if c.jumpDests == nil {
+		c.jumpDests = c.scanJumpDests()
+	}
+	return c.jumpDests
 }
 
 func (c *CFG) addBlock(block *MIRBasicBlock) {
@@ -93,7 +108,7 @@ func (c *CFG) scanJumpDests() map[uint]bool {
 func (c *CFG) Parse() error {
 	// 1. Identify all valid JUMPDESTs (critical for security/validity)
 	// You can use a bitset or map for fast lookup.
-	validJumpDests := c.scanJumpDests()
+	validJumpDests := c.JumpDests()
 
 	// 2. Create the Entry Block (Block 0) at PC 0
 	entryBlock := c.getOrCreateBlock(0)
@@ -106,9 +121,14 @@ func (c *CFG) Parse() error {
 		block := queue[0]
 		queue = queue[1:]
 
-		// If already built successfully with compatible stack, skip
+		// If already built and no one invalidated it, skip
 		if block.built {
 			continue
+		}
+
+		// If we're rebuilding, clear previously generated MIR but preserve entry stack snapshot.
+		if len(block.instructions) > 0 {
+			block.ResetForRebuild(true)
 		}
 
 		// Build the block (emit MIR instructions)
@@ -137,6 +157,36 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 
 	// Case 2: First visit (No established entry stack yet)
 	if block.entryStack == nil {
+		// Prefer recorded incomingStacks (per-parent snapshots) if present.
+		var incoming []Value
+		if len(block.parents) > 0 {
+			for _, p := range block.parents {
+				if p == nil {
+					continue
+				}
+				if s, ok := block.incomingStacks[p]; ok {
+					incoming = s
+					break
+				}
+			}
+		}
+		// Fallback: pick any recorded incoming stack
+		if incoming == nil && len(block.incomingStacks) > 0 {
+			for _, s := range block.incomingStacks {
+				incoming = s
+				break
+			}
+		}
+		if incoming != nil {
+			for _, val := range incoming {
+				valCopy := val
+				valCopy.liveIn = true
+				stack.push(&valCopy)
+			}
+			block.SetEntryStack(stack.data)
+			return stack
+		}
+
 		if len(block.parents) > 0 {
 			// Inherit blindly from the first parent.
 			// Ideally, we check all parents, but in a worklist algo, we usually
@@ -166,6 +216,29 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 	return stack
 }
 
+// connectEdge links parent -> child and records the incoming stack snapshot for child.
+// If the incoming snapshot for this (parent,child) pair changed, invalidate child's entry stack
+// and mark it for rebuild (PHI may be required later).
+func (c *CFG) connectEdge(parent, child *MIRBasicBlock, exitSnapshot []Value) {
+	if parent == nil || child == nil {
+		return
+	}
+	parent.SetChildren([]*MIRBasicBlock{child})
+	child.SetParents([]*MIRBasicBlock{parent})
+	if exitSnapshot == nil {
+		return
+	}
+	// Only invalidate if this parent's incoming snapshot changed.
+	if prev, ok := child.incomingStacks[parent]; ok {
+		if stacksEqual(prev, exitSnapshot) {
+			return
+		}
+	}
+	child.AddIncomingStack(parent, exitSnapshot)
+	child.SetEntryStack(nil)
+	child.built = false
+}
+
 func (c *CFG) buildBasicBlock(block *MIRBasicBlock, validJumpDests map[uint]bool) error {
 	pc := block.firstPC
 	codeLen := uint(len(c.rawCode))
@@ -188,15 +261,14 @@ func (c *CFG) buildBasicBlock(block *MIRBasicBlock, validJumpDests map[uint]bool
 		// If we are NOT at the start of the block, but we hit a JUMPDEST,
 		// then this block MUST end here (fallthrough to the next block).
 		if pc != block.firstPC && op == compiler.JUMPDEST {
-			// Link to the next block
-			nextBlock := c.getOrCreateBlock(pc)
-			block.SetChildren([]*MIRBasicBlock{nextBlock})
-			nextBlock.SetParents([]*MIRBasicBlock{block})
-
 			// Record block end. This is a fallthrough edge, not an executed JUMP opcode.
 			block.SetLastPC(pc)
 			// Record exit stack snapshot (used by later PHI/merge logic)
-			block.SetExitStack(stack.clone())
+			exitSnap := stack.clone()
+			block.SetExitStack(exitSnap)
+			// Link to next block and record incoming snapshot
+			nextBlock := c.getOrCreateBlock(pc)
+			c.connectEdge(block, nextBlock, exitSnap)
 
 			block.built = true
 			return nil
@@ -558,6 +630,7 @@ func (c *CFG) buildBasicBlock(block *MIRBasicBlock, validJumpDests map[uint]bool
 			block.appendMIR(mir)
 
 			// Resolve successor if constant; otherwise mark as unresolved for runtime backfill.
+			exitSnap := stack.clone()
 			if dest.kind == Konst {
 				target := uint(0)
 				if dest.u != nil {
@@ -569,14 +642,13 @@ func (c *CFG) buildBasicBlock(block *MIRBasicBlock, validJumpDests map[uint]bool
 					return fmt.Errorf("invalid jumpdest 0x%x at pc %d", target, pc)
 				}
 				targetBlock := c.getOrCreateBlock(target)
-				block.SetChildren([]*MIRBasicBlock{targetBlock})
-				targetBlock.SetParents([]*MIRBasicBlock{block})
+				c.connectEdge(block, targetBlock, exitSnap)
 			} else {
 				block.unresolvedJump = true
 			}
 
 			block.SetLastPC(pc + 1)
-			block.SetExitStack(stack.clone())
+			block.SetExitStack(exitSnap)
 			block.built = true
 			return nil
 		case op == compiler.JUMPI:
@@ -589,10 +661,10 @@ func (c *CFG) buildBasicBlock(block *MIRBasicBlock, validJumpDests map[uint]bool
 			block.appendMIR(mir)
 
 			// Fallthrough successor (pc+1)
+			exitSnap := stack.clone()
 			fallthroughPC := pc + 1
 			fallthroughBlock := c.getOrCreateBlock(fallthroughPC)
-			block.SetChildren([]*MIRBasicBlock{fallthroughBlock})
-			fallthroughBlock.SetParents([]*MIRBasicBlock{block})
+			c.connectEdge(block, fallthroughBlock, exitSnap)
 
 			// Branch successor if constant dest
 			if dest.kind == Konst {
@@ -606,15 +678,14 @@ func (c *CFG) buildBasicBlock(block *MIRBasicBlock, validJumpDests map[uint]bool
 					return fmt.Errorf("invalid jumpdest 0x%x at pc %d", target, pc)
 				}
 				targetBlock := c.getOrCreateBlock(target)
-				block.SetChildren([]*MIRBasicBlock{targetBlock})
-				targetBlock.SetParents([]*MIRBasicBlock{block})
+				c.connectEdge(block, targetBlock, exitSnap)
 			} else {
 				// Dynamic target: keep fallthrough edge; runtime will resolve jump target and backfill CFG.
 				block.unresolvedJump = true
 			}
 
 			block.SetLastPC(pc + 1)
-			block.SetExitStack(stack.clone())
+			block.SetExitStack(exitSnap)
 			block.built = true
 			return nil
 		default:
@@ -667,7 +738,14 @@ func (c *CFG) handleStackOp(block *MIRBasicBlock, op compiler.ByteCode, stack *V
 	var mirOp MirOperation
 	switch {
 	case op == compiler.POP:
-		mirOp = MirPOP
+		// POP pops 1 element, produces no result
+		v := stack.pop()
+		mir := new(MIR)
+		mir.op = MirPOP
+		mir.operands = []*Value{&v}
+		mir = block.appendMIR(mir)
+		mir.genStackDepth = stack.size()
+		return pc + 1, nil
 	case op >= compiler.DUP1 && op <= compiler.DUP16:
 		mirOp = MirDUP1 + MirOperation(op-compiler.DUP1)
 	case op >= compiler.SWAP1 && op <= compiler.SWAP16:
