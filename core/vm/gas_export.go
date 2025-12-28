@@ -51,5 +51,3 @@ func jumpTableForRules(r params.Rules) JumpTable {
 		return frontierInstructionSet
 	}
 }
-
-

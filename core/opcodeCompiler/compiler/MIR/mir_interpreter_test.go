@@ -229,3 +229,60 @@ func TestSemantics_Call_WritesOutputAndSetsReturnData(t *testing.T) {
 		t.Fatalf("expected mem[0..2]=aa bb, got %x %x", it.mem[0], it.mem[1])
 	}
 }
+
+func TestRefundCap_LondonVsPreLondon(t *testing.T) {
+	// gasUsed=1000, refund counter=800
+	// - pre-London cap: gasUsed/2=500 => refundUsed=500
+	// - London cap: gasUsed/5=200 => refundUsed=200
+	run := func(isLondon bool) uint64 {
+		b := NewMIRBasicBlock(0, 0)
+		b.instructions = []*MIR{{op: MirSTOP}}
+		b.built = true
+		st := NewInMemoryState()
+		st.AddRefund(800)
+		it := NewMIRInterpreter(&CFG{pcToBlock: map[uint]*MIRBasicBlock{0: b}, rawCode: []byte{0x00}})
+		it.SetGasLimit(10_000)
+		if isLondon {
+			it.SetChainRules(params.Rules{IsLondon: true})
+		} else {
+			it.SetChainRules(params.Rules{})
+		}
+		it.SetStateBackend(st)
+		it.gasUsed = 1000
+		res := it.Run()
+		if res.Err != nil {
+			t.Fatalf("Run err: %v", res.Err)
+		}
+		return res.RefundUsed
+	}
+	if got := run(false); got != 500 {
+		t.Fatalf("pre-london refundUsed: got %d want 500", got)
+	}
+	if got := run(true); got != 200 {
+		t.Fatalf("london refundUsed: got %d want 200", got)
+	}
+}
+
+func TestSelfdestruct_ChargesRefundPreLondon(t *testing.T) {
+	// Selfdestruct should add SelfdestructRefundGas pre-London, once.
+	sd := &MIR{
+		op:       MirSELFDESTRUCT,
+		operands: []*Value{newValue(Konst, nil, nil, common.HexToAddress("0xbb").Bytes())},
+	}
+	b := NewMIRBasicBlock(0, 0)
+	b.instructions = []*MIR{sd}
+	b.built = true
+	st := NewInMemoryState()
+	it := NewMIRInterpreter(&CFG{pcToBlock: map[uint]*MIRBasicBlock{0: b}, rawCode: []byte{0x00}})
+	it.SetGasLimit(10_000)
+	it.SetChainRules(params.Rules{IsEIP150: true})
+	it.SetStateBackend(st)
+	it.SetContractAddress(common.HexToAddress("0xaa"))
+	res := it.Run()
+	if res.Err != nil {
+		t.Fatalf("Run err: %v", res.Err)
+	}
+	if st.GetRefund() != params.SelfdestructRefundGas {
+		t.Fatalf("refund got %d want %d", st.GetRefund(), params.SelfdestructRefundGas)
+	}
+}

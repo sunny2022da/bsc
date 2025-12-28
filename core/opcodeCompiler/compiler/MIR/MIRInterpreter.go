@@ -19,6 +19,7 @@ type ExecResult struct {
 	Err        error
 	GasUsed    uint64
 	GasLeft    uint64
+	RefundUsed uint64 // refund applied at tx end (capped), if gasLimit != 0
 }
 
 // MIRInterpreter executes MIRBasicBlocks produced by CFG.Parse().
@@ -51,6 +52,9 @@ type MIRInterpreter struct {
 	returnData []byte
 
 	callCreate CallCreateBackend
+
+	// tx-level refund application guard
+	refundApplied bool
 }
 
 func NewMIRInterpreter(cfg *CFG) *MIRInterpreter {
@@ -72,6 +76,7 @@ func NewMIRInterpreter(cfg *CFG) *MIRInterpreter {
 		callData:      nil,
 		returnData:    nil,
 		callCreate:    NoopCallCreateBackend{},
+		refundApplied: false,
 	}
 	if cfg != nil {
 		it.validJumpDests = cfg.JumpDests()
@@ -194,7 +199,7 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 						return it.finishResult(ExecResult{Err: err})
 					}
 				}
-				a, b, err := it.eval2(m)
+				a, b, err := it.evalBinary(m)
 				if err != nil {
 					return it.finishResult(ExecResult{Err: err})
 				}
@@ -265,7 +270,7 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 				it.results[m] = out
 
 			case MirNOT, MirISZERO:
-				a, err := it.eval1(m)
+				a, err := it.evalUnary(m)
 				if err != nil {
 					return it.finishResult(ExecResult{Err: err})
 				}
@@ -713,6 +718,17 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 				copy(out, it.mem[o:o+n])
 				return it.finishResult(ExecResult{HaltOp: MirREVERT, ReturnData: out})
 
+			case MirSELFDESTRUCT:
+				beneficiary, err := it.evalAddressOperand(m, 0)
+				if err != nil {
+					return it.finishResult(ExecResult{Err: err})
+				}
+				if err := it.chargeSelfdestructDynamicGas(beneficiary); err != nil {
+					return it.finishResult(ExecResult{Err: err})
+				}
+				it.execSelfdestruct(beneficiary)
+				return it.finishResult(ExecResult{HaltOp: MirSELFDESTRUCT})
+
 			default:
 				return it.finishResult(ExecResult{Err: fmt.Errorf("unimplemented MIR op: %s", m.op.String())})
 			}
@@ -740,6 +756,14 @@ func (it *MIRInterpreter) ensureMem(n int) {
 }
 
 func (it *MIRInterpreter) finishResult(r ExecResult) ExecResult {
+	// Apply tx-level refund cap once, on normal halts.
+	if !it.refundApplied && r.Err == nil {
+		switch r.HaltOp {
+		case MirSTOP, MirRETURN, MirREVERT, MirSELFDESTRUCT:
+			r.RefundUsed = it.applyRefundCap()
+			it.refundApplied = true
+		}
+	}
 	r.GasUsed = it.gasUsed
 	if it.gasLimit > 0 {
 		if it.gasUsed >= it.gasLimit {
@@ -749,6 +773,75 @@ func (it *MIRInterpreter) finishResult(r ExecResult) ExecResult {
 		}
 	}
 	return r
+}
+
+func (it *MIRInterpreter) applyRefundCap() uint64 {
+	if it.gasLimit == 0 || it.state == nil {
+		return 0
+	}
+	refund := it.state.GetRefund()
+	if refund == 0 {
+		return 0
+	}
+	quot := params.RefundQuotient
+	if it.chainRules.IsLondon {
+		quot = params.RefundQuotientEIP3529
+	}
+	cap := it.gasUsed / quot
+	if refund > cap {
+		refund = cap
+	}
+	// Apply by decreasing used gas.
+	if refund >= it.gasUsed {
+		it.gasUsed = 0
+		return refund
+	}
+	it.gasUsed -= refund
+	return refund
+}
+
+func (it *MIRInterpreter) chargeSelfdestructDynamicGas(beneficiary common.Address) error {
+	if it.state == nil {
+		return nil
+	}
+	var gas uint64
+	// EIP-2929: cold account access cost if beneficiary not warm.
+	if it.chainRules.IsEIP2929 && !it.state.AddressInAccessList(beneficiary) {
+		it.state.AddAddressToAccessList(beneficiary)
+		gas += params.ColdAccountAccessCostEIP2929
+	}
+	// EIP150+ create-by-selfdestruct cost if beneficiary empty and we transfer value.
+	if it.chainRules.IsEIP150 {
+		bal := it.state.GetBalanceU256(it.contractAddr)
+		transfers := bal != nil && !bal.IsZero()
+		if transfers {
+			if it.chainRules.IsEIP158 {
+				if it.state.Empty(beneficiary) {
+					gas += params.CreateBySelfdestructGas
+				}
+			} else if !it.state.Exists(beneficiary) {
+				gas += params.CreateBySelfdestructGas
+			}
+		}
+	}
+	// Refunds: removed by EIP-3529 (London+)
+	if !it.chainRules.IsLondon && !it.state.HasSelfDestructed(it.contractAddr) {
+		it.state.AddRefund(params.SelfdestructRefundGas)
+	}
+	return it.chargeGas(gas)
+}
+
+func (it *MIRInterpreter) execSelfdestruct(beneficiary common.Address) {
+	if it.state == nil {
+		return
+	}
+	// Transfer balance to beneficiary, then mark selfdestruct.
+	bal := it.state.GetBalanceU256(it.contractAddr)
+	if bal != nil && !bal.IsZero() {
+		it.state.AddBalanceU256(beneficiary, bal)
+		it.state.SetBalanceU256(it.contractAddr, uint256.NewInt(0))
+	}
+	it.state.SelfDestruct(it.contractAddr)
 }
 
 func (it *MIRInterpreter) chargeGas(amount uint64) error {
@@ -1573,11 +1666,11 @@ func (it *MIRInterpreter) evalOperand(m *MIR, idx int) (*uint256.Int, error) {
 	return it.evalValue(m.operands[idx])
 }
 
-func (it *MIRInterpreter) eval1(m *MIR) (*uint256.Int, error) {
+func (it *MIRInterpreter) evalUnary(m *MIR) (*uint256.Int, error) {
 	return it.evalOperand(m, 0)
 }
 
-func (it *MIRInterpreter) eval2(m *MIR) (*uint256.Int, *uint256.Int, error) {
+func (it *MIRInterpreter) evalBinary(m *MIR) (*uint256.Int, *uint256.Int, error) {
 	a, err := it.evalOperand(m, 0)
 	if err != nil {
 		return nil, nil, err
