@@ -20,6 +20,13 @@
     <div id="container">
         <div id="input-pane">
             <h3>Bytecode (Hex)</h3>
+            <div style="display:flex; gap:10px; align-items:center; margin-bottom:10px;">
+                <label for="history" style="white-space:nowrap;">History</label>
+                <select id="history" style="flex:1;" onchange="loadFromHistory()">
+                    <option value="">(none)</option>
+                </select>
+                <button type="button" onclick="clearHistory()" style="background:#6c757d;">Clear</button>
+            </div>
             <textarea id="bytecode" placeholder="0x6001600201..."></textarea>
             <button onclick="visualize()">Visualize</button>
             <div id="error"></div>
@@ -31,6 +38,88 @@
 
     <script>
         const viz = new Viz();
+        const HISTORY_KEY = "mir_visualizer_bytecode_history_v1";
+        const HISTORY_LIMIT = 30;
+
+        function normalizeInput(s) {
+            if (!s) return "";
+            return s
+                .trim()
+                .replace(/^0x/i, "")
+                .replaceAll("\n", "")
+                .replaceAll(" ", "")
+                .toLowerCase();
+        }
+
+        function getHistory() {
+            try {
+                const raw = localStorage.getItem(HISTORY_KEY);
+                if (!raw) return [];
+                const parsed = JSON.parse(raw);
+                return Array.isArray(parsed) ? parsed : [];
+            } catch {
+                return [];
+            }
+        }
+
+        function setHistory(arr) {
+            try {
+                localStorage.setItem(HISTORY_KEY, JSON.stringify(arr));
+            } catch {
+                // ignore
+            }
+        }
+
+        function addToHistory(hexStr) {
+            const norm = normalizeInput(hexStr);
+            if (!norm) return;
+            let hist = getHistory();
+            // De-dupe (move to top)
+            hist = hist.filter(x => x !== norm);
+            hist.unshift(norm);
+            if (hist.length > HISTORY_LIMIT) hist = hist.slice(0, HISTORY_LIMIT);
+            setHistory(hist);
+            refreshHistoryDropdown(norm);
+        }
+
+        function refreshHistoryDropdown(selectedValue = "") {
+            const select = document.getElementById("history");
+            const hist = getHistory();
+            select.innerHTML = "";
+
+            const noneOpt = document.createElement("option");
+            noneOpt.value = "";
+            noneOpt.textContent = "(none)";
+            select.appendChild(noneOpt);
+
+            for (const item of hist) {
+                const opt = document.createElement("option");
+                opt.value = item;
+                // Show a short preview
+                const preview = item.length > 32 ? item.slice(0, 32) + "…" : item;
+                opt.textContent = preview;
+                select.appendChild(opt);
+            }
+
+            if (selectedValue) {
+                select.value = selectedValue;
+            }
+        }
+
+        function loadFromHistory() {
+            const select = document.getElementById("history");
+            const val = select.value;
+            if (!val) return;
+            document.getElementById("bytecode").value = "0x" + val;
+        }
+
+        function clearHistory() {
+            setHistory([]);
+            refreshHistoryDropdown("");
+        }
+
+        // Initialize history dropdown on page load
+        refreshHistoryDropdown();
 
         async function visualize() {
             const bytecode = document.getElementById('bytecode').value;
@@ -41,6 +130,7 @@
             graphDiv.innerHTML = 'Generating...';
 
             try {
+                addToHistory(bytecode);
                 const response = await fetch('/visualize', {
                     method: 'POST',
                     body: bytecode

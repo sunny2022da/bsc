@@ -13,8 +13,26 @@ func (c *CFG) ToDot() string {
 	sb.WriteString("  node [shape=box, fontname=\"Courier\"];\n")
 
 	for _, block := range c.basicBlocks {
-		// Node Label: Block ID + PC Range
-		label := fmt.Sprintf("Block %d\\nPC: %d", block.blockNum, block.firstPC)
+		// Node Label: Block ID + PC Range + stack heights
+		entryH := 0
+		if block.entryStack != nil {
+			entryH = len(block.entryStack)
+		}
+		exitH := 0
+		if block.exitStack != nil {
+			exitH = len(block.exitStack)
+		}
+		label := fmt.Sprintf(
+			"Block %d\\nPC: %d..%d\\nStack: in=%d out=%d",
+			block.blockNum,
+			block.firstPC,
+			block.lastPC,
+			entryH,
+			exitH,
+		)
+		if block.unresolvedJump {
+			label += "\\n(unresolved jump)"
+		}
 
 		// Add instructions to the label for debugging
 		// We limit the number of instructions shown to keep graph readable
