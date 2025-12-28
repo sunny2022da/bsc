@@ -204,5 +204,3 @@ func (b *StateDBBackend) AddBalance(addr common.Address, amount *uint256.Int, re
 	}
 	return b.db.AddBalance(addr, amount, reason)
 }
-
-
