@@ -225,8 +225,9 @@ func (c *CFG) connectEdge(parent, child *MIRBasicBlock, exitSnapshot []Value) {
 	}
 	parent.SetChildren([]*MIRBasicBlock{child})
 	child.SetParents([]*MIRBasicBlock{parent})
+	// Treat nil snapshot as an empty stack snapshot (important to record the predecessor).
 	if exitSnapshot == nil {
-		return
+		exitSnapshot = []Value{}
 	}
 	// Only invalidate if this parent's incoming snapshot changed.
 	if prev, ok := child.incomingStacks[parent]; ok {

@@ -618,18 +618,9 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 					return it.finishResult(ExecResult{Err: err})
 				}
 				target := uint(dest.Uint64())
-				if it.validJumpDests != nil && !it.validJumpDests[target] {
-					return it.finishResult(ExecResult{Err: fmt.Errorf("invalid jumpdest 0x%x", target)})
-				}
-				nb := it.cfg.pcToBlock[target]
-				if nb == nil {
-					// on-demand build (minimal backfill)
-					nb = it.cfg.getOrCreateBlock(target)
-					if !nb.built {
-						if err := it.cfg.buildBasicBlock(nb, it.validJumpDests); err != nil {
-							return it.finishResult(ExecResult{Err: err})
-						}
-					}
+				nb, err := it.resolveBB(cur, target)
+				if err != nil {
+					return it.finishResult(ExecResult{Err: err})
 				}
 				prev, cur = cur, nb
 				break
@@ -645,17 +636,9 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 				}
 				if !cond.IsZero() {
 					target := uint(dest.Uint64())
-					if it.validJumpDests != nil && !it.validJumpDests[target] {
-						return it.finishResult(ExecResult{Err: fmt.Errorf("invalid jumpdest 0x%x", target)})
-					}
-					nb := it.cfg.pcToBlock[target]
-					if nb == nil {
-						nb = it.cfg.getOrCreateBlock(target)
-						if !nb.built {
-							if err := it.cfg.buildBasicBlock(nb, it.validJumpDests); err != nil {
-								return it.finishResult(ExecResult{Err: err})
-							}
-						}
+					nb, err := it.resolveBB(cur, target)
+					if err != nil {
+						return it.finishResult(ExecResult{Err: err})
 					}
 					prev, cur = cur, nb
 					break
@@ -675,6 +658,16 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 						return it.finishResult(ExecResult{HaltOp: MirSTOP})
 					}
 					ft = children[0]
+				}
+				// Ensure we record incoming stack for correct PHI evaluation on fallthrough.
+				if cur != nil && ft != nil && it.cfg != nil {
+					it.cfg.connectEdge(cur, ft, cur.ExitStack())
+					if !ft.built && len(ft.instructions) > 0 {
+						ft.ResetForRebuild(true)
+					}
+					if !ft.built {
+						_ = it.cfg.buildBasicBlock(ft, it.validJumpDests)
+					}
 				}
 				prev, cur = cur, ft
 				break
@@ -740,6 +733,36 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 			}
 		}
 	}
+}
+
+// resolveBB is the runtime backfill hook for dynamic jumps.
+// It validates jumpdest, creates/builds the target block if missing, and records a CFG edge
+// (including incoming stack snapshot) to enable PHI correctness.
+func (it *MIRInterpreter) resolveBB(from *MIRBasicBlock, targetPC uint) (*MIRBasicBlock, error) {
+	if it.cfg == nil {
+		return nil, errors.New("nil CFG")
+	}
+	if it.validJumpDests != nil && !it.validJumpDests[targetPC] {
+		return nil, fmt.Errorf("invalid jumpdest 0x%x", targetPC)
+	}
+	nb := it.cfg.pcToBlock[targetPC]
+	if nb == nil {
+		nb = it.cfg.getOrCreateBlock(targetPC)
+	}
+	// Record incoming stack snapshot for PHI evaluation.
+	if from != nil {
+		it.cfg.connectEdge(from, nb, from.ExitStack())
+	}
+	// Ensure block is (re)built if it was invalidated by new incoming stacks.
+	for i := 0; i < 8 && !nb.built; i++ {
+		if len(nb.instructions) > 0 {
+			nb.ResetForRebuild(true)
+		}
+		if err := it.cfg.buildBasicBlock(nb, it.validJumpDests); err != nil {
+			return nil, err
+		}
+	}
+	return nb, nil
 }
 
 func (it *MIRInterpreter) ensureMem(n int) {
