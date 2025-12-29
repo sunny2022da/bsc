@@ -78,5 +78,3 @@ func TestDynamicJumpBackfill_InvalidJumpdestErrors(t *testing.T) {
 		t.Fatalf("expected invalid jumpdest error, got nil")
 	}
 }
-
-

@@ -155,56 +155,68 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 		return stack
 	}
 
-	// Case 2: First visit (No established entry stack yet)
+	// Case 2: First visit or invalidated entry (entryStack == nil)
+	//
+	// Build entry stack from recorded incomingStacks, inserting PHIs when values differ.
 	if block.entryStack == nil {
-		// Prefer recorded incomingStacks (per-parent snapshots) if present.
-		var incoming []Value
-		if len(block.parents) > 0 {
-			for _, p := range block.parents {
-				if p == nil {
-					continue
-				}
-				if s, ok := block.incomingStacks[p]; ok {
-					incoming = s
+		// Gather incoming snapshots in a deterministic order based on parents slice.
+		incomings := make([][]Value, 0, len(block.parents))
+		for _, p := range block.parents {
+			if p == nil {
+				continue
+			}
+			if s, ok := block.incomingStacks[p]; ok {
+				incomings = append(incomings, s)
+			}
+		}
+		// Fallback: if parents list is empty but incomingStacks exists, use all snapshots.
+		if len(incomings) == 0 && len(block.incomingStacks) > 0 {
+			for _, s := range block.incomingStacks {
+				incomings = append(incomings, s)
+			}
+		}
+		if len(incomings) == 0 {
+			return stack
+		}
+		// All incoming stacks must have identical height for valid EVM control-flow.
+		height := len(incomings[0])
+		for i := 1; i < len(incomings); i++ {
+			if len(incomings[i]) != height {
+				// Stack height mismatch at merge => invalid bytecode control-flow.
+				// Keep it strict to avoid producing nonsense PHIs.
+				return stack
+			}
+		}
+
+		for i := 0; i < height; i++ {
+			base := incomings[0][i]
+			same := true
+			for j := 1; j < len(incomings); j++ {
+				v := incomings[j][i]
+				if !equalValueForFlow(&base, &v) {
+					same = false
 					break
 				}
 			}
-		}
-		// Fallback: pick any recorded incoming stack
-		if incoming == nil && len(block.incomingStacks) > 0 {
-			for _, s := range block.incomingStacks {
-				incoming = s
-				break
-			}
-		}
-		if incoming != nil {
-			for _, val := range incoming {
-				valCopy := val
+			if same {
+				valCopy := base
 				valCopy.liveIn = true
 				stack.push(&valCopy)
+				continue
 			}
-			block.SetEntryStack(stack.data)
-			return stack
-		}
-
-		if len(block.parents) > 0 {
-			// Inherit blindly from the first parent.
-			// Ideally, we check all parents, but in a worklist algo, we usually
-			// process one parent first.
-			parent := block.parents[0]
-			if parent.exitStack != nil {
-				for _, val := range parent.exitStack {
-					valCopy := val
-					// Mark as LiveIn so we know it came from outside this block.
-					// This effectively treats it as a "variable" or "parameter" to the block.
-					valCopy.liveIn = true
-					// Clear definition pointer if we want to be strict about not optimizing across blocks yet
-					// valCopy.def = nil
-					stack.push(&valCopy)
-				}
-				block.SetEntryStack(stack.data)
+			// Create PHI merging all incoming values at this stack slot.
+			ops := make([]*Value, 0, len(incomings))
+			for _, s := range incomings {
+				v := s[i]
+				v.liveIn = true
+				vv := v // heap allocate per-operand
+				ops = append(ops, &vv)
 			}
+			phi := block.CreatePhiMIR(ops, stack)
+			// phiStackIndex is 0 for top-of-stack.
+			phi.phiStackIndex = (height - 1) - i
 		}
+		block.SetEntryStack(stack.data)
 		return stack
 	}
 
@@ -644,6 +656,13 @@ func (c *CFG) buildBasicBlock(block *MIRBasicBlock, validJumpDests map[uint]bool
 				}
 				targetBlock := c.getOrCreateBlock(target)
 				c.connectEdge(block, targetBlock, exitSnap)
+				// Self-loop may invalidate this block's entryStack; request rebuild by leaving built=false.
+				if targetBlock == block && block.entryStack == nil {
+					block.SetLastPC(pc + 1)
+					block.SetExitStack(exitSnap)
+					block.built = false
+					return nil
+				}
 			} else {
 				block.unresolvedJump = true
 			}
@@ -680,6 +699,12 @@ func (c *CFG) buildBasicBlock(block *MIRBasicBlock, validJumpDests map[uint]bool
 				}
 				targetBlock := c.getOrCreateBlock(target)
 				c.connectEdge(block, targetBlock, exitSnap)
+				if targetBlock == block && block.entryStack == nil {
+					block.SetLastPC(pc + 1)
+					block.SetExitStack(exitSnap)
+					block.built = false
+					return nil
+				}
 			} else {
 				// Dynamic target: keep fallthrough edge; runtime will resolve jump target and backfill CFG.
 				block.unresolvedJump = true

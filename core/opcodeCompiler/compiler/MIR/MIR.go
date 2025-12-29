@@ -11,6 +11,8 @@ type MIR struct {
 	meta     []byte
 	pc       *uint // Program counter of the original instruction (optional)
 	idx      int   // Index within its basic block, set by appendMIR
+	// Stable identity for fixpoint comparisons across rebuilds.
+	defBlockNum uint
 	// EVM mapping metadata (set during CFG build)
 	evmPC uint // byte offset of the originating EVM opcode
 	evmOp byte // originating EVM opcode byte value

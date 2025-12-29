@@ -172,6 +172,7 @@ func (b *MIRBasicBlock) CreateVoidMIR(op MirOperation) (mir *MIR) {
 
 func (b *MIRBasicBlock) appendMIR(mir *MIR) *MIR {
 	mir.idx = len(b.instructions)
+	mir.defBlockNum = b.blockNum
 	// Attach EVM mapping captured by the CFG builder
 	mir.evmPC = currentEVMBuildPC
 	mir.evmOp = currentEVMBuildOp
@@ -741,9 +742,13 @@ func equalValueForFlow(a, b *Value) bool {
 		if a.def == nil || b.def == nil {
 			return a.def == nil && b.def == nil
 		}
-		// Only treat variables as equal when they are the exact same defining instruction.
-		// This preserves PHI correctness across variants/rebuilds.
-		return a.def == b.def
+		// Stable definition identity across rebuilds:
+		// (defBlockNum, evmPC, op, phiStackIndex)
+		da, db := a.def, b.def
+		return da.defBlockNum == db.defBlockNum &&
+			da.evmPC == db.evmPC &&
+			da.op == db.op &&
+			da.phiStackIndex == db.phiStackIndex
 	case Arguments, Unknown:
 		return true
 	default:
