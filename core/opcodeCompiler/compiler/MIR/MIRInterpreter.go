@@ -55,6 +55,9 @@ type MIRInterpreter struct {
 
 	// tx-level refund application guard
 	refundApplied bool
+
+	// Context for LOGs
+	blockNumber uint64
 }
 
 func NewMIRInterpreter(cfg *CFG) *MIRInterpreter {
@@ -97,6 +100,7 @@ func (it *MIRInterpreter) SetChainRules(r params.Rules) {
 // SetChainConfig derives and sets fork rules for a specific block context.
 // Fullnode integration should call this per block (rules are fork-dependent).
 func (it *MIRInterpreter) SetChainConfig(cfg *params.ChainConfig, blockNumber uint64, isMerge bool, timestamp uint64) {
+	it.blockNumber = blockNumber
 	if cfg == nil {
 		it.chainRules = params.Rules{}
 		return
@@ -424,7 +428,43 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 				if err := it.chargeLogDynamicGas(m); err != nil {
 					return it.finishResult(ExecResult{Err: err})
 				}
-				// Semantics (recording logs) will be implemented later (p12).
+				// Semantics (recording logs)
+				// 1. Get offset and size
+				off, err := it.evalOperand(m, 0)
+				if err != nil {
+					return it.finishResult(ExecResult{Err: err})
+				}
+				sz, err := it.evalOperand(m, 1)
+				if err != nil {
+					return it.finishResult(ExecResult{Err: err})
+				}
+
+				// 2. Read data from memory
+				o := int(off.Uint64())
+				n := int(sz.Uint64())
+				if n < 0 {
+					n = 0
+				}
+				it.ensureMem(o + n)
+				data := make([]byte, n)
+				copy(data, it.mem[o:o+n])
+
+				// 3. Read topics from stack
+				numTopics := int(m.op - MirLOG0)
+				topics := make([]common.Hash, numTopics)
+				for i := 0; i < numTopics; i++ {
+					// Topics start at operand index 2
+					val, err := it.evalOperand(m, 2+i)
+					if err != nil {
+						return it.finishResult(ExecResult{Err: err})
+					}
+					topics[i] = common.Hash(val.Bytes32())
+				}
+
+				// 4. Record log via backend
+				if it.state != nil {
+					it.state.AddLog(it.contractAddr, topics, data, it.blockNumber)
+				}
 
 			case MirBALANCE:
 				addr, err := it.evalAddressOperand(m, 0)

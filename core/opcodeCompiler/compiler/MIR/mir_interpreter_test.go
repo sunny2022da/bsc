@@ -286,3 +286,82 @@ func TestSelfdestruct_ChargesRefundPreLondon(t *testing.T) {
 		t.Fatalf("refund got %d want %d", st.GetRefund(), params.SelfdestructRefundGas)
 	}
 }
+
+func TestSemantics_Log_RecordsDataAndTopics(t *testing.T) {
+	// Build a small block:
+	// MSTORE(0, 0x11223344...) to set up memory data
+	// LOG2(offset=0, size=4, topic1=0xAA, topic2=0xBB)
+
+	// Opcode setup:
+	// 1. MSTORE(0, 0x11223344...)
+	//    We'll just manually set memory in the interpreter to keep the MIR simple.
+
+	// 2. LOG2 op:
+	//    Operands: offset, size, topic1, topic2
+	off := newValue(Konst, nil, nil, []byte{0x00})
+	sz := newValue(Konst, nil, nil, []byte{0x04})
+	t1 := newValue(Konst, nil, nil, common.BytesToHash(common.HexToAddress("0xAA").Bytes()).Bytes())
+	t2 := newValue(Konst, nil, nil, common.BytesToHash(common.HexToAddress("0xBB").Bytes()).Bytes())
+
+	logOp := &MIR{
+		op:       MirLOG2,
+		operands: []*Value{off, sz, t1, t2},
+	}
+
+	b := NewMIRBasicBlock(0, 0)
+	b.instructions = []*MIR{logOp, {op: MirSTOP}}
+	b.built = true
+
+	cfg := &CFG{pcToBlock: map[uint]*MIRBasicBlock{0: b}, rawCode: []byte{}}
+	it := NewMIRInterpreter(cfg)
+
+	// Setup state backend
+	st := NewInMemoryState()
+	it.SetStateBackend(st)
+
+	// Setup context
+	contractAddr := common.HexToAddress("0xCC")
+	it.SetContractAddress(contractAddr)
+
+	// Setup block number via SetChainConfig
+	blockNum := uint64(12345)
+	it.SetChainConfig(nil, blockNum, false, 0)
+
+	// Setup memory content (simulate what MSTORE would have done)
+	it.ensureMem(32)
+	it.mem[0] = 0x11
+	it.mem[1] = 0x22
+	it.mem[2] = 0x33
+	it.mem[3] = 0x44
+
+	// Run
+	res := it.Run()
+	if res.Err != nil {
+		t.Fatalf("Run failed: %v", res.Err)
+	}
+
+	// Verify backend captured the log
+	if len(st.logs) != 1 {
+		t.Fatalf("expected 1 log, got %d", len(st.logs))
+	}
+	log := st.logs[0]
+
+	if log.Address != contractAddr {
+		t.Errorf("expected address %s, got %s", contractAddr, log.Address)
+	}
+	if log.BlockNumber != blockNum {
+		t.Errorf("expected block number %d, got %d", blockNum, log.BlockNumber)
+	}
+	if len(log.Data) != 4 || log.Data[0] != 0x11 || log.Data[3] != 0x44 {
+		t.Errorf("expected data 11223344, got %x", log.Data)
+	}
+	if len(log.Topics) != 2 {
+		t.Fatalf("expected 2 topics, got %d", len(log.Topics))
+	}
+	if log.Topics[0] != common.BytesToHash(common.HexToAddress("0xAA").Bytes()) {
+		t.Errorf("topic 0 mismatch: %x", log.Topics[0])
+	}
+	if log.Topics[1] != common.BytesToHash(common.HexToAddress("0xBB").Bytes()) {
+		t.Errorf("topic 1 mismatch: %x", log.Topics[1])
+	}
+}

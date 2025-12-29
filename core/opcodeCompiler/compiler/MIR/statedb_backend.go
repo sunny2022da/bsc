@@ -3,6 +3,7 @@ package MIR
 import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/tracing"
+	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/holiman/uint256"
 )
@@ -203,4 +204,17 @@ func (b *StateDBBackend) AddBalance(addr common.Address, amount *uint256.Int, re
 		return *uint256.NewInt(0)
 	}
 	return b.db.AddBalance(addr, amount, reason)
+}
+
+func (b *StateDBBackend) AddLog(addr common.Address, topics []common.Hash, data []byte, blockNumber uint64) {
+	if b == nil || b.db == nil {
+		return
+	}
+	// Create the go-ethereum Log struct and pass it to StateDB
+	b.db.AddLog(&types.Log{
+		Address:     addr,
+		Topics:      topics,
+		Data:        data,
+		BlockNumber: blockNumber,
+	})
 }

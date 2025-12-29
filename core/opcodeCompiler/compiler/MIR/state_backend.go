@@ -36,6 +36,9 @@ type StateBackend interface {
 	AddAddressToAccessList(addr common.Address)
 	AddSlotToAccessList(addr common.Address, slot common.Hash)
 
+	// Logs
+	AddLog(addr common.Address, topics []common.Hash, data []byte, blockNumber uint64)
+
 	Snapshot() int
 	RevertToSnapshot(id int)
 }
@@ -57,6 +60,8 @@ type InMemoryState struct {
 
 	// snapshots store coarse copies for Snapshot/RevertToSnapshot.
 	snapshots []inMemorySnapshot
+
+	logs []inMemoryLog // Journal of logs
 }
 
 type inMemorySnapshot struct {
@@ -69,20 +74,30 @@ type inMemorySnapshot struct {
 	code           map[[20]byte][]byte
 	codeHash       map[[20]byte]common.Hash
 	selfDestructed map[[20]byte]bool
+
+	logs []inMemoryLog
+}
+
+// Define helper struct for in-memory logs
+type inMemoryLog struct {
+	Address     common.Address
+	Topics      []common.Hash
+	Data        []byte
+	BlockNumber uint64
 }
 
 func NewInMemoryState() *InMemoryState {
 	return &InMemoryState{
-		current:   make(map[[52]byte]common.Hash),
-		committed: make(map[[52]byte]common.Hash),
-		refund:    0,
-		addrWarm:  make(map[[20]byte]bool, 64),
-		access:    make(map[[20]byte]map[[32]byte]bool),
-		balance:   make(map[[20]byte]common.Hash),
-		code:      make(map[[20]byte][]byte),
-		codeHash:  make(map[[20]byte]common.Hash),
+		current:        make(map[[52]byte]common.Hash),
+		committed:      make(map[[52]byte]common.Hash),
+		refund:         0,
+		addrWarm:       make(map[[20]byte]bool, 64),
+		access:         make(map[[20]byte]map[[32]byte]bool),
+		balance:        make(map[[20]byte]common.Hash),
+		code:           make(map[[20]byte][]byte),
+		codeHash:       make(map[[20]byte]common.Hash),
 		selfDestructed: make(map[[20]byte]bool, 16),
-		snapshots: nil,
+		snapshots:      nil,
 	}
 }
 
@@ -100,6 +115,24 @@ func addrKey(addr common.Address) (k [20]byte) {
 func slotKey(slot common.Hash) (k [32]byte) {
 	copy(k[:], slot[:])
 	return k
+}
+
+func (s *InMemoryState) AddLog(addr common.Address, topics []common.Hash, data []byte, blockNumber uint64) {
+	if s == nil {
+		return
+	}
+	// Deep copy to be safe
+	d := make([]byte, len(data))
+	copy(d, data)
+	t := make([]common.Hash, len(topics))
+	copy(t, topics)
+
+	s.logs = append(s.logs, inMemoryLog{
+		Address:     addr,
+		Topics:      t,
+		Data:        d,
+		BlockNumber: blockNumber,
+	})
 }
 
 func (s *InMemoryState) GetState(addr common.Address, slot common.Hash) common.Hash {
@@ -330,6 +363,7 @@ func (s *InMemoryState) Snapshot() int {
 		code:           make(map[[20]byte][]byte, len(s.code)),
 		codeHash:       make(map[[20]byte]common.Hash, len(s.codeHash)),
 		selfDestructed: make(map[[20]byte]bool, len(s.selfDestructed)),
+		logs:           make([]inMemoryLog, len(s.logs)),
 	}
 	for k, v := range s.current {
 		snap.current[k] = v
@@ -361,6 +395,10 @@ func (s *InMemoryState) Snapshot() int {
 	for k, v := range s.selfDestructed {
 		snap.selfDestructed[k] = v
 	}
+
+	// Copy logs
+	copy(snap.logs, s.logs)
+
 	s.snapshots = append(s.snapshots, snap)
 	return len(s.snapshots) - 1
 }
@@ -382,5 +420,7 @@ func (s *InMemoryState) RevertToSnapshot(id int) {
 	s.code = snap.code
 	s.codeHash = snap.codeHash
 	s.selfDestructed = snap.selfDestructed
+	s.logs = snap.logs // Restore log slice (truncating newer logs)
+
 	s.snapshots = s.snapshots[:id]
 }

@@ -59,5 +59,3 @@ func TestCFG_PhiFixpoint_LoopHeader(t *testing.T) {
 		t.Fatalf("expected MirPHI in loop header instructions")
 	}
 }
-
-
