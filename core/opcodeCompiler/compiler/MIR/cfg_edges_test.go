@@ -126,5 +126,3 @@ func TestCFGEdges_JUMPTerminatesBlock(t *testing.T) {
 		t.Fatalf("expected pc=3 block to have parent pc=0")
 	}
 }
-
-
