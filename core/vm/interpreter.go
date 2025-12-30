@@ -37,6 +37,11 @@ type Config struct {
 
 	StatelessSelfValidation bool // Generate execution witnesses and self-check against them (testing purpose)
 	EnableWitnessStats      bool // Whether trie access statistics collection is enabled
+
+	// EnableMIR enables the MIR interpreter for top-level contract execution.
+	// Nested calls (CALL*/CREATE*) are still executed by the geth EVM interpreter.
+	// Fullnode wiring must provide a MIR runner via EVM.SetMIRRunner.
+	EnableMIR bool
 }
 
 // ScopeContext contains the things that are per-call, such as stack and memory,

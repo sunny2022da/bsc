@@ -155,6 +155,12 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 	if it.cfg == nil {
 		return ExecResult{Err: errors.New("nil CFG")}
 	}
+	// Snapshot state so we can revert on REVERT or any fatal error, matching geth semantics.
+	// NOTE: This snapshot includes refund counter/access list/logs via StateDB journaling.
+	snap := -1
+	if it.state != nil {
+		snap = it.state.Snapshot()
+	}
 	cur := it.cfg.pcToBlock[entryPC]
 	if cur == nil {
 		return ExecResult{Err: fmt.Errorf("no block at pc %d", entryPC)}
@@ -749,7 +755,11 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 				it.ensureMem(o + n)
 				out := make([]byte, n)
 				copy(out, it.mem[o:o+n])
-				return it.finishResult(ExecResult{HaltOp: MirREVERT, ReturnData: out})
+				// Revert state changes and keep leftover gas.
+				if it.state != nil && snap >= 0 {
+					it.state.RevertToSnapshot(snap)
+				}
+				return it.finishResult(ExecResult{HaltOp: MirREVERT, ReturnData: out, Err: vm.ErrExecutionReverted})
 
 			case MirSELFDESTRUCT:
 				beneficiary, err := it.evalAddressOperand(m, 0)
@@ -763,6 +773,10 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 				return it.finishResult(ExecResult{HaltOp: MirSELFDESTRUCT})
 
 			default:
+				// Fatal error: revert and consume all gas.
+				if it.state != nil && snap >= 0 {
+					it.state.RevertToSnapshot(snap)
+				}
 				return it.finishResult(ExecResult{Err: fmt.Errorf("unimplemented MIR op: %s", m.op.String())})
 			}
 
@@ -826,6 +840,10 @@ func (it *MIRInterpreter) finishResult(r ExecResult) ExecResult {
 			r.RefundUsed = it.applyRefundCap()
 			it.refundApplied = true
 		}
+	}
+	// Fatal errors consume all gas, matching geth (except REVERT which keeps gas-left).
+	if r.Err != nil && !errors.Is(r.Err, vm.ErrExecutionReverted) && it.gasLimit > 0 {
+		it.gasUsed = it.gasLimit
 	}
 	r.GasUsed = it.gasUsed
 	if it.gasLimit > 0 {
@@ -913,11 +931,11 @@ func (it *MIRInterpreter) chargeGas(amount uint64) error {
 	}
 	// overflow safe add
 	if it.gasUsed > ^uint64(0)-amount {
-		return errors.New("gas uint64 overflow")
+		return vm.ErrGasUintOverflow
 	}
 	it.gasUsed += amount
 	if it.gasLimit > 0 && it.gasUsed > it.gasLimit {
-		return errors.New("out of gas")
+		return vm.ErrOutOfGas
 	}
 	return nil
 }
@@ -1145,6 +1163,14 @@ func (it *MIRInterpreter) chargeLogDynamicGas(m *MIR) error {
 	if err := it.chargeMemoryExpansion(off, sz); err != nil {
 		return err
 	}
+	// NOTE: In geth, LOGx charges ALL of the following in the dynamic gas function
+	// (see vm.makeGasLog):
+	// - params.LogGas (base)
+	// - params.LogTopicGas * numTopics
+	// - params.LogDataGas * dataSize
+	// plus memory expansion.
+	// The jump table constant gas for LOGx is 0.
+
 	// + LogGas base
 	if err := it.chargeGas(params.LogGas); err != nil {
 		return err
@@ -1158,7 +1184,6 @@ func (it *MIRInterpreter) chargeLogDynamicGas(m *MIR) error {
 	if err := it.chargeGas(topicsGas); err != nil {
 		return err
 	}
-	// + data gas (per byte)
 	dataSz, overflow := sz.Uint64WithOverflow()
 	if overflow {
 		return errors.New("log data size overflow")

@@ -124,7 +124,8 @@ func (b *StateDBBackend) GetCommittedState(addr common.Address, slot common.Hash
 	if b == nil || b.db == nil {
 		return common.Hash{}
 	}
-	return b.db.GetCommittedState(addr, slot)
+	_, committed := b.db.GetStateAndCommittedState(addr, slot)
+	return committed
 }
 
 func (b *StateDBBackend) SetState(addr common.Address, slot common.Hash, value common.Hash) {

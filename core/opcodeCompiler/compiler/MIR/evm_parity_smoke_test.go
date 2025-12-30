@@ -59,6 +59,9 @@ func TestParity_GasUsed_SimplePrograms(t *testing.T) {
 		{"mstore_memexp", "600160405200", 100000},
 		// PUSH1 0; PUSH1 0x20; KECCAK256; STOP
 		{"keccak_memexp", "600060202000", 100000},
+		// PUSH1 0xbb (topic2); PUSH1 0xaa (topic1); PUSH1 0 (size); PUSH1 0 (offset); LOG2; STOP
+		// Regression: LOG base/topic gas must come ONLY from constant gas tables (no double-charge in MIR dynamic gas).
+		{"log2_size0_topics_only", "60bb60aa60006000a200", 100000},
 	}
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {

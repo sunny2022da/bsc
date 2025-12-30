@@ -26,6 +26,7 @@ import (
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/consensus/misc"
 	"github.com/ethereum/go-ethereum/core/state"
+	mir "github.com/ethereum/go-ethereum/core/opcodeCompiler/compiler/MIR"
 	"github.com/ethereum/go-ethereum/core/systemcontracts"
 	"github.com/ethereum/go-ethereum/core/tracing"
 	"github.com/ethereum/go-ethereum/core/types"
@@ -102,6 +103,9 @@ func (p *StateProcessor) Process(block *types.Block, statedb *state.StateDB, cfg
 	}
 	context = NewEVMBlockContext(header, p.chain, nil)
 	evm := vm.NewEVM(context, tracingStateDB, config, cfg)
+	if cfg.EnableMIR {
+		evm.SetMIRRunner(mir.NewEVMRunner(evm))
+	}
 
 	if beaconRoot := block.BeaconRoot(); beaconRoot != nil {
 		ProcessBeaconBlockRoot(*beaconRoot, evm)

@@ -18,6 +18,7 @@ package runtime
 
 import (
 	"github.com/ethereum/go-ethereum/core"
+	mir "github.com/ethereum/go-ethereum/core/opcodeCompiler/compiler/MIR"
 	"github.com/ethereum/go-ethereum/core/vm"
 )
 
@@ -43,6 +44,9 @@ func NewEnv(cfg *Config) *vm.EVM {
 	}
 
 	evm := vm.NewEVM(blockContext, cfg.State, cfg.ChainConfig, cfg.EVMConfig)
+	if cfg.EVMConfig.EnableMIR {
+		evm.SetMIRRunner(mir.NewEVMRunner(evm))
+	}
 	evm.SetTxContext(txContext)
 	return evm
 }
