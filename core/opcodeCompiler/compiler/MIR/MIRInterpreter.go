@@ -629,6 +629,17 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 				if err != nil {
 					return it.finishResult(ExecResult{Err: err})
 				}
+				// Bounds check (matches geth opReturnDataCopy):
+				// if offset+size > len(returnData) => ErrReturnDataOutOfBounds (fatal)
+				off64, offOv := off.Uint64WithOverflow()
+				sz64, szOv := sz.Uint64WithOverflow()
+				if offOv || szOv {
+					return it.finishResult(ExecResult{Err: vm.ErrReturnDataOutOfBounds})
+				}
+				end := off64 + sz64
+				if end < off64 || uint64(len(it.returnData)) < end {
+					return it.finishResult(ExecResult{Err: vm.ErrReturnDataOutOfBounds})
+				}
 				if err := it.chargeMemoryExpansion(dest, sz); err != nil {
 					return it.finishResult(ExecResult{Err: err})
 				}
@@ -1579,8 +1590,9 @@ func (it *MIRInterpreter) chargeSLoadGas(slot common.Hash) error {
 }
 
 func (it *MIRInterpreter) chargeSStoreGas(slot common.Hash, newVal common.Hash) error {
-	// Legacy rules apply if Petersburg (EIP-1283 removed) OR Constantinople not active.
-	if it.chainRules.IsPetersburg || !it.chainRules.IsConstantinople {
+	// Legacy rules apply only before Constantinople (pre EIP-1283/EIP-2200 era).
+	// NOTE: Petersburg does NOT imply legacy rules. Post-Istanbul networks use EIP-2200/2929/3529.
+	if !it.chainRules.IsConstantinople {
 		if it.state == nil {
 			// No state: assume worst-case set.
 			return it.chargeGas(params.SstoreSetGas)

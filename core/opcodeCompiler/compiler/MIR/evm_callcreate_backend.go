@@ -41,5 +41,3 @@ func (b *EVMCallCreateBackend) Create(caller common.Address, initCode []byte, ga
 func (b *EVMCallCreateBackend) Create2(caller common.Address, initCode []byte, gas uint64, value *uint256.Int, salt *uint256.Int) ([]byte, common.Address, uint64, error) {
 	return b.evm.Create2(caller, initCode, gas, value, salt)
 }
-
-

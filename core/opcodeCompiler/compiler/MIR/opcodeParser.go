@@ -486,13 +486,14 @@ func (c *CFG) buildBasicBlock(block *MIRBasicBlock, validJumpDests map[uint]bool
 			// Note: opcode values in compiler package differ from MirOperation for some calls.
 			switch op {
 			case compiler.CALL:
-				outSize := stack.pop()
-				outOff := stack.pop()
-				inSize := stack.pop()
-				inOff := stack.pop()
-				value := stack.pop()
-				to := stack.pop()
+				// EVM stack (top to bottom): gas, to, value, inOff, inSize, outOff, outSize
 				gas := stack.pop()
+				to := stack.pop()
+				value := stack.pop()
+				inOff := stack.pop()
+				inSize := stack.pop()
+				outOff := stack.pop()
+				outSize := stack.pop()
 				mir := new(MIR)
 				mir.op = MirCALL
 				mir.operands = []*Value{&gas, &to, &value, &inOff, &inSize, &outOff, &outSize}
@@ -500,13 +501,14 @@ func (c *CFG) buildBasicBlock(block *MIRBasicBlock, validJumpDests map[uint]bool
 				mir = block.appendMIR(mir)
 				mir.genStackDepth = stack.size()
 			case compiler.CALLCODE:
-				outSize := stack.pop()
-				outOff := stack.pop()
-				inSize := stack.pop()
-				inOff := stack.pop()
-				value := stack.pop()
-				to := stack.pop()
+				// EVM stack (top to bottom): gas, to, value, inOff, inSize, outOff, outSize
 				gas := stack.pop()
+				to := stack.pop()
+				value := stack.pop()
+				inOff := stack.pop()
+				inSize := stack.pop()
+				outOff := stack.pop()
+				outSize := stack.pop()
 				mir := new(MIR)
 				mir.op = MirCALLCODE
 				mir.operands = []*Value{&gas, &to, &value, &inOff, &inSize, &outOff, &outSize}
@@ -514,12 +516,13 @@ func (c *CFG) buildBasicBlock(block *MIRBasicBlock, validJumpDests map[uint]bool
 				mir = block.appendMIR(mir)
 				mir.genStackDepth = stack.size()
 			case compiler.DELEGATECALL:
-				outSize := stack.pop()
-				outOff := stack.pop()
-				inSize := stack.pop()
-				inOff := stack.pop()
-				to := stack.pop()
+				// EVM stack (top to bottom): gas, to, inOff, inSize, outOff, outSize
 				gas := stack.pop()
+				to := stack.pop()
+				inOff := stack.pop()
+				inSize := stack.pop()
+				outOff := stack.pop()
+				outSize := stack.pop()
 				mir := new(MIR)
 				mir.op = MirDELEGATECALL
 				mir.operands = []*Value{&gas, &to, &inOff, &inSize, &outOff, &outSize}
@@ -527,12 +530,13 @@ func (c *CFG) buildBasicBlock(block *MIRBasicBlock, validJumpDests map[uint]bool
 				mir = block.appendMIR(mir)
 				mir.genStackDepth = stack.size()
 			case compiler.STATICCALL:
-				outSize := stack.pop()
-				outOff := stack.pop()
-				inSize := stack.pop()
-				inOff := stack.pop()
-				to := stack.pop()
+				// EVM stack (top to bottom): gas, to, inOff, inSize, outOff, outSize
 				gas := stack.pop()
+				to := stack.pop()
+				inOff := stack.pop()
+				inSize := stack.pop()
+				outOff := stack.pop()
+				outSize := stack.pop()
 				mir := new(MIR)
 				mir.op = MirSTATICCALL
 				mir.operands = []*Value{&gas, &to, &inOff, &inSize, &outOff, &outSize}
