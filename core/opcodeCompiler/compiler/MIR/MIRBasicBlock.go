@@ -763,7 +763,15 @@ func (b *MIRBasicBlock) ResetForRebuild(preserveEntry bool) {
 	// Clear previously generated instructions and iteration cursor
 	b.instructions = nil
 	b.pos = 0
-	// Clear emitted-op accounting; it will be recomputed during rebuild.
+	// Clear opcode accounting; it will be recomputed during rebuild.
+	//
+	// Important: both maps must be cleared. `evmOpCounts` drives constant gas charging
+	// and must not accumulate across rebuilds, otherwise MIR will overcharge gas.
+	if b.evmOpCounts != nil {
+		for k := range b.evmOpCounts {
+			delete(b.evmOpCounts, k)
+		}
+	}
 	if b.emittedOpCounts != nil {
 		for k := range b.emittedOpCounts {
 			delete(b.emittedOpCounts, k)

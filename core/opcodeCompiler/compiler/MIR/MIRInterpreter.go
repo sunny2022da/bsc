@@ -20,6 +20,29 @@ type ExecResult struct {
 	GasUsed    uint64
 	GasLeft    uint64
 	RefundUsed uint64 // refund applied at tx end (capped), if gasLimit != 0
+	LastEVMPC  uint   // best-effort: last executed EVM pc (for debugging)
+	// Debug-only: RETURN/REVERT operands observed at halt (best-effort).
+	ReturnOffset uint64
+	ReturnSize   uint64
+}
+
+type mirDefKey struct {
+	defBlockNum   uint
+	evmPC         uint
+	op            MirOperation
+	phiStackIndex int
+}
+
+func keyForDef(def *MIR) mirDefKey {
+	if def == nil {
+		return mirDefKey{}
+	}
+	return mirDefKey{
+		defBlockNum:   def.defBlockNum,
+		evmPC:         def.evmPC,
+		op:            def.op,
+		phiStackIndex: def.phiStackIndex,
+	}
 }
 
 // MIRInterpreter executes MIRBasicBlocks produced by CFG.Parse().
@@ -28,7 +51,7 @@ type MIRInterpreter struct {
 	cfg *CFG
 
 	// results stores computed values for MIR definitions.
-	results map[*MIR]*uint256.Int
+	results map[mirDefKey]*uint256.Int
 
 	// simple linear memory model
 	mem []byte
@@ -44,6 +67,7 @@ type MIRInterpreter struct {
 	// minimal state for SLOAD/SSTORE gas + semantics
 	contractAddr common.Address
 	callerAddr   common.Address
+	originAddr   common.Address
 	callValue    *uint256.Int
 	state        StateBackend
 
@@ -58,12 +82,18 @@ type MIRInterpreter struct {
 
 	// Context for LOGs
 	blockNumber uint64
+
+	// Debug: last executed EVM pc (best-effort)
+	lastEvmPC uint
+
+	// Optional debug hook (used by tests/tools): called for each executed MIR instruction.
+	stepHook func(evmPC uint, evmOp byte, op MirOperation)
 }
 
 func NewMIRInterpreter(cfg *CFG) *MIRInterpreter {
 	it := &MIRInterpreter{
 		cfg:            cfg,
-		results:        make(map[*MIR]*uint256.Int, 4096),
+		results:        make(map[mirDefKey]*uint256.Int, 4096),
 		mem:            nil,
 		validJumpDests: nil,
 		// Default to "Frontier-like" rules (all false). A real fullnode MUST set rules
@@ -74,17 +104,51 @@ func NewMIRInterpreter(cfg *CFG) *MIRInterpreter {
 		memLastGasFee: 0,
 		contractAddr:  common.Address{},
 		callerAddr:    common.Address{},
+		originAddr:    common.Address{},
 		callValue:     uint256.NewInt(0),
 		state:         NewInMemoryState(),
 		callData:      nil,
 		returnData:    nil,
 		callCreate:    NoopCallCreateBackend{},
 		refundApplied: false,
+		lastEvmPC:     0,
+		stepHook:      nil,
 	}
 	if cfg != nil {
 		it.validJumpDests = cfg.JumpDests()
 	}
 	return it
+}
+
+func (it *MIRInterpreter) SetStepHook(h func(evmPC uint, evmOp byte, op MirOperation)) {
+	it.stepHook = h
+}
+
+func (it *MIRInterpreter) setResult(def *MIR, v *uint256.Int) {
+	if it == nil {
+		return
+	}
+	it.results[keyForDef(def)] = v
+}
+
+func (it *MIRInterpreter) getResult(def *MIR) (*uint256.Int, bool) {
+	if it == nil {
+		return nil, false
+	}
+	r, ok := it.results[keyForDef(def)]
+	return r, ok
+}
+
+func (it *MIRInterpreter) invalidateBlockResults(b *MIRBasicBlock) {
+	if it == nil || b == nil {
+		return
+	}
+	for _, m := range b.instructions {
+		if m == nil {
+			continue
+		}
+		delete(it.results, keyForDef(m))
+	}
 }
 
 // SetGasLimit enables out-of-gas checking. If limit==0, gas is tracked but never errors.
@@ -114,6 +178,10 @@ func (it *MIRInterpreter) SetContractAddress(addr common.Address) {
 
 func (it *MIRInterpreter) SetCallerAddress(addr common.Address) {
 	it.callerAddr = addr
+}
+
+func (it *MIRInterpreter) SetOriginAddress(addr common.Address) {
+	it.originAddr = addr
 }
 
 func (it *MIRInterpreter) SetCallValue(v *uint256.Int) {
@@ -188,6 +256,10 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 				prev, cur = cur, children[0]
 				break
 			}
+			it.lastEvmPC = m.evmPC
+			if it.stepHook != nil {
+				it.stepHook(m.evmPC, m.evmOp, m.op)
+			}
 
 			switch m.op {
 			case MirPHI:
@@ -195,7 +267,7 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 				if err != nil {
 					return it.finishResult(ExecResult{Err: err})
 				}
-				it.results[m] = v
+				it.setResult(m, v)
 
 			case MirPOP:
 				// effect already modeled by IR; no runtime action needed here
@@ -277,7 +349,7 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 						out.Clear()
 					}
 				}
-				it.results[m] = out
+				it.setResult(m, out)
 
 			case MirNOT, MirISZERO:
 				a, err := it.evalUnary(m)
@@ -295,7 +367,7 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 						out.Clear()
 					}
 				}
-				it.results[m] = out
+				it.setResult(m, out)
 
 			case MirMLOAD:
 				off, err := it.evalOperand(m, 0)
@@ -308,7 +380,7 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 				o := int(off.Uint64())
 				it.ensureMem(o + 32)
 				word := it.mem[o : o+32]
-				it.results[m] = uint256.NewInt(0).SetBytes(word)
+				it.setResult(m, uint256.NewInt(0).SetBytes(word))
 
 			case MirMSTORE:
 				off, err := it.evalOperand(m, 0)
@@ -346,7 +418,7 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 				it.mem[o] = byte(val.Uint64() & 0xff)
 
 			case MirMSIZE:
-				it.results[m] = uint256.NewInt(0).SetUint64(uint64(len(it.mem)))
+				it.setResult(m, uint256.NewInt(0).SetUint64(uint64(len(it.mem))))
 
 			case MirKECCAK256:
 				off, err := it.evalOperand(m, 0)
@@ -367,7 +439,45 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 				}
 				it.ensureMem(o + n)
 				h := crypto.Keccak256(it.mem[o : o+n])
-				it.results[m] = uint256.NewInt(0).SetBytes(h)
+				it.setResult(m, uint256.NewInt(0).SetBytes(h))
+
+			case MirADDRESS:
+				it.setResult(m, uint256.NewInt(0).SetBytes(it.contractAddr.Bytes()))
+
+			case MirORIGIN:
+				it.setResult(m, uint256.NewInt(0).SetBytes(it.originAddr.Bytes()))
+
+			case MirCALLER:
+				it.setResult(m, uint256.NewInt(0).SetBytes(it.callerAddr.Bytes()))
+
+			case MirCALLVALUE:
+				if it.callValue == nil {
+					it.setResult(m, uint256.NewInt(0))
+				} else {
+					it.setResult(m, uint256.NewInt(0).Set(it.callValue))
+				}
+
+			case MirCALLDATALOAD:
+				off, err := it.evalOperand(m, 0)
+				if err != nil {
+					return it.finishResult(ExecResult{Err: err})
+				}
+				o := int(off.Uint64())
+				var word [32]byte
+				if o < 0 {
+					o = 0
+				}
+				if it.callData != nil && o < len(it.callData) {
+					end := o + 32
+					if end > len(it.callData) {
+						end = len(it.callData)
+					}
+					copy(word[:], it.callData[o:end])
+				}
+				it.setResult(m, uint256.NewInt(0).SetBytes(word[:]))
+
+			case MirCALLDATASIZE:
+				it.setResult(m, uint256.NewInt(0).SetUint64(uint64(len(it.callData))))
 
 			case MirSLOAD:
 				keyU, err := it.evalOperand(m, 0)
@@ -382,7 +492,7 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 				if it.state != nil {
 					hv = it.state.GetState(it.contractAddr, slot)
 				}
-				it.results[m] = uint256.NewInt(0).SetBytes(hv[:])
+				it.setResult(m, uint256.NewInt(0).SetBytes(hv[:]))
 
 			case MirSSTORE:
 				keyU, err := it.evalOperand(m, 0)
@@ -481,11 +591,11 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 					return it.finishResult(ExecResult{Err: err})
 				}
 				if it.state == nil {
-					it.results[m] = uint256.NewInt(0)
+					it.setResult(m, uint256.NewInt(0))
 					break
 				}
 				bal := it.state.GetBalance(addr)
-				it.results[m] = uint256.NewInt(0).SetBytes(bal[:])
+				it.setResult(m, uint256.NewInt(0).SetBytes(bal[:]))
 
 			case MirEXTCODESIZE:
 				addr, err := it.evalAddressOperand(m, 0)
@@ -496,10 +606,10 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 					return it.finishResult(ExecResult{Err: err})
 				}
 				if it.state == nil {
-					it.results[m] = uint256.NewInt(0)
+					it.setResult(m, uint256.NewInt(0))
 					break
 				}
-				it.results[m] = uint256.NewInt(0).SetUint64(uint64(it.state.GetCodeSize(addr)))
+				it.setResult(m, uint256.NewInt(0).SetUint64(uint64(it.state.GetCodeSize(addr))))
 
 			case MirEXTCODEHASH:
 				addr, err := it.evalAddressOperand(m, 0)
@@ -510,11 +620,11 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 					return it.finishResult(ExecResult{Err: err})
 				}
 				if it.state == nil {
-					it.results[m] = uint256.NewInt(0)
+					it.setResult(m, uint256.NewInt(0))
 					break
 				}
 				h := it.state.GetCodeHash(addr)
-				it.results[m] = uint256.NewInt(0).SetBytes(h[:])
+				it.setResult(m, uint256.NewInt(0).SetBytes(h[:]))
 
 			case MirEXTCODECOPY:
 				// Operands: address, destOffset, codeOffset, size
@@ -653,21 +763,21 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 				if err != nil {
 					return it.finishResult(ExecResult{Err: err})
 				}
-				it.results[m] = uint256.NewInt(0).SetUint64(ok)
+				it.setResult(m, uint256.NewInt(0).SetUint64(ok))
 
 			case MirCREATE:
 				addr, err := it.execCreateLike(m, false)
 				if err != nil {
 					return it.finishResult(ExecResult{Err: err})
 				}
-				it.results[m] = uint256.NewInt(0).SetBytes(addr.Bytes())
+				it.setResult(m, uint256.NewInt(0).SetBytes(addr.Bytes()))
 
 			case MirCREATE2:
 				addr, err := it.execCreateLike(m, true)
 				if err != nil {
 					return it.finishResult(ExecResult{Err: err})
 				}
-				it.results[m] = uint256.NewInt(0).SetBytes(addr.Bytes())
+				it.setResult(m, uint256.NewInt(0).SetBytes(addr.Bytes()))
 
 			case MirJUMP:
 				dest, err := it.evalOperand(m, 0)
@@ -691,8 +801,8 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 				if err != nil {
 					return it.finishResult(ExecResult{Err: err})
 				}
+				target := uint(dest.Uint64())
 				if !cond.IsZero() {
-					target := uint(dest.Uint64())
 					nb, err := it.resolveBB(cur, target)
 					if err != nil {
 						return it.finishResult(ExecResult{Err: err})
@@ -700,17 +810,28 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 					prev, cur = cur, nb
 					break
 				}
-				// fallthrough: prefer a child whose firstPC == evmPC+1, else first child
+				// fallthrough: prefer the non-target child when we have a 2-way branch.
 				ftPC := m.evmPC + 1
 				var ft *MIRBasicBlock
-				for _, ch := range cur.Children() {
-					if ch != nil && ch.firstPC == ftPC {
-						ft = ch
-						break
+				children := cur.Children()
+				if len(children) == 2 {
+					// Prefer the successor that is not the jump target.
+					if children[0] != nil && children[0].firstPC != target {
+						ft = children[0]
+					} else if children[1] != nil && children[1].firstPC != target {
+						ft = children[1]
 					}
 				}
 				if ft == nil {
-					children := cur.Children()
+					// Fallback: choose the child whose firstPC == evmPC+1, else first child.
+					for _, ch := range children {
+						if ch != nil && ch.firstPC == ftPC {
+							ft = ch
+							break
+						}
+					}
+				}
+				if ft == nil {
 					if len(children) == 0 {
 						return it.finishResult(ExecResult{HaltOp: MirSTOP})
 					}
@@ -720,6 +841,7 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 				if cur != nil && ft != nil && it.cfg != nil {
 					it.cfg.connectEdge(cur, ft, cur.ExitStack())
 					if !ft.built && len(ft.instructions) > 0 {
+						it.invalidateBlockResults(ft)
 						ft.ResetForRebuild(true)
 					}
 					if !ft.built {
@@ -748,7 +870,7 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 				it.ensureMem(o + n)
 				out := make([]byte, n)
 				copy(out, it.mem[o:o+n])
-				return it.finishResult(ExecResult{HaltOp: MirRETURN, ReturnData: out})
+				return it.finishResult(ExecResult{HaltOp: MirRETURN, ReturnData: out, ReturnOffset: off.Uint64(), ReturnSize: sz.Uint64()})
 			case MirREVERT:
 				off, err := it.evalOperand(m, 0)
 				if err != nil {
@@ -770,7 +892,7 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 				if it.state != nil && snap >= 0 {
 					it.state.RevertToSnapshot(snap)
 				}
-				return it.finishResult(ExecResult{HaltOp: MirREVERT, ReturnData: out, Err: vm.ErrExecutionReverted})
+				return it.finishResult(ExecResult{HaltOp: MirREVERT, ReturnData: out, Err: vm.ErrExecutionReverted, ReturnOffset: off.Uint64(), ReturnSize: sz.Uint64()})
 
 			case MirSELFDESTRUCT:
 				beneficiary, err := it.evalAddressOperand(m, 0)
@@ -821,6 +943,7 @@ func (it *MIRInterpreter) resolveBB(from *MIRBasicBlock, targetPC uint) (*MIRBas
 	// Ensure block is (re)built if it was invalidated by new incoming stacks.
 	for i := 0; i < 8 && !nb.built; i++ {
 		if len(nb.instructions) > 0 {
+			it.invalidateBlockResults(nb)
 			nb.ResetForRebuild(true)
 		}
 		if err := it.cfg.buildBasicBlock(nb, it.validJumpDests); err != nil {
@@ -834,16 +957,19 @@ func (it *MIRInterpreter) ensureMem(n int) {
 	if n <= 0 {
 		return
 	}
-	if len(it.mem) >= n {
+	// EVM memory expands in 32-byte words. Keep len(mem) word-aligned so MSIZE matches geth.
+	want := ((n + 31) / 32) * 32
+	if len(it.mem) >= want {
 		return
 	}
-	// grow to n
-	newMem := make([]byte, n)
+	// grow to want
+	newMem := make([]byte, want)
 	copy(newMem, it.mem)
 	it.mem = newMem
 }
 
 func (it *MIRInterpreter) finishResult(r ExecResult) ExecResult {
+	r.LastEVMPC = it.lastEvmPC
 	// Apply tx-level refund cap once, on normal halts.
 	if !it.refundApplied && r.Err == nil {
 		switch r.HaltOp {
@@ -1082,11 +1208,29 @@ func (it *MIRInterpreter) chargeExpDynamicGas(m *MIR) error {
 	if bits > 0 {
 		bytes = uint64((bits + 7) / 8)
 	}
-	dyn := bytes * params.ExpByteGas
-	if bytes != 0 && dyn/bytes != params.ExpByteGas {
+	// Fork-dependent ExpByte cost (EIP-158 repricing).
+	expByteGas := params.ExpByteFrontier
+	if it.chainRules.IsEIP158 {
+		expByteGas = params.ExpByteEIP158
+	}
+	dyn := bytes * expByteGas
+	if bytes != 0 && dyn/bytes != expByteGas {
 		return errors.New("gas uint64 overflow")
 	}
-	return it.chargeGas(dyn)
+	// EXP base cost handling:
+	// - Some jump tables encode params.ExpGas in the opcode's constantGas.
+	// - Others encode it in the dynamic gas function.
+	// MIR charges block-constant gas via ConstantGasForOp, so we add ExpGas here only
+	// when the constantGas for EXP is 0 for the active ruleset.
+	base := uint64(0)
+	if c, ok := vm.ConstantGasForOp(it.chainRules, vm.EXP); ok && c == 0 {
+		base = params.ExpGas
+	}
+	total := base + dyn
+	if total < dyn {
+		return errors.New("gas uint64 overflow")
+	}
+	return it.chargeGas(total)
 }
 
 func (it *MIRInterpreter) chargeCopyGas(size *uint256.Int) error {
@@ -1404,9 +1548,11 @@ func (it *MIRInterpreter) doCall(op MirOperation, gasReq *uint256.Int, to common
 		ret, returnGas, err = it.callCreate.StaticCall(it.contractAddr, to, args, gasForCallee)
 	}
 
-	// Refund unused gas back to caller (but never refund stipend)
-	if returnGas > gasToSend {
-		returnGas = gasToSend
+	// Refund unused gas back to caller.
+	// Note: geth refunds the leftover gas from the callee call, which includes any
+	// CALL stipend that was added to the callee gas.
+	if returnGas > gasForCallee {
+		returnGas = gasForCallee
 	}
 	it.refundGas(returnGas)
 
@@ -1750,7 +1896,7 @@ func (it *MIRInterpreter) evalValue(v *Value) (*uint256.Int, error) {
 		if v.def == nil {
 			return uint256.NewInt(0), nil
 		}
-		if r, ok := it.results[v.def]; ok && r != nil {
+		if r, ok := it.getResult(v.def); ok && r != nil {
 			return uint256.NewInt(0).Set(r), nil
 		}
 		return nil, fmt.Errorf("missing result for def op=%s pc=%d", v.def.op.String(), v.def.evmPC)

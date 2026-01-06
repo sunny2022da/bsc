@@ -50,6 +50,7 @@ func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]b
 	// Call context
 	it.SetContractAddress(contract.Address())
 	it.SetCallerAddress(contract.Caller())
+	it.SetOriginAddress(r.evm.Origin)
 	it.SetCallValue(contract.Value())
 	it.SetCallData(input)
 
@@ -61,5 +62,3 @@ func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]b
 	contract.Gas = res.GasLeft
 	return res.ReturnData, res.Err
 }
-
-

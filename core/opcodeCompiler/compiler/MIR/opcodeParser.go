@@ -126,9 +126,12 @@ func (c *CFG) Parse() error {
 			continue
 		}
 
-		// If we're rebuilding, clear previously generated MIR but preserve entry stack snapshot.
+		// If we're rebuilding, clear previously generated MIR and force entry-stack recompute.
+		// Preserving entryStack is unsafe because it can contain Value.def pointers to
+		// MIR instructions we are about to discard (e.g. PHIs), which leads to
+		// "missing result for def MirPHI" at runtime after rebuild.
 		if len(block.instructions) > 0 {
-			block.ResetForRebuild(true)
+			block.ResetForRebuild(false)
 		}
 
 		// Build the block (emit MIR instructions)
@@ -178,14 +181,28 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 		if len(incomings) == 0 {
 			return stack
 		}
-		// All incoming stacks must have identical height for valid EVM control-flow.
-		height := len(incomings[0])
-		for i := 1; i < len(incomings); i++ {
-			if len(incomings[i]) != height {
-				// Stack height mismatch at merge => invalid bytecode control-flow.
-				// Keep it strict to avoid producing nonsense PHIs.
-				return stack
+		// EVM requires identical stack height at merge points, but during dynamic CFG
+		// expansion (runtime backfill) we can temporarily observe incomplete/missing
+		// incoming snapshots. Instead of bailing out to an empty stack (which later
+		// causes silent Unknown->0 behavior), pad shorter stacks with Unknown values
+		// from the *bottom* so top-of-stack alignment is preserved.
+		height := 0
+		for i := 0; i < len(incomings); i++ {
+			if len(incomings[i]) > height {
+				height = len(incomings[i])
 			}
+		}
+		for i := 0; i < len(incomings); i++ {
+			if len(incomings[i]) == height {
+				continue
+			}
+			padded := make([]Value, height)
+			// Default Value is kind=Konst zero-ish; explicitly mark padding as Unknown.
+			for j := 0; j < height-len(incomings[i]); j++ {
+				padded[j] = Value{kind: Unknown}
+			}
+			copy(padded[height-len(incomings[i]):], incomings[i])
+			incomings[i] = padded
 		}
 
 		for i := 0; i < height; i++ {
@@ -265,10 +282,6 @@ func (c *CFG) buildBasicBlock(block *MIRBasicBlock, validJumpDests map[uint]bool
 		// Global tracking for MIR generation
 		currentEVMBuildPC = pc
 		currentEVMBuildOp = byte(op)
-		// Count every originating EVM opcode for gas parity bookkeeping
-		if block.evmOpCounts != nil {
-			block.evmOpCounts[byte(op)]++
-		}
 
 		// 2. Check for Basic Block Boundaries (Implicit)
 		// If we are NOT at the start of the block, but we hit a JUMPDEST,
@@ -285,6 +298,13 @@ func (c *CFG) buildBasicBlock(block *MIRBasicBlock, validJumpDests map[uint]bool
 
 			block.built = true
 			return nil
+		}
+
+		// Count every originating EVM opcode for gas parity bookkeeping.
+		// IMPORTANT: this must happen *after* the boundary split check above, otherwise
+		// we'd count a boundary JUMPDEST in the predecessor block and overcharge by 1 gas.
+		if block.evmOpCounts != nil {
+			block.evmOpCounts[byte(op)]++
 		}
 
 		// 2.5 Handle no-op JUMPDEST (valid instruction, may only appear at block start here)
