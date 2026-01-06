@@ -219,8 +219,9 @@ func TestSemantics_Call_WritesOutputAndSetsReturnData(t *testing.T) {
 	if res.Err != nil {
 		t.Fatalf("Run error: %v", res.Err)
 	}
-	if it.results[callMir] == nil || it.results[callMir].Uint64() != 1 {
-		t.Fatalf("expected CALL success=1, got %v", it.results[callMir])
+	got, ok := it.getResult(callMir)
+	if !ok || got == nil || got.Uint64() != 1 {
+		t.Fatalf("expected CALL success=1, got %v (ok=%v)", got, ok)
 	}
 	if len(it.returnData) != 3 || it.returnData[0] != 0xaa || it.returnData[1] != 0xbb || it.returnData[2] != 0xcc {
 		t.Fatalf("unexpected returnData: %x", it.returnData)

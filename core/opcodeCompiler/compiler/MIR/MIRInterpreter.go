@@ -33,6 +33,9 @@ type mirDefKey struct {
 	phiStackIndex int
 }
 
+// Shared immutable zero value to avoid allocations in hot paths.
+var u256Zero = new(uint256.Int)
+
 func keyForDef(def *MIR) mirDefKey {
 	if def == nil {
 		return mirDefKey{}
@@ -120,6 +123,36 @@ func NewMIRInterpreter(cfg *CFG) *MIRInterpreter {
 	return it
 }
 
+// ResetForRun clears per-execution state while keeping long-lived allocations (maps/slices)
+// so the interpreter can be safely reused (e.g. via sync.Pool) for performance.
+func (it *MIRInterpreter) ResetForRun(cfg *CFG) {
+	if it == nil {
+		return
+	}
+	it.cfg = cfg
+	if cfg != nil {
+		it.validJumpDests = cfg.JumpDests()
+	} else {
+		it.validJumpDests = nil
+	}
+	// Clear computed SSA results
+	if it.results != nil {
+		for k := range it.results {
+			delete(it.results, k)
+		}
+	}
+	// Reset memory but keep capacity
+	if it.mem != nil {
+		it.mem = it.mem[:0]
+	}
+	it.gasUsed = 0
+	it.memLastGasFee = 0
+	it.returnData = nil
+	it.callData = nil
+	it.refundApplied = false
+	it.lastEvmPC = 0
+}
+
 func (it *MIRInterpreter) SetStepHook(h func(evmPC uint, evmOp byte, op MirOperation)) {
 	it.stepHook = h
 }
@@ -186,10 +219,11 @@ func (it *MIRInterpreter) SetOriginAddress(addr common.Address) {
 
 func (it *MIRInterpreter) SetCallValue(v *uint256.Int) {
 	if v == nil {
-		it.callValue = uint256.NewInt(0)
+		it.callValue = u256Zero
 		return
 	}
-	it.callValue = uint256.NewInt(0).Set(v)
+	// Treat as immutable for the duration of the call.
+	it.callValue = v
 }
 
 func (it *MIRInterpreter) SetStateBackend(s StateBackend) {
@@ -209,8 +243,8 @@ func (it *MIRInterpreter) SetCallData(data []byte) {
 		it.callData = nil
 		return
 	}
-	it.callData = make([]byte, len(data))
-	copy(it.callData, data)
+	// NOTE: this is treated as read-only. Avoid copying for performance.
+	it.callData = data
 }
 
 // Run executes from the standard EVM entrypoint PC=0.
@@ -1859,23 +1893,23 @@ func (it *MIRInterpreter) evalPhi(cur, prev *MIRBasicBlock, phi *MIR) (*uint256.
 	}
 	if prev == nil {
 		// Entry block should not have PHI; treat as zero.
-		return uint256.NewInt(0), nil
+		return u256Zero, nil
 	}
 	in := cur.incomingStacks[prev]
 	if in == nil {
 		// Unknown predecessor: fallback to first operand
 		if len(phi.operands) == 0 {
-			return uint256.NewInt(0), nil
+			return u256Zero, nil
 		}
 		return it.evalValue(phi.operands[0])
 	}
 	if len(in) == 0 {
-		return uint256.NewInt(0), nil
+		return u256Zero, nil
 	}
 	// Map stack slot index from top to slice index (bottom->top)
 	idx := (len(in) - 1) - phi.phiStackIndex
 	if idx < 0 || idx >= len(in) {
-		return uint256.NewInt(0), nil
+		return u256Zero, nil
 	}
 	v := in[idx]
 	v.liveIn = true
@@ -1884,24 +1918,26 @@ func (it *MIRInterpreter) evalPhi(cur, prev *MIRBasicBlock, phi *MIR) (*uint256.
 
 func (it *MIRInterpreter) evalValue(v *Value) (*uint256.Int, error) {
 	if v == nil {
-		return uint256.NewInt(0), nil
+		return u256Zero, nil
 	}
 	switch v.kind {
 	case Konst:
 		if v.u != nil {
-			return uint256.NewInt(0).Set(v.u), nil
+			return v.u, nil
 		}
+		// Constants created via newValue(Konst, ...) should always have v.u set.
+		// Fall back to a decoding allocation if needed (e.g. for legacy-constructed Values).
 		return uint256.NewInt(0).SetBytes(v.payload), nil
 	case Variable, Arguments:
 		if v.def == nil {
-			return uint256.NewInt(0), nil
+			return u256Zero, nil
 		}
 		if r, ok := it.getResult(v.def); ok && r != nil {
-			return uint256.NewInt(0).Set(r), nil
+			return r, nil
 		}
 		return nil, fmt.Errorf("missing result for def op=%s pc=%d", v.def.op.String(), v.def.evmPC)
 	default:
-		return uint256.NewInt(0), nil
+		return u256Zero, nil
 	}
 }
 

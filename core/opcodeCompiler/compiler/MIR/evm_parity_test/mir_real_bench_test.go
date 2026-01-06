@@ -3,6 +3,7 @@ package evm_parity_test
 import (
 	"math/big"
 	"os"
+	goruntime "runtime"
 	"strings"
 	"testing"
 
@@ -15,6 +16,12 @@ import (
 	ethlog "github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/holiman/uint256"
+)
+
+var (
+	benchSinkRet []byte
+	benchSinkGas uint64
+	benchSinkErr error
 )
 
 // Configure logger to emit warnings/errors to stdout during benchmarks so MIR fallback logs are visible.
@@ -74,10 +81,15 @@ func BenchmarkMIRVsEVM_USDT(b *testing.B) {
 				addr := common.BytesToAddress([]byte("bench_usdt"))
 				evm.StateDB.CreateAccount(addr)
 				evm.StateDB.SetCode(addr, code)
+				// Warm-up to avoid counting one-time init work (e.g. jumpdest scanning) in the loop.
+				benchSinkRet, benchSinkGas, benchSinkErr = evm.Call(cfgBase.Origin, addr, input, cfgBase.GasLimit, uint256.NewInt(0))
+				goruntime.KeepAlive(benchSinkRet)
+				goruntime.KeepAlive(benchSinkGas)
+				goruntime.KeepAlive(benchSinkErr)
 				b.ReportAllocs()
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
-					_, _, _ = evm.Call(cfgBase.Origin, addr, input, cfgBase.GasLimit, uint256.NewInt(0))
+					benchSinkRet, benchSinkGas, benchSinkErr = evm.Call(cfgBase.Origin, addr, input, cfgBase.GasLimit, uint256.NewInt(0))
 				}
 			})
 		}
@@ -89,10 +101,15 @@ func BenchmarkMIRVsEVM_USDT(b *testing.B) {
 				addr := common.BytesToAddress([]byte("bench_usdt"))
 				evm.StateDB.CreateAccount(addr)
 				evm.StateDB.SetCode(addr, code)
+				// Warm-up to populate MIR CFG cache inside the runner (steady-state timing).
+				benchSinkRet, benchSinkGas, benchSinkErr = evm.Call(cfgMIR.Origin, addr, input, cfgMIR.GasLimit, uint256.NewInt(0))
+				goruntime.KeepAlive(benchSinkRet)
+				goruntime.KeepAlive(benchSinkGas)
+				goruntime.KeepAlive(benchSinkErr)
 				b.ReportAllocs()
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
-					_, _, _ = evm.Call(cfgMIR.Origin, addr, input, cfgMIR.GasLimit, uint256.NewInt(0))
+					benchSinkRet, benchSinkGas, benchSinkErr = evm.Call(cfgMIR.Origin, addr, input, cfgMIR.GasLimit, uint256.NewInt(0))
 				}
 			})
 		}
@@ -136,10 +153,10 @@ func BenchmarkMIRVsEVM_WBNB(b *testing.B) {
 
 	zeroAddress := make([]byte, 32)
 	methods := []struct {
-		name     string
-		selector []byte
-		args     [][]byte
-		callValue *uint256.Int
+		name       string
+		selector   []byte
+		args       [][]byte
+		callValue  *uint256.Int
 		fundOrigin *uint256.Int
 	}{
 		{"name", []byte{0x06, 0xfd, 0xde, 0x03}, nil, uint256.NewInt(0), uint256.NewInt(0)},
@@ -147,8 +164,13 @@ func BenchmarkMIRVsEVM_WBNB(b *testing.B) {
 		{"decimals", []byte{0x31, 0x3c, 0xe5, 0x67}, nil, uint256.NewInt(0), uint256.NewInt(0)},
 		{"totalSupply", []byte{0x18, 0x16, 0x0d, 0xdd}, nil, uint256.NewInt(0), uint256.NewInt(0)},
 		{"balanceOf", []byte{0x70, 0xa0, 0x82, 0x31}, [][]byte{zeroAddress}, uint256.NewInt(0), uint256.NewInt(0)},
-		// Include one stateful path in the benchmark corpus (deposit) with a fixed value.
-		{"deposit_1e18", []byte{0xd0, 0xe3, 0x0d, 0xb0}, nil, uint256.MustFromBig(new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil)), uint256.MustFromBig(new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil))},
+		// Include one stateful path in the benchmark corpus (deposit) with a fixed msg.value.
+		// IMPORTANT: fund the origin with a very large balance so the call doesn't fail-fast
+		// on the CanTransfer check after the first iteration.
+		{"deposit_1e18", []byte{0xd0, 0xe3, 0x0d, 0xb0}, nil,
+			uint256.MustFromBig(new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil)), // msg.value = 1e18
+			uint256.MustFromBig(new(big.Int).Exp(big.NewInt(10), big.NewInt(30), nil)), // fundOrigin = 1e30
+		},
 	}
 
 	for _, m := range methods {
@@ -167,10 +189,14 @@ func BenchmarkMIRVsEVM_WBNB(b *testing.B) {
 				if m.fundOrigin != nil && !m.fundOrigin.IsZero() {
 					evm.StateDB.AddBalance(cfgBase.Origin, m.fundOrigin, tracing.BalanceIncreaseGenesisBalance)
 				}
+				benchSinkRet, benchSinkGas, benchSinkErr = evm.Call(cfgBase.Origin, addr, input, cfgBase.GasLimit, m.callValue)
+				goruntime.KeepAlive(benchSinkRet)
+				goruntime.KeepAlive(benchSinkGas)
+				goruntime.KeepAlive(benchSinkErr)
 				b.ReportAllocs()
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
-					_, _, _ = evm.Call(cfgBase.Origin, addr, input, cfgBase.GasLimit, m.callValue)
+					benchSinkRet, benchSinkGas, benchSinkErr = evm.Call(cfgBase.Origin, addr, input, cfgBase.GasLimit, m.callValue)
 				}
 			})
 		}
@@ -185,14 +211,16 @@ func BenchmarkMIRVsEVM_WBNB(b *testing.B) {
 				if m.fundOrigin != nil && !m.fundOrigin.IsZero() {
 					evm.StateDB.AddBalance(cfgMIR.Origin, m.fundOrigin, tracing.BalanceIncreaseGenesisBalance)
 				}
+				benchSinkRet, benchSinkGas, benchSinkErr = evm.Call(cfgMIR.Origin, addr, input, cfgMIR.GasLimit, m.callValue)
+				goruntime.KeepAlive(benchSinkRet)
+				goruntime.KeepAlive(benchSinkGas)
+				goruntime.KeepAlive(benchSinkErr)
 				b.ReportAllocs()
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
-					_, _, _ = evm.Call(cfgMIR.Origin, addr, input, cfgMIR.GasLimit, m.callValue)
+					benchSinkRet, benchSinkGas, benchSinkErr = evm.Call(cfgMIR.Origin, addr, input, cfgMIR.GasLimit, m.callValue)
 				}
 			})
 		}
 	}
 }
-
-

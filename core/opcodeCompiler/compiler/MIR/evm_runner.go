@@ -2,8 +2,11 @@ package MIR
 
 import (
 	"fmt"
+	"sync"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/vm"
+	"github.com/ethereum/go-ethereum/crypto"
 )
 
 // EVMRunner adapts MIRInterpreter to the vm.ContractRunner interface so vm.EVM
@@ -14,10 +17,26 @@ import (
 // - Nested calls are delegated back into geth EVM via EVMCallCreateBackend.
 type EVMRunner struct {
 	evm *vm.EVM
+
+	mu       sync.RWMutex
+	cfgCache map[common.Hash]*CFG
+
+	itPool sync.Pool
+
+	stateBackend StateDBBackend
+	callBackend  EVMCallCreateBackend
 }
 
 func NewEVMRunner(evm *vm.EVM) *EVMRunner {
-	return &EVMRunner{evm: evm}
+	r := &EVMRunner{
+		evm:      evm,
+		cfgCache: make(map[common.Hash]*CFG),
+	}
+	// Pool interpreters to avoid per-call allocations (maps/slices). ResetForRun() clears state.
+	r.itPool.New = func() any { return NewMIRInterpreter(nil) }
+	r.stateBackend = StateDBBackend{db: evm.StateDB}
+	r.callBackend = EVMCallCreateBackend{evm: evm}
+	return r
 }
 
 func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]byte, error) {
@@ -33,11 +52,35 @@ func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]b
 		return nil, vm.ErrWriteProtection
 	}
 
-	cfg := NewCFG(contract.CodeHash, contract.Code)
-	if err := cfg.Parse(); err != nil {
-		return nil, err
+	codeHash := contract.CodeHash
+	if (codeHash == common.Hash{}) {
+		// Some call paths may not set CodeHash; derive it to make caching effective.
+		codeHash = crypto.Keccak256Hash(contract.Code)
 	}
-	it := NewMIRInterpreter(cfg)
+
+	r.mu.RLock()
+	cfg := r.cfgCache[codeHash]
+	r.mu.RUnlock()
+
+	if cfg == nil {
+		built := NewCFG(codeHash, contract.Code)
+		if err := built.Parse(); err != nil {
+			return nil, err
+		}
+		r.mu.Lock()
+		// Another goroutine may have populated it while we were building; keep the first.
+		if existing := r.cfgCache[codeHash]; existing != nil {
+			cfg = existing
+		} else {
+			r.cfgCache[codeHash] = built
+			cfg = built
+		}
+		r.mu.Unlock()
+	}
+
+	it := r.itPool.Get().(*MIRInterpreter)
+	it.ResetForRun(cfg)
+	defer r.itPool.Put(it)
 	it.SetGasLimit(contract.Gas)
 
 	// Fork rules + block context
@@ -55,8 +98,8 @@ func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]b
 	it.SetCallData(input)
 
 	// Fullnode backends
-	it.SetStateBackend(NewStateDBBackend(r.evm.StateDB))
-	it.SetCallCreateBackend(NewEVMCallCreateBackend(r.evm))
+	it.SetStateBackend(&r.stateBackend)
+	it.SetCallCreateBackend(&r.callBackend)
 
 	res := it.Run()
 	contract.Gas = res.GasLeft
