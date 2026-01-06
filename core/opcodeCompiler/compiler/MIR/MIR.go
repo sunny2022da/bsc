@@ -74,6 +74,7 @@ func newNopMIR(operation MirOperation, original_opnds []*Value) *MIR {
 // These are set in opcodeParser.buildBasicBlock before each MIR creation.
 var currentEVMBuildPC uint
 var currentEVMBuildOp byte
+
 // currentCFGBuild points at the CFG currently being built. Used to allocate MIR resIdx.
 // NOTE: CFG building already relies on package-level globals for EVM mapping, so this
 // is not concurrency-safe by design.
