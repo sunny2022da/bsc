@@ -173,9 +173,17 @@ func (b *MIRBasicBlock) CreateVoidMIR(op MirOperation) (mir *MIR) {
 func (b *MIRBasicBlock) appendMIR(mir *MIR) *MIR {
 	mir.idx = len(b.instructions)
 	mir.defBlockNum = b.blockNum
+	// Allocate a global result slot for this MIR (if we're in a CFG build context).
+	if currentCFGBuild != nil {
+		mir.resIdx = currentCFGBuild.allocResIdx()
+	}
 	// Attach EVM mapping captured by the CFG builder
 	mir.evmPC = currentEVMBuildPC
 	mir.evmOp = currentEVMBuildOp
+	// Register stable identity -> resIdx mapping (for rebuild-safe incoming stack resolution).
+	if currentCFGBuild != nil && currentCFGBuild.defKeyToResIdx != nil && mir.resIdx > 0 {
+		currentCFGBuild.defKeyToResIdx[keyForDef(mir)] = mir.resIdx
+	}
 	// Record that we emitted a MIR for this originating EVM opcode
 	if b.emittedOpCounts != nil {
 		b.emittedOpCounts[currentEVMBuildOp]++
@@ -197,7 +205,16 @@ func (b *MIRBasicBlock) appendMIR(mir *MIR) *MIR {
 			case Variable, Arguments:
 				mir.opKinds[i] = 1
 				if v.def != nil {
-					mir.opDefIdx[i] = v.def.idx
+					// Prefer rebuild-safe lookup via stable key mapping.
+					if currentCFGBuild != nil && currentCFGBuild.defKeyToResIdx != nil {
+						if ridx, ok := currentCFGBuild.defKeyToResIdx[keyForDef(v.def)]; ok {
+							mir.opDefIdx[i] = ridx
+						} else {
+							mir.opDefIdx[i] = v.def.resIdx
+						}
+					} else {
+						mir.opDefIdx[i] = v.def.resIdx
+					}
 				} else {
 					mir.opDefIdx[i] = -1
 				}

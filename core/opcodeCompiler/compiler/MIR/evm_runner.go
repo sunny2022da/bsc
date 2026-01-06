@@ -2,11 +2,13 @@ package MIR
 
 import (
 	"fmt"
+	"math/big"
 	"sync"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/params"
 )
 
 // EVMRunner adapts MIRInterpreter to the vm.ContractRunner interface so vm.EVM
@@ -25,6 +27,10 @@ type EVMRunner struct {
 
 	stateBackend StateDBBackend
 	callBackend  EVMCallCreateBackend
+
+	// Cached per-EVM block context (constant for this EVM instance).
+	blockNumber uint64
+	chainRules  params.Rules
 }
 
 func NewEVMRunner(evm *vm.EVM) *EVMRunner {
@@ -36,6 +42,16 @@ func NewEVMRunner(evm *vm.EVM) *EVMRunner {
 	r.itPool.New = func() any { return NewMIRInterpreter(nil) }
 	r.stateBackend = StateDBBackend{db: evm.StateDB}
 	r.callBackend = EVMCallCreateBackend{evm: evm}
+
+	// Cache rules for this EVM instance once (avoid per-call big.Int allocs + rules derivation).
+	bn := uint64(0)
+	if evm != nil && evm.Context.BlockNumber != nil {
+		bn = evm.Context.BlockNumber.Uint64()
+	}
+	r.blockNumber = bn
+	if evm != nil && evm.ChainConfig() != nil {
+		r.chainRules = evm.ChainConfig().Rules(new(big.Int).SetUint64(bn), evm.Context.Random != nil, evm.Context.Time)
+	}
 	return r
 }
 
@@ -83,12 +99,9 @@ func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]b
 	defer r.itPool.Put(it)
 	it.SetGasLimit(contract.Gas)
 
-	// Fork rules + block context
-	bn := uint64(0)
-	if r.evm.Context.BlockNumber != nil {
-		bn = r.evm.Context.BlockNumber.Uint64()
-	}
-	it.SetChainConfig(r.evm.ChainConfig(), bn, r.evm.Context.Random != nil, r.evm.Context.Time)
+	// Fork rules + block context (cached in runner)
+	it.blockNumber = r.blockNumber
+	it.SetChainRules(r.chainRules)
 
 	// Call context
 	it.SetContractAddress(contract.Address())

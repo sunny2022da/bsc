@@ -16,6 +16,13 @@ type CFG struct {
 	rawCode         []byte
 	basicBlocks     []*MIRBasicBlock
 	basicBlockCount uint
+	// nextResIdx allocates global MIR result slots for this CFG.
+	// Index 0 is reserved for "unassigned".
+	nextResIdx int
+	// defKeyToResIdx maps stable MIR def identity -> latest allocated resIdx.
+	// This is used to repair stale *MIR pointers captured in incoming stack snapshots
+	// across block rebuilds during CFG construction.
+	defKeyToResIdx map[mirDefKey]int
 
 	// Mapping from EVM PC to the BasicBlock starting at that PC
 	pcToBlock map[uint]*MIRBasicBlock
@@ -30,10 +37,21 @@ func NewCFG(hash common.Hash, code []byte) (c *CFG) {
 	c.rawCode = code
 	c.basicBlocks = []*MIRBasicBlock{}
 	c.basicBlockCount = 0
+	c.nextResIdx = 1
+	c.defKeyToResIdx = make(map[mirDefKey]int, 4096)
 
 	c.pcToBlock = make(map[uint]*MIRBasicBlock)
 	c.jumpDests = nil
 	return c
+}
+
+func (c *CFG) allocResIdx() int {
+	if c == nil {
+		return 0
+	}
+	idx := c.nextResIdx
+	c.nextResIdx++
+	return idx
 }
 
 // JumpDests returns the cached map of valid JUMPDEST PCs, computing it once if needed.
@@ -106,6 +124,10 @@ func (c *CFG) scanJumpDests() map[uint]bool {
 
 // Parse builds the Control Flow Graph from the raw EVM code.
 func (c *CFG) Parse() error {
+	// Set current CFG build context for MIR resIdx allocation.
+	currentCFGBuild = c
+	defer func() { currentCFGBuild = nil }()
+
 	// 1. Identify all valid JUMPDESTs (critical for security/validity)
 	// You can use a bitset or map for fast lookup.
 	validJumpDests := c.JumpDests()
@@ -270,6 +292,11 @@ func (c *CFG) connectEdge(parent, child *MIRBasicBlock, exitSnapshot []Value) {
 }
 
 func (c *CFG) buildBasicBlock(block *MIRBasicBlock, validJumpDests map[uint]bool) error {
+	// Set current CFG build context for MIR resIdx allocation.
+	// This also covers dynamic backfill builds invoked at runtime.
+	currentCFGBuild = c
+	defer func() { currentCFGBuild = nil }()
+
 	pc := block.firstPC
 	codeLen := uint(len(c.rawCode))
 

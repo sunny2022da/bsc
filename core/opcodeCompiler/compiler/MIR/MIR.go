@@ -4,6 +4,28 @@ import (
 	"github.com/holiman/uint256"
 )
 
+// mirDefKey is a stable identity for MIR definitions across block rebuilds.
+// It is used to map values captured in incoming stack snapshots (which may retain
+// stale *MIR pointers) back to the latest MIR resIdx for the same logical def.
+type mirDefKey struct {
+	defBlockNum   uint
+	evmPC         uint
+	op            MirOperation
+	phiStackIndex int
+}
+
+func keyForDef(def *MIR) mirDefKey {
+	if def == nil {
+		return mirDefKey{}
+	}
+	return mirDefKey{
+		defBlockNum:   def.defBlockNum,
+		evmPC:         def.evmPC,
+		op:            def.op,
+		phiStackIndex: def.phiStackIndex,
+	}
+}
+
 // MIR is register based intermediate representation
 type MIR struct {
 	op       MirOperation
@@ -11,6 +33,10 @@ type MIR struct {
 	meta     []byte
 	pc       *uint // Program counter of the original instruction (optional)
 	idx      int   // Index within its basic block, set by appendMIR
+	// resIdx is a global, per-CFG result slot index assigned during CFG build.
+	// It enables fast operand evaluation and dense result storage at runtime.
+	// 0 means "unassigned" (e.g. tests constructing MIR manually).
+	resIdx int
 	// Stable identity for fixpoint comparisons across rebuilds.
 	defBlockNum uint
 	// EVM mapping metadata (set during CFG build)
@@ -48,6 +74,10 @@ func newNopMIR(operation MirOperation, original_opnds []*Value) *MIR {
 // These are set in opcodeParser.buildBasicBlock before each MIR creation.
 var currentEVMBuildPC uint
 var currentEVMBuildOp byte
+// currentCFGBuild points at the CFG currently being built. Used to allocate MIR resIdx.
+// NOTE: CFG building already relies on package-level globals for EVM mapping, so this
+// is not concurrency-safe by design.
+var currentCFGBuild *CFG
 
 func newUnaryOpMIR(operation MirOperation, opnd *Value, stack *ValueStack) *MIR {
 	// todo clyde add peephole optimization later
