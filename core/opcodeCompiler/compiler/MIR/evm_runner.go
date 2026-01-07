@@ -126,6 +126,8 @@ func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]b
 	// IMPORTANT: Refund cap is applied by geth's state transition logic, not the runner.
 	// If MIR applies it internally, it will incorrectly refund against post-intrinsic call gas.
 	it.SetApplyRefundCapInFinish(false)
+	// EVM.Call/Create already wraps execution in a StateDB snapshot; avoid duplicating that work here.
+	it.SetManageStateSnapshots(false)
 	// Ensure we don't leak a previous hook across pooled interpreter instances.
 	if r.mirStepHookFactory != nil {
 		it.SetStepHook(r.mirStepHookFactory(it))

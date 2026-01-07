@@ -91,6 +91,10 @@ type MIRInterpreter struct {
 	// Optional debug hook (used by tests/tools): called for each executed MIR instruction.
 	stepHook func(evmPC uint, evmOp byte, op MirOperation)
 
+	// Optional debug hook (used by tools): called when resolving a JUMP/JUMPI target PC to a basic block.
+	// existed indicates whether the CFG already had a block entry for targetPC.
+	resolveHook func(fromFirstPC uint, fromEvmPC uint, targetPC uint, resolvedFirstPC uint, existed bool)
+
 	// Optional debug hook to inspect operands at runtime (used by tools/tests).
 	// Values are passed by value to avoid accidental mutation by the caller.
 	debugOperandHook func(evmPC uint, evmOp byte, op MirOperation, a uint256.Int, b uint256.Int)
@@ -106,6 +110,16 @@ type MIRInterpreter struct {
 	// Cached per-block suffix sums of constant gas for original EVM opcode stream.
 	// Indexed by basic block number; each entry is len(block.evmOps)+1 where suffix[i] is sum from i..end.
 	blockConstSuffix [][]uint64
+
+	// Cached per-block total constant gas for original EVM opcode stream.
+	// This avoids per-op charging overhead without allocating per-block suffix slices.
+	blockConstTotal      []uint64
+	blockConstTotalKnown []bool
+
+	// manageStateSnapshots controls whether MIRInterpreter snapshots/reverts state internally.
+	// When MIR runs as a vm runner inside geth, the outer EVM already snapshots/reverts around
+	// contract execution, so doing it again here is redundant and expensive.
+	manageStateSnapshots bool
 }
 
 func NewMIRInterpreter(cfg *CFG) *MIRInterpreter {
@@ -136,8 +150,11 @@ func NewMIRInterpreter(cfg *CFG) *MIRInterpreter {
 		refundApplied: false,
 		// Default to true for standalone/tests. Fullnode runner disables this.
 		applyRefundCapInFinish: true,
-		lastEvmPC:              0,
-		stepHook:               nil,
+		// Default to true for standalone/tests. Fullnode runner disables this because
+		// EVM.Call/Create already snapshot/revert around execution.
+		manageStateSnapshots: true,
+		lastEvmPC:            0,
+		stepHook:             nil,
 	}
 	if cfg != nil {
 		it.validJumpDests = cfg.JumpDests()
@@ -148,6 +165,16 @@ func NewMIRInterpreter(cfg *CFG) *MIRInterpreter {
 	}
 	it.rebuildConstGasTable()
 	return it
+}
+
+// SetManageStateSnapshots controls whether MIRInterpreter performs StateBackend Snapshot/Revert internally.
+// For geth integration (EVMRunner), set this to false because EVM.Call/Create already wraps execution
+// in a StateDB snapshot.
+func (it *MIRInterpreter) SetManageStateSnapshots(enabled bool) {
+	if it == nil {
+		return
+	}
+	it.manageStateSnapshots = enabled
 }
 
 // SetApplyRefundCapInFinish controls whether MIRInterpreter applies the tx-level refund cap
@@ -204,6 +231,7 @@ func (it *MIRInterpreter) ResetForRun(cfg *CFG) {
 		it.gen = 1
 	}
 
+	prevCfg := it.cfg
 	it.cfg = cfg
 	if cfg != nil {
 		it.validJumpDests = cfg.JumpDests()
@@ -213,6 +241,12 @@ func (it *MIRInterpreter) ResetForRun(cfg *CFG) {
 		it.ensureResultsCapacity(it.nextResIdx)
 	} else {
 		it.validJumpDests = nil
+	}
+	// If CFG changes (different contract), cached per-block gas tables are invalid.
+	if prevCfg != cfg {
+		it.blockConstSuffix = nil
+		it.blockConstTotal = nil
+		it.blockConstTotalKnown = nil
 	}
 	// Reset memory but keep capacity
 	if it.mem != nil {
@@ -229,12 +263,15 @@ func (it *MIRInterpreter) ResetForRun(cfg *CFG) {
 	it.debugOperandHook = nil
 	it.debugOperandHookEx = nil
 	it.debugKeccakHook = nil
-	// Reset per-run cached suffix tables (cheap; slices will be reused across blocks within this run).
-	it.blockConstSuffix = nil
 }
 
 func (it *MIRInterpreter) SetStepHook(h func(evmPC uint, evmOp byte, op MirOperation)) {
 	it.stepHook = h
+}
+
+// SetResolveHook installs an optional hook invoked during JUMP/JUMPI resolution.
+func (it *MIRInterpreter) SetResolveHook(h func(fromFirstPC uint, fromEvmPC uint, targetPC uint, resolvedFirstPC uint, existed bool)) {
+	it.resolveHook = h
 }
 
 // SetDebugOperandHook registers a hook that receives selected opcode operands during execution.
@@ -249,6 +286,24 @@ func (it *MIRInterpreter) SetDebugOperandHookEx(h func(evmPC uint, evmOp byte, o
 
 func (it *MIRInterpreter) SetDebugKeccakHook(h func(evmPC uint, off uint64, sz uint64, data []byte)) {
 	it.debugKeccakHook = h
+}
+
+// CurrentBlockFirstPC returns the current basic block start pc (best-effort; 0 if unknown).
+// This is intended for debugging/tracing tools.
+func (it *MIRInterpreter) CurrentBlockFirstPC() uint {
+	if it == nil || it.curBlock == nil {
+		return 0
+	}
+	return it.curBlock.FirstPC()
+}
+
+// CurrentBlock returns the currently executing basic block (best-effort; nil if unknown).
+// Intended for debugging/tracing tools.
+func (it *MIRInterpreter) CurrentBlock() *MIRBasicBlock {
+	if it == nil {
+		return nil
+	}
+	return it.curBlock
 }
 
 func (it *MIRInterpreter) setResult(def *MIR, v *uint256.Int) {
@@ -414,7 +469,7 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 	// Snapshot state so we can revert on REVERT or any fatal error, matching geth semantics.
 	// NOTE: This snapshot includes refund counter/access list/logs via StateDB journaling.
 	snap := -1
-	if it.state != nil {
+	if it.manageStateSnapshots && it.state != nil {
 		snap = it.state.Snapshot()
 	}
 	cur := it.cfg.pcToBlock[entryPC]
@@ -445,6 +500,7 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 			return it.finishResult(ExecResult{Err: err})
 		}
 
+	execBlock:
 		for {
 			m := cur.GetNextOp()
 			if m == nil {
@@ -455,7 +511,7 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 				}
 				// Deterministic: fallthrough to the first child (for non-terminator blocks).
 				prev, cur = cur, children[0]
-				break
+				break execBlock
 			}
 			it.lastEvmPC = m.evmPC
 			it.curBlock = cur
@@ -471,12 +527,28 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 					if err == nil && a != nil && b != nil {
 						it.debugOperandHook(m.evmPC, m.evmOp, m.op, *a, *b)
 					}
+				case MirSLOAD:
+					k, err := it.evalOperand(m, 0)
+					if err == nil && k != nil {
+						it.debugOperandHook(m.evmPC, m.evmOp, m.op, *k, uint256.Int{})
+					}
+				case MirSSTORE:
+					k, err1 := it.evalOperand(m, 0)
+					v, err2 := it.evalOperand(m, 1)
+					if err1 == nil && err2 == nil && k != nil && v != nil {
+						it.debugOperandHook(m.evmPC, m.evmOp, m.op, *k, *v)
+					}
 				case MirJUMP:
 					d, err := it.evalOperand(m, 0)
 					if err == nil && d != nil {
 						it.debugOperandHook(m.evmPC, m.evmOp, m.op, *d, uint256.Int{})
 					}
 				case MirGT:
+					a, b, err := it.evalBinary(m)
+					if err == nil && a != nil && b != nil {
+						it.debugOperandHook(m.evmPC, m.evmOp, m.op, *a, *b)
+					}
+				case MirLT:
 					a, b, err := it.evalBinary(m)
 					if err == nil && a != nil && b != nil {
 						it.debugOperandHook(m.evmPC, m.evmOp, m.op, *a, *b)
@@ -810,6 +882,12 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 					hv = it.state.GetState(it.contractAddr, slot)
 				}
 				it.resultSlot(m).SetBytes(hv[:])
+				// Optional targeted debug: expose the loaded value (post-read).
+				if it.debugOperandHook != nil && keyU != nil {
+					var vv uint256.Int
+					vv.SetBytes(hv[:])
+					it.debugOperandHook(m.evmPC, m.evmOp, m.op, *keyU, vv)
+				}
 
 			case MirSSTORE:
 				keyU, err := it.evalOperand(m, 0)
@@ -1108,12 +1186,21 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 					return it.finishResult(ExecResult{Err: err})
 				}
 				target := uint(dest.Uint64())
+				// Fast path: static CFG edge already exists.
+				if cur != nil {
+					for _, ch := range cur.Children() {
+						if ch != nil && ch.firstPC == target {
+							prev, cur = cur, ch
+							break execBlock
+						}
+					}
+				}
 				nb, err := it.resolveBB(cur, target)
 				if err != nil {
 					return it.finishResult(ExecResult{Err: err})
 				}
 				prev, cur = cur, nb
-				break
+				break execBlock
 
 			case MirJUMPI:
 				dest, err := it.evalOperand(m, 0)
@@ -1126,12 +1213,21 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 				}
 				target := uint(dest.Uint64())
 				if !cond.IsZero() {
+					// Fast path: static CFG edge already exists.
+					if cur != nil {
+						for _, ch := range cur.Children() {
+							if ch != nil && ch.firstPC == target {
+								prev, cur = cur, ch
+								break execBlock
+							}
+						}
+					}
 					nb, err := it.resolveBB(cur, target)
 					if err != nil {
 						return it.finishResult(ExecResult{Err: err})
 					}
 					prev, cur = cur, nb
-					break
+					break execBlock
 				}
 				// fallthrough: prefer the non-target child when we have a 2-way branch.
 				ftPC := m.evmPC + 1
@@ -1160,19 +1256,19 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 					}
 					ft = children[0]
 				}
-				// Ensure we record incoming stack for correct PHI evaluation on fallthrough.
+				// Avoid CFG churn on steady-state fallthrough: edge is already known for static JUMPI.
+				// Only record an edge if this predecessor wasn't seen before (dynamic CFG expansion case).
 				if cur != nil && ft != nil && it.cfg != nil {
-					it.cfg.connectEdge(cur, ft, cur.ExitStack())
-					if !ft.built && len(ft.instructions) > 0 {
-						it.invalidateBlockResults(ft)
-						ft.ResetForRebuild(true)
-					}
-					if !ft.built {
-						_ = it.cfg.buildBasicBlock(ft, it.validJumpDests)
+					if ft.incomingStacks == nil {
+						it.cfg.connectEdge(cur, ft, cur.ExitStack())
+					} else {
+						if _, ok := ft.incomingStacks[cur]; !ok {
+							it.cfg.connectEdge(cur, ft, cur.ExitStack())
+						}
 					}
 				}
 				prev, cur = cur, ft
-				break
+				break execBlock
 
 			case MirSTOP:
 				return it.finishResult(ExecResult{HaltOp: MirSTOP})
@@ -1212,7 +1308,7 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 				out := make([]byte, n)
 				copy(out, it.mem[o:o+n])
 				// Revert state changes and keep leftover gas.
-				if it.state != nil && snap >= 0 {
+				if it.manageStateSnapshots && it.state != nil && snap >= 0 {
 					it.state.RevertToSnapshot(snap)
 				}
 				return it.finishResult(ExecResult{HaltOp: MirREVERT, ReturnData: out, Err: vm.ErrExecutionReverted, ReturnOffset: off.Uint64(), ReturnSize: sz.Uint64()})
@@ -1230,7 +1326,7 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 
 			default:
 				// Fatal error: revert and consume all gas.
-				if it.state != nil && snap >= 0 {
+				if it.manageStateSnapshots && it.state != nil && snap >= 0 {
 					it.state.RevertToSnapshot(snap)
 				}
 				return it.finishResult(ExecResult{Err: fmt.Errorf("unimplemented MIR op: %s", m.op.String())})
@@ -1255,9 +1351,20 @@ func (it *MIRInterpreter) resolveBB(from *MIRBasicBlock, targetPC uint) (*MIRBas
 	if it.validJumpDests != nil && !it.validJumpDests[targetPC] {
 		return nil, fmt.Errorf("invalid jumpdest 0x%x", targetPC)
 	}
+	existed := false
 	nb := it.cfg.pcToBlock[targetPC]
+	if nb != nil {
+		existed = true
+	}
 	if nb == nil {
 		nb = it.cfg.getOrCreateBlock(targetPC)
+	}
+	if it.resolveHook != nil {
+		fromPC := uint(0)
+		if from != nil {
+			fromPC = from.FirstPC()
+		}
+		it.resolveHook(fromPC, it.curEvmPC, targetPC, nb.FirstPC(), existed)
 	}
 	// Record incoming stack snapshot for PHI evaluation.
 	if from != nil {
@@ -1275,7 +1382,17 @@ func (it *MIRInterpreter) ensureMem(n int) {
 	if len(it.mem) >= want {
 		return
 	}
-	// grow to want
+	// Grow to want, reusing capacity when possible.
+	//
+	// IMPORTANT: We must zero the newly-exposed bytes. Geth achieves this by appending a
+	// freshly zeroed slice. Do the same here; this avoids repeated allocations for small
+	// expansions in tight loops and is a major perf win for ABI-return heavy paths.
+	if cap(it.mem) >= want {
+		extra := want - len(it.mem)
+		it.mem = append(it.mem, make([]byte, extra)...)
+		return
+	}
+	// Allocate a fresh buffer sized to want (zeroed), and copy existing content.
 	newMem := make([]byte, want)
 	copy(newMem, it.mem)
 	it.mem = newMem
@@ -1410,24 +1527,14 @@ func (it *MIRInterpreter) chargeBlockConstantGas(b *MIRBasicBlock) error {
 	if b == nil {
 		return nil
 	}
-	if !it.constGasInit || it.constGasRules != it.chainRules {
-		it.rebuildConstGasTable()
+	// Charge the total constant gas once per block entry instead of per opcode.
+	// We intentionally do NOT build the suffix table here; suffixes are only needed
+	// if the contract actually executes GAS/CALL-family and we need gasLeftEffective().
+	total := it.ensureBlockConstTotal(b)
+	if total == 0 {
+		return nil
 	}
-	// Charge constant gas for the *original EVM opcode stream* in this basic block.
-	// This includes opcodes optimized away in MIR (e.g. PUSH/DUP/SWAP/NOP), and preserves
-	// exact ordering information via (pc,op) for GAS/call-gas semantics.
-	for _, e := range b.evmOps {
-		op := e.op
-		if !it.constGasKnown[int(op)] {
-			return fmt.Errorf("missing constant gas for evm opcode 0x%x", op)
-		}
-		if cost := it.constGas[int(op)]; cost != 0 {
-			if err := it.chargeGas(cost); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
+	return it.chargeGas(total)
 }
 
 // toWordSize matches geth's toWordSize: ceil(size/32).
@@ -2032,9 +2139,16 @@ func (it *MIRInterpreter) ensureBlockConstSuffix(b *MIRBasicBlock) []uint64 {
 	if it == nil || b == nil {
 		return nil
 	}
-	// Ensure const gas table is initialized for current rules.
+	// Ensure const gas table is initialized for current rules. If rules changed, invalidate caches.
 	if !it.constGasInit || it.constGasRules != it.chainRules {
 		it.rebuildConstGasTable()
+		// Cached per-block gas depends on constant schedule; drop and rebuild lazily.
+		it.blockConstSuffix = nil
+		if it.blockConstTotalKnown != nil {
+			for i := range it.blockConstTotalKnown {
+				it.blockConstTotalKnown[i] = false
+			}
+		}
 	}
 	// Allocate outer table lazily.
 	if it.blockConstSuffix == nil {
@@ -2063,6 +2177,53 @@ func (it *MIRInterpreter) ensureBlockConstSuffix(b *MIRBasicBlock) []uint64 {
 	}
 	it.blockConstSuffix[b.blockNum] = suf
 	return suf
+}
+
+func (it *MIRInterpreter) ensureBlockConstTotal(b *MIRBasicBlock) uint64 {
+	if it == nil || b == nil {
+		return 0
+	}
+	// Ensure const gas table is initialized for current rules. If rules changed, invalidate caches.
+	if !it.constGasInit || it.constGasRules != it.chainRules {
+		it.rebuildConstGasTable()
+		it.blockConstSuffix = nil
+		if it.blockConstTotalKnown != nil {
+			for i := range it.blockConstTotalKnown {
+				it.blockConstTotalKnown[i] = false
+			}
+		}
+	}
+	// Allocate per-block total cache lazily.
+	if it.blockConstTotal == nil || it.blockConstTotalKnown == nil {
+		n := 0
+		if it.cfg != nil {
+			n = int(it.cfg.basicBlockCount)
+		}
+		if n == 0 {
+			n = int(b.blockNum) + 1
+		}
+		it.blockConstTotal = make([]uint64, n)
+		it.blockConstTotalKnown = make([]bool, n)
+	} else if int(b.blockNum) >= len(it.blockConstTotal) {
+		need := int(b.blockNum) + 1
+		newTot := make([]uint64, need)
+		copy(newTot, it.blockConstTotal)
+		it.blockConstTotal = newTot
+		newKnown := make([]bool, need)
+		copy(newKnown, it.blockConstTotalKnown)
+		it.blockConstTotalKnown = newKnown
+	}
+	idx := int(b.blockNum)
+	if it.blockConstTotalKnown[idx] {
+		return it.blockConstTotal[idx]
+	}
+	var sum uint64
+	for _, e := range b.evmOps {
+		sum += it.constGas[int(e.op)]
+	}
+	it.blockConstTotal[idx] = sum
+	it.blockConstTotalKnown[idx] = true
+	return sum
 }
 
 // gasLeftEffective returns the gas remaining *as observed by the currently executing EVM opcode*,

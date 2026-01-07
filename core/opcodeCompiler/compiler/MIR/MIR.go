@@ -53,6 +53,30 @@ type MIR struct {
 	genStackDepth int            // stack depth at generation time (for debugging/dumps)
 }
 
+// Op returns the MIR operation opcode for this instruction.
+func (m *MIR) Op() MirOperation {
+	if m == nil {
+		return MirINVALID
+	}
+	return m.op
+}
+
+// EvmPC returns the originating EVM program counter (byte offset) for this MIR instruction.
+func (m *MIR) EvmPC() uint {
+	if m == nil {
+		return 0
+	}
+	return m.evmPC
+}
+
+// EvmOp returns the originating EVM opcode byte for this MIR instruction.
+func (m *MIR) EvmOp() byte {
+	if m == nil {
+		return 0
+	}
+	return m.evmOp
+}
+
 func newVoidMIR(operation MirOperation) *MIR {
 	mir := new(MIR)
 	mir.op = operation
