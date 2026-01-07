@@ -19,6 +19,7 @@ package vm
 import (
 	"errors"
 	"math/big"
+	"strings"
 	"sync/atomic"
 
 	"github.com/holiman/uint256"
@@ -31,6 +32,43 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/params"
 )
+
+// BSC system contracts. We keep the list here to avoid importing consensus/parlia
+// (and also avoid importing core/systemcontracts which depends on core/vm, causing an import cycle).
+//
+// Policy: MIR should never be used for these predeployed system contracts while we're doing
+// block-sync validation, since their behavior is consensus-critical and also tends to be
+// highly version-/fork-dependent.
+var parliaSystemContracts = map[common.Address]bool{
+	common.HexToAddress("0x0000000000000000000000000000000000001000"): true, // ValidatorContract
+	common.HexToAddress("0x0000000000000000000000000000000000001001"): true, // SlashContract
+	common.HexToAddress("0x0000000000000000000000000000000000001002"): true, // SystemRewardContract
+	common.HexToAddress("0x0000000000000000000000000000000000001003"): true, // LightClientContract
+	common.HexToAddress("0x0000000000000000000000000000000000001004"): true, // TokenHubContract
+	common.HexToAddress("0x0000000000000000000000000000000000001005"): true, // RelayerIncentivizeContract
+	common.HexToAddress("0x0000000000000000000000000000000000001006"): true, // RelayerHubContract
+	common.HexToAddress("0x0000000000000000000000000000000000001007"): true, // GovHubContract
+	common.HexToAddress("0x0000000000000000000000000000000000001008"): true, // TokenManagerContract
+
+	common.HexToAddress("0x0000000000000000000000000000000000002000"): true, // CrossChainContract
+	common.HexToAddress("0x0000000000000000000000000000000000002001"): true, // StakingContract
+	common.HexToAddress("0x0000000000000000000000000000000000002002"): true, // StakeHubContract
+	common.HexToAddress("0x0000000000000000000000000000000000002003"): true, // StakeCreditContract
+	common.HexToAddress("0x0000000000000000000000000000000000002004"): true, // GovernorContract
+	common.HexToAddress("0x0000000000000000000000000000000000002005"): true, // GovTokenContract
+	common.HexToAddress("0x0000000000000000000000000000000000002006"): true, // TimelockContract
+
+	common.HexToAddress("0x0000000000000000000000000000000000003000"): true, // TokenRecoverPortalContract
+}
+
+func isToSystemContract(to common.Address) bool { return parliaSystemContracts[to] }
+
+func isSystemContract(to *common.Address) bool {
+	if to == nil {
+		return false
+	}
+	return isToSystemContract(*to)
+}
 
 type (
 	// CanTransferFunc is the signature of a transfer guard function
@@ -299,13 +337,21 @@ func (evm *EVM) Call(caller common.Address, addr common.Address, input []byte, g
 			ret, err = nil, nil // gas is unchanged
 		} else {
 			// Optional MIR dispatch for top-level execution only.
-			if evm.shouldUseMIR() {
+			if evm.shouldUseMIR() && !isSystemContract(&addr) {
 				contract := GetContract(caller, addr, value, gas, evm.jumpDests)
 				defer ReturnContract(contract)
 				contract.IsSystemCall = isSystemCall(caller)
 				// IMPORTANT: run raw code (not optimized/super-instructions), since MIR parses EVM bytecode.
 				contract.SetCallCode(&addr, evm.resolveCodeHash(addr), code)
+				gasBefore := contract.Gas
 				ret, err = evm.runWithRunner(evm.mirRunner, contract, input, false)
+				// Safety valve: if MIR fails with an internal runtime/IR error, fall back to the native interpreter.
+				// This keeps block processing progressing while we iteratively turn mismatches into fixes.
+				if err != nil && (strings.Contains(err.Error(), "missing result for def") || strings.Contains(err.Error(), "unimplemented MIR op:")) {
+					contract.Gas = gasBefore
+					evm.UseBaseInterpreter()
+					ret, err = evm.interpreter.Run(contract, input, false)
+				}
 				gas = contract.Gas
 			} else if evm.Config.EnableOpcodeOptimizations {
 				addrCopy := addr

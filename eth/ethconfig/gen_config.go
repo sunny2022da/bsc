@@ -87,6 +87,7 @@ func (c Config) MarshalTOML() (interface{}, error) {
 		TxSyncMaxTimeout          time.Duration `toml:",omitempty"`
 		BlobExtraReserve          uint64
 		EnableOpcodeOptimizing    bool
+		EnableMIR                bool
 		EnableIncrSnapshots       bool
 		IncrSnapshotPath          string
 		IncrSnapshotBlockInterval uint64
@@ -165,6 +166,7 @@ func (c Config) MarshalTOML() (interface{}, error) {
 	enc.TxSyncMaxTimeout = c.TxSyncMaxTimeout
 	enc.BlobExtraReserve = c.BlobExtraReserve
 	enc.EnableOpcodeOptimizing = c.EnableOpcodeOptimizing
+	enc.EnableMIR = c.EnableMIR
 	enc.EnableIncrSnapshots = c.EnableIncrSnapshots
 	enc.IncrSnapshotPath = c.IncrSnapshotPath
 	enc.IncrSnapshotBlockInterval = c.IncrSnapshotBlockInterval
@@ -247,6 +249,7 @@ func (c *Config) UnmarshalTOML(unmarshal func(interface{}) error) error {
 		TxSyncMaxTimeout          *time.Duration `toml:",omitempty"`
 		BlobExtraReserve          *uint64
 		EnableOpcodeOptimizing    *bool
+		EnableMIR                 *bool
 		EnableIncrSnapshots       *bool
 		IncrSnapshotPath          *string
 		IncrSnapshotBlockInterval *uint64
@@ -465,6 +468,9 @@ func (c *Config) UnmarshalTOML(unmarshal func(interface{}) error) error {
 	}
 	if dec.EnableOpcodeOptimizing != nil {
 		c.EnableOpcodeOptimizing = *dec.EnableOpcodeOptimizing
+	}
+	if dec.EnableMIR != nil {
+		c.EnableMIR = *dec.EnableMIR
 	}
 	if dec.EnableIncrSnapshots != nil {
 		c.EnableIncrSnapshots = *dec.EnableIncrSnapshots

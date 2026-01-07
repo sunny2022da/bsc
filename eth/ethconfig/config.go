@@ -249,8 +249,12 @@ type Config struct {
 	// blob setting
 	BlobExtraReserve uint64
 
-	//opcode optimization setting
+	// opcode optimization setting
 	EnableOpcodeOptimizing bool
+
+	// EnableMIR enables the MIR contract runner (top-level execution only).
+	// This is plumbed into vm.Config.EnableMIR via eth/backend.go.
+	EnableMIR bool
 	// incremental snapshot config
 	EnableIncrSnapshots       bool
 	IncrSnapshotPath          string

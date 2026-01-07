@@ -251,9 +251,9 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 				vv := v // heap allocate per-operand
 				ops = append(ops, &vv)
 			}
-			phi := block.CreatePhiMIR(ops, stack)
 			// phiStackIndex is 0 for top-of-stack.
-			phi.phiStackIndex = (height - 1) - i
+			phiStackIndex := (height - 1) - i
+			block.CreatePhiMIR(ops, stack, phiStackIndex)
 		}
 		block.SetEntryStack(stack.data)
 		return stack
@@ -289,6 +289,36 @@ func (c *CFG) connectEdge(parent, child *MIRBasicBlock, exitSnapshot []Value) {
 	child.AddIncomingStack(parent, exitSnapshot)
 	child.SetEntryStack(nil)
 	child.built = false
+	// Conservative: when a block's incoming stack changes, its PHI set (and thus defs) can change,
+	// which can invalidate downstream blocks that captured stale defs. Mark descendants for rebuild
+	// so we don't attempt to execute with dangling def pointers.
+	c.markDescendantsForRebuild(child)
+}
+
+func (c *CFG) markDescendantsForRebuild(start *MIRBasicBlock) {
+	if start == nil {
+		return
+	}
+	visited := make(map[*MIRBasicBlock]struct{}, 32)
+	q := []*MIRBasicBlock{start}
+	visited[start] = struct{}{}
+	for len(q) > 0 {
+		b := q[0]
+		q = q[1:]
+		// Force rebuild on next entry.
+		b.built = false
+		b.SetEntryStack(nil)
+		for _, ch := range b.Children() {
+			if ch == nil {
+				continue
+			}
+			if _, ok := visited[ch]; ok {
+				continue
+			}
+			visited[ch] = struct{}{}
+			q = append(q, ch)
+		}
+	}
 }
 
 func (c *CFG) buildBasicBlock(block *MIRBasicBlock, validJumpDests map[uint]bool) error {
@@ -301,6 +331,14 @@ func (c *CFG) buildBasicBlock(block *MIRBasicBlock, validJumpDests map[uint]bool
 	codeLen := uint(len(c.rawCode))
 
 	// 1. Initialize Stack
+	// Ensure any PHIs created as part of entry stack construction get a stable EVM mapping
+	// (otherwise they may inherit a stale currentEVMBuildPC/currentEVMBuildOp from a previous block).
+	currentEVMBuildPC = pc
+	if pc < codeLen {
+		currentEVMBuildOp = c.rawCode[pc]
+	} else {
+		currentEVMBuildOp = 0
+	}
 	stack := c.getEntryStackForBlock(block)
 
 	for pc < codeLen {
@@ -333,6 +371,8 @@ func (c *CFG) buildBasicBlock(block *MIRBasicBlock, validJumpDests map[uint]bool
 		if block.evmOpCounts != nil {
 			block.evmOpCounts[byte(op)]++
 		}
+		// Also record the exact opcode stream (pc,op) for this block (used for GAS/call gas correctness).
+		block.recordEVMOp(pc, byte(op))
 
 		// 2.5 Handle no-op JUMPDEST (valid instruction, may only appear at block start here)
 		if op == compiler.JUMPDEST {

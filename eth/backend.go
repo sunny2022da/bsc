@@ -371,6 +371,7 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 				EnableWitnessStats:        config.EnableWitnessStats,
 				StatelessSelfValidation:   config.StatelessSelfValidation,
 				EnableOpcodeOptimizations: config.EnableOpcodeOptimizing,
+				EnableMIR:                 config.EnableMIR,
 			},
 			// Enables file journaling for the trie database. The journal files will be stored
 			// within the data directory. The corresponding paths will be either:

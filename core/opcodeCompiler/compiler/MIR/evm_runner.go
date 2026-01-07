@@ -31,6 +31,13 @@ type EVMRunner struct {
 	// Cached per-EVM block context (constant for this EVM instance).
 	blockNumber uint64
 	chainRules  params.Rules
+
+	// Optional per-step hook for MIR execution (used by tools/tests).
+	mirStepHook func(evmPC uint, evmOp byte, op MirOperation)
+
+	// Optional factory to build a step hook that can close over the interpreter instance
+	// (e.g., to also sample gasUsed/gasLeft). If set, it takes precedence over mirStepHook.
+	mirStepHookFactory func(it *MIRInterpreter) func(evmPC uint, evmOp byte, op MirOperation)
 }
 
 func NewEVMRunner(evm *vm.EVM) *EVMRunner {
@@ -53,6 +60,24 @@ func NewEVMRunner(evm *vm.EVM) *EVMRunner {
 		r.chainRules = evm.ChainConfig().Rules(new(big.Int).SetUint64(bn), evm.Context.Random != nil, evm.Context.Time)
 	}
 	return r
+}
+
+// SetMIRStepHook sets an optional hook called for each executed MIR instruction.
+// Passing nil disables it. This is intended for diagnostics and should not be enabled in production.
+func (r *EVMRunner) SetMIRStepHook(h func(evmPC uint, evmOp byte, op MirOperation)) {
+	if r == nil {
+		return
+	}
+	r.mirStepHook = h
+}
+
+// SetMIRStepHookFactory sets a hook factory that receives the per-run interpreter instance.
+// Passing nil disables it.
+func (r *EVMRunner) SetMIRStepHookFactory(f func(it *MIRInterpreter) func(evmPC uint, evmOp byte, op MirOperation)) {
+	if r == nil {
+		return
+	}
+	r.mirStepHookFactory = f
 }
 
 func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]byte, error) {
@@ -98,6 +123,15 @@ func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]b
 	it.ResetForRun(cfg)
 	defer r.itPool.Put(it)
 	it.SetGasLimit(contract.Gas)
+	// IMPORTANT: Refund cap is applied by geth's state transition logic, not the runner.
+	// If MIR applies it internally, it will incorrectly refund against post-intrinsic call gas.
+	it.SetApplyRefundCapInFinish(false)
+	// Ensure we don't leak a previous hook across pooled interpreter instances.
+	if r.mirStepHookFactory != nil {
+		it.SetStepHook(r.mirStepHookFactory(it))
+	} else {
+		it.SetStepHook(r.mirStepHook)
+	}
 
 	// Fork rules + block context (cached in runner)
 	it.blockNumber = r.blockNumber

@@ -73,6 +73,14 @@ type MIRInterpreter struct {
 
 	// tx-level refund application guard
 	refundApplied bool
+	// applyRefundCapInFinish controls whether MIRInterpreter applies the tx-level
+	// refund cap internally on STOP/RETURN/REVERT/SELFDESTRUCT.
+	//
+	// IMPORTANT: When MIR is used as a vm runner inside geth, the transaction-level
+	// refund cap is applied by state_transition, not the interpreter. In that mode,
+	// this must be disabled, otherwise MIR will "refund" against the post-intrinsic
+	// call gas only (causing gasUsed mismatches).
+	applyRefundCapInFinish bool
 
 	// Context for LOGs
 	blockNumber uint64
@@ -82,6 +90,22 @@ type MIRInterpreter struct {
 
 	// Optional debug hook (used by tests/tools): called for each executed MIR instruction.
 	stepHook func(evmPC uint, evmOp byte, op MirOperation)
+
+	// Optional debug hook to inspect operands at runtime (used by tools/tests).
+	// Values are passed by value to avoid accidental mutation by the caller.
+	debugOperandHook func(evmPC uint, evmOp byte, op MirOperation, a uint256.Int, b uint256.Int)
+	// Extended operand hook including operand source (def op/pc if the operand is a Variable).
+	debugOperandHookEx func(evmPC uint, evmOp byte, op MirOperation, a uint256.Int, b uint256.Int, aDefPC uint, bDefPC uint, aDefOp MirOperation, bDefOp MirOperation)
+	// Debug hook for KECCAK256 input bytes (truncated) to diagnose memory divergence.
+	debugKeccakHook func(evmPC uint, off uint64, sz uint64, data []byte)
+
+	// Execution cursor (for GAS/call-gas semantics when constant gas is precharged at block entry).
+	curBlock *MIRBasicBlock
+	curEvmPC uint
+
+	// Cached per-block suffix sums of constant gas for original EVM opcode stream.
+	// Indexed by basic block number; each entry is len(block.evmOps)+1 where suffix[i] is sum from i..end.
+	blockConstSuffix [][]uint64
 }
 
 func NewMIRInterpreter(cfg *CFG) *MIRInterpreter {
@@ -110,8 +134,10 @@ func NewMIRInterpreter(cfg *CFG) *MIRInterpreter {
 		returnData:    nil,
 		callCreate:    NoopCallCreateBackend{},
 		refundApplied: false,
-		lastEvmPC:     0,
-		stepHook:      nil,
+		// Default to true for standalone/tests. Fullnode runner disables this.
+		applyRefundCapInFinish: true,
+		lastEvmPC:              0,
+		stepHook:               nil,
 	}
 	if cfg != nil {
 		it.validJumpDests = cfg.JumpDests()
@@ -122,6 +148,15 @@ func NewMIRInterpreter(cfg *CFG) *MIRInterpreter {
 	}
 	it.rebuildConstGasTable()
 	return it
+}
+
+// SetApplyRefundCapInFinish controls whether MIRInterpreter applies the tx-level refund cap
+// internally at halt. Fullnode mode should set this to false.
+func (it *MIRInterpreter) SetApplyRefundCapInFinish(enabled bool) {
+	if it == nil {
+		return
+	}
+	it.applyRefundCapInFinish = enabled
 }
 
 func (it *MIRInterpreter) rebuildConstGasTable() {
@@ -189,10 +224,31 @@ func (it *MIRInterpreter) ResetForRun(cfg *CFG) {
 	it.callData = nil
 	it.refundApplied = false
 	it.lastEvmPC = 0
+	it.curBlock = nil
+	it.curEvmPC = 0
+	it.debugOperandHook = nil
+	it.debugOperandHookEx = nil
+	it.debugKeccakHook = nil
+	// Reset per-run cached suffix tables (cheap; slices will be reused across blocks within this run).
+	it.blockConstSuffix = nil
 }
 
 func (it *MIRInterpreter) SetStepHook(h func(evmPC uint, evmOp byte, op MirOperation)) {
 	it.stepHook = h
+}
+
+// SetDebugOperandHook registers a hook that receives selected opcode operands during execution.
+// Intended for diagnostics only.
+func (it *MIRInterpreter) SetDebugOperandHook(h func(evmPC uint, evmOp byte, op MirOperation, a uint256.Int, b uint256.Int)) {
+	it.debugOperandHook = h
+}
+
+func (it *MIRInterpreter) SetDebugOperandHookEx(h func(evmPC uint, evmOp byte, op MirOperation, a uint256.Int, b uint256.Int, aDefPC uint, bDefPC uint, aDefOp MirOperation, bDefOp MirOperation)) {
+	it.debugOperandHookEx = h
+}
+
+func (it *MIRInterpreter) SetDebugKeccakHook(h func(evmPC uint, off uint64, sz uint64, data []byte)) {
+	it.debugKeccakHook = h
 }
 
 func (it *MIRInterpreter) setResult(def *MIR, v *uint256.Int) {
@@ -265,6 +321,22 @@ func (it *MIRInterpreter) resultSlot(def *MIR) *uint256.Int {
 // SetGasLimit enables out-of-gas checking. If limit==0, gas is tracked but never errors.
 func (it *MIRInterpreter) SetGasLimit(limit uint64) {
 	it.gasLimit = limit
+}
+
+// GasLimit returns the current gas limit for this execution frame (0 means "unlimited").
+func (it *MIRInterpreter) GasLimit() uint64 {
+	if it == nil {
+		return 0
+	}
+	return it.gasLimit
+}
+
+// GasUsed returns the amount of gas consumed so far in the current frame.
+func (it *MIRInterpreter) GasUsed() uint64 {
+	if it == nil {
+		return 0
+	}
+	return it.gasUsed
 }
 
 // SetChainRules controls fork-dependent constant gas schedule. Defaults to Cancun.
@@ -352,6 +424,19 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 
 	var prev *MIRBasicBlock
 	for {
+		// Ensure the current block is built before executing it. This is critical for correctness
+		// when new incoming edges are discovered at runtime (dynamic jumps): we must never rebuild
+		// a block while it is actively executing, because that can invalidate PHI/results mid-run.
+		if cur != nil && !cur.built {
+			if len(cur.instructions) > 0 {
+				it.invalidateBlockResults(cur)
+				cur.ResetForRebuild(true)
+			}
+			if err := it.cfg.buildBasicBlock(cur, it.validJumpDests); err != nil {
+				return it.finishResult(ExecResult{Err: err})
+			}
+		}
+
 		// Reset instruction cursor for this block execution
 		cur.pos = 0
 
@@ -373,8 +458,98 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 				break
 			}
 			it.lastEvmPC = m.evmPC
+			it.curBlock = cur
+			it.curEvmPC = m.evmPC
 			if it.stepHook != nil {
 				it.stepHook(m.evmPC, m.evmOp, m.op)
+			}
+			if it.debugOperandHook != nil {
+				// Targeted operand capture for diagnosing control-flow divergence.
+				switch m.op {
+				case MirADD:
+					a, b, err := it.evalBinary(m)
+					if err == nil && a != nil && b != nil {
+						it.debugOperandHook(m.evmPC, m.evmOp, m.op, *a, *b)
+					}
+				case MirJUMP:
+					d, err := it.evalOperand(m, 0)
+					if err == nil && d != nil {
+						it.debugOperandHook(m.evmPC, m.evmOp, m.op, *d, uint256.Int{})
+					}
+				case MirGT:
+					a, b, err := it.evalBinary(m)
+					if err == nil && a != nil && b != nil {
+						it.debugOperandHook(m.evmPC, m.evmOp, m.op, *a, *b)
+					}
+				case MirJUMPI:
+					d, err1 := it.evalOperand(m, 0)
+					c, err2 := it.evalOperand(m, 1)
+					if err1 == nil && err2 == nil && d != nil && c != nil {
+						it.debugOperandHook(m.evmPC, m.evmOp, m.op, *d, *c)
+					}
+				}
+			}
+			if it.debugOperandHookEx != nil {
+				switch m.op {
+				case MirADD:
+					a, b, err := it.evalBinary(m)
+					if err == nil && a != nil && b != nil {
+						var aDefPC, bDefPC uint
+						var aDefOp, bDefOp MirOperation
+						if len(m.operands) >= 2 {
+							if v := m.operands[0]; v != nil && v.def != nil {
+								aDefPC, aDefOp = v.def.evmPC, v.def.op
+							}
+							if v := m.operands[1]; v != nil && v.def != nil {
+								bDefPC, bDefOp = v.def.evmPC, v.def.op
+							}
+						}
+						it.debugOperandHookEx(m.evmPC, m.evmOp, m.op, *a, *b, aDefPC, bDefPC, aDefOp, bDefOp)
+					}
+				case MirJUMP:
+					d, err := it.evalOperand(m, 0)
+					if err == nil && d != nil {
+						var dDefPC uint
+						var dDefOp MirOperation
+						if len(m.operands) >= 1 {
+							if v := m.operands[0]; v != nil && v.def != nil {
+								dDefPC, dDefOp = v.def.evmPC, v.def.op
+							}
+						}
+						it.debugOperandHookEx(m.evmPC, m.evmOp, m.op, *d, uint256.Int{}, dDefPC, 0, dDefOp, 0)
+					}
+				case MirGT:
+					a, b, err := it.evalBinary(m)
+					if err == nil && a != nil && b != nil {
+						var aDefPC, bDefPC uint
+						var aDefOp, bDefOp MirOperation
+						if len(m.operands) >= 2 {
+							if v := m.operands[0]; v != nil && v.def != nil {
+								aDefPC, aDefOp = v.def.evmPC, v.def.op
+							}
+							if v := m.operands[1]; v != nil && v.def != nil {
+								bDefPC, bDefOp = v.def.evmPC, v.def.op
+							}
+						}
+						it.debugOperandHookEx(m.evmPC, m.evmOp, m.op, *a, *b, aDefPC, bDefPC, aDefOp, bDefOp)
+					}
+				case MirJUMPI:
+					d, err1 := it.evalOperand(m, 0)
+					c, err2 := it.evalOperand(m, 1)
+					if err1 == nil && err2 == nil && d != nil && c != nil {
+						var dDefPC, cDefPC uint
+						var dDefOp, cDefOp MirOperation
+						if len(m.operands) >= 2 {
+							if v := m.operands[0]; v != nil && v.def != nil {
+								dDefPC, dDefOp = v.def.evmPC, v.def.op
+							}
+							if v := m.operands[1]; v != nil && v.def != nil {
+								cDefPC, cDefOp = v.def.evmPC, v.def.op
+							}
+						}
+						it.debugOperandHookEx(m.evmPC, m.evmOp, m.op, *d, *c, dDefPC, cDefPC, dDefOp, cDefOp)
+					}
+				}
 			}
 
 			switch m.op {
@@ -447,6 +622,7 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 						out.Clear()
 					}
 				case MirGT:
+					// EVM semantics: GT compares x > y where x is stack top and y is next item.
 					if a.Gt(b) {
 						out.SetOne()
 					} else {
@@ -562,6 +738,19 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 					n = 0
 				}
 				it.ensureMem(o + n)
+				if it.debugKeccakHook != nil {
+					off64, _ := off.Uint64WithOverflow()
+					sz64, _ := sz.Uint64WithOverflow()
+					snip := n
+					if snip > 64 {
+						snip = 64
+					}
+					buf := make([]byte, snip)
+					if snip > 0 {
+						copy(buf, it.mem[o:o+snip])
+					}
+					it.debugKeccakHook(m.evmPC, off64, sz64, buf)
+				}
 				h := crypto.Keccak256Hash(it.mem[o : o+n])
 				it.resultSlot(m).SetBytes(h[:])
 
@@ -581,6 +770,9 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 				} else {
 					out.Set(it.callValue)
 				}
+
+			case MirGAS:
+				it.resultSlot(m).SetUint64(it.gasLeftEffective())
 
 			case MirCALLDATALOAD:
 				off, err := it.evalOperand(m, 0)
@@ -853,6 +1045,9 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 				}
 				it.memCopyFromBytes(dest, off, sz, code)
 
+			case MirRETURNDATASIZE:
+				it.resultSlot(m).SetUint64(uint64(len(it.returnData)))
+
 			case MirRETURNDATACOPY:
 				// operands: dest, offset, size
 				dest, err := it.evalOperand(m, 0)
@@ -1068,16 +1263,6 @@ func (it *MIRInterpreter) resolveBB(from *MIRBasicBlock, targetPC uint) (*MIRBas
 	if from != nil {
 		it.cfg.connectEdge(from, nb, from.ExitStack())
 	}
-	// Ensure block is (re)built if it was invalidated by new incoming stacks.
-	for i := 0; i < 8 && !nb.built; i++ {
-		if len(nb.instructions) > 0 {
-			it.invalidateBlockResults(nb)
-			nb.ResetForRebuild(true)
-		}
-		if err := it.cfg.buildBasicBlock(nb, it.validJumpDests); err != nil {
-			return nil, err
-		}
-	}
 	return nb, nil
 }
 
@@ -1099,7 +1284,7 @@ func (it *MIRInterpreter) ensureMem(n int) {
 func (it *MIRInterpreter) finishResult(r ExecResult) ExecResult {
 	r.LastEVMPC = it.lastEvmPC
 	// Apply tx-level refund cap once, on normal halts.
-	if !it.refundApplied && r.Err == nil {
+	if it.applyRefundCapInFinish && !it.refundApplied && r.Err == nil {
 		switch r.HaltOp {
 		case MirSTOP, MirRETURN, MirREVERT, MirSELFDESTRUCT:
 			r.RefundUsed = it.applyRefundCap()
@@ -1228,24 +1413,18 @@ func (it *MIRInterpreter) chargeBlockConstantGas(b *MIRBasicBlock) error {
 	if !it.constGasInit || it.constGasRules != it.chainRules {
 		it.rebuildConstGasTable()
 	}
-	opCounts := b.EVMOpCounts()
-	for op, cnt := range opCounts {
+	// Charge constant gas for the *original EVM opcode stream* in this basic block.
+	// This includes opcodes optimized away in MIR (e.g. PUSH/DUP/SWAP/NOP), and preserves
+	// exact ordering information via (pc,op) for GAS/call-gas semantics.
+	for _, e := range b.evmOps {
+		op := e.op
 		if !it.constGasKnown[int(op)] {
-			// Be strict: missing gas schedule mapping is a parity bug.
 			return fmt.Errorf("missing constant gas for evm opcode 0x%x", op)
 		}
-		cost := it.constGas[int(op)]
-		if cnt == 0 || cost == 0 {
-			continue
-		}
-		// safe multiply/add in uint64 domain
-		total := cost * uint64(cnt)
-		// multiplication overflow check
-		if uint64(cnt) != 0 && total/uint64(cnt) != cost {
-			return errors.New("gas uint64 overflow")
-		}
-		if err := it.chargeGas(total); err != nil {
-			return err
+		if cost := it.constGas[int(op)]; cost != 0 {
+			if err := it.chargeGas(cost); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -1629,7 +1808,7 @@ func (it *MIRInterpreter) doCall(op MirOperation, gasReq *uint256.Int, to common
 		return 0, errors.New("call gas overflow")
 	}
 	req = gasReq.Uint64()
-	avail := it.gasLeft()
+	avail := it.gasLeftEffective()
 	if it.chainRules.IsEIP150 {
 		avail = avail - avail/64
 	}
@@ -1849,6 +2028,70 @@ func (it *MIRInterpreter) gasLeft() uint64 {
 	return it.gasLimit - it.gasUsed
 }
 
+func (it *MIRInterpreter) ensureBlockConstSuffix(b *MIRBasicBlock) []uint64 {
+	if it == nil || b == nil {
+		return nil
+	}
+	// Ensure const gas table is initialized for current rules.
+	if !it.constGasInit || it.constGasRules != it.chainRules {
+		it.rebuildConstGasTable()
+	}
+	// Allocate outer table lazily.
+	if it.blockConstSuffix == nil {
+		// Basic block numbers are dense from 0..basicBlockCount-1.
+		n := 0
+		if it.cfg != nil {
+			n = int(it.cfg.basicBlockCount)
+		}
+		if n == 0 {
+			n = int(b.blockNum) + 1
+		}
+		it.blockConstSuffix = make([][]uint64, n)
+	} else if int(b.blockNum) >= len(it.blockConstSuffix) {
+		// Grow defensively (shouldn't happen if cfg.basicBlockCount is set).
+		newTab := make([][]uint64, int(b.blockNum)+1)
+		copy(newTab, it.blockConstSuffix)
+		it.blockConstSuffix = newTab
+	}
+	if it.blockConstSuffix[b.blockNum] != nil && len(it.blockConstSuffix[b.blockNum]) == len(b.evmOps)+1 {
+		return it.blockConstSuffix[b.blockNum]
+	}
+	suf := make([]uint64, len(b.evmOps)+1)
+	for i := len(b.evmOps) - 1; i >= 0; i-- {
+		op := b.evmOps[i].op
+		suf[i] = suf[i+1] + it.constGas[int(op)]
+	}
+	it.blockConstSuffix[b.blockNum] = suf
+	return suf
+}
+
+// gasLeftEffective returns the gas remaining *as observed by the currently executing EVM opcode*,
+// i.e. after paying the current opcode's cost but before paying costs of future opcodes.
+// This compensates for MIR's block-entry constant gas precharge.
+func (it *MIRInterpreter) gasLeftEffective() uint64 {
+	g := it.gasLeft()
+	if it == nil || it.curBlock == nil || it.gasLimit == 0 {
+		return g
+	}
+	idx, ok := it.curBlock.evmPCToOpIndex[it.curEvmPC]
+	if !ok {
+		return g
+	}
+	suf := it.ensureBlockConstSuffix(it.curBlock)
+	if suf == nil {
+		return g
+	}
+	// Add back constant gas for future opcodes in this block.
+	rebate := uint64(0)
+	if idx+1 < len(suf) {
+		rebate = suf[idx+1]
+	}
+	if g > ^uint64(0)-rebate {
+		return ^uint64(0)
+	}
+	return g + rebate
+}
+
 func (it *MIRInterpreter) chargeSLoadGas(slot common.Hash) error {
 	// Pre-Berlin SLOAD is covered by constant gas schedule.
 	if !it.chainRules.IsEIP2929 {
@@ -2041,7 +2284,18 @@ func (it *MIRInterpreter) evalValue(v *Value) (*uint256.Int, error) {
 				}
 			}
 		}
-		return nil, fmt.Errorf("missing result for def op=%s pc=%d", v.def.op.String(), v.def.evmPC)
+		// Provide rich context; this typically indicates a CFG/PHI rebuild or dominance issue.
+		def := v.def
+		mapped, mappedOk := 0, false
+		if it.cfg != nil && it.cfg.defKeyToResIdx != nil && def != nil {
+			mapped, mappedOk = it.cfg.defKeyToResIdx[keyForDef(def)]
+		}
+		curFirstPC := uint(0)
+		if it.curBlock != nil {
+			curFirstPC = it.curBlock.firstPC
+		}
+		return nil, fmt.Errorf("missing result for def op=%s defPC=%d defBlock=%d phiIdx=%d defResIdx=%d mappedResIdx=%d mappedOk=%v (curFirstPC=%d curEvmPC=%d)",
+			def.op.String(), def.evmPC, def.defBlockNum, def.phiStackIndex, def.resIdx, mapped, mappedOk, curFirstPC, it.curEvmPC)
 	default:
 		return u256Zero, nil
 	}

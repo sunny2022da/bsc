@@ -514,7 +514,7 @@ func (p *Parlia) verifyVoteAttestation(chain consensus.ChainHeaderReader, header
 	match := false
 	ancestor := parent
 	ancestorParents := trimParents(parents)
-	for range p.GetAncestorGenerationDepth(header) {
+	for i := uint64(0); i < p.GetAncestorGenerationDepth(header); i++ {
 		if targetNumber == ancestor.Number.Uint64() && targetHash == ancestor.Hash() {
 			match = true
 			break
@@ -1068,7 +1068,7 @@ func (p *Parlia) assembleVoteAttestation(chain consensus.ChainHeaderReader, head
 		targetHeader           = parent
 		targetHeaderParentSnap *Snapshot
 	)
-	for range p.GetAncestorGenerationDepth(header) {
+	for i := uint64(0); i < p.GetAncestorGenerationDepth(header); i++ {
 		snap, err := p.snapshot(chain, targetHeader.Number.Uint64()-1, targetHeader.ParentHash, nil)
 		if err != nil {
 			return err
@@ -1400,12 +1400,18 @@ func (p *Parlia) Finalize(chain consensus.ChainHeaderReader, header *types.Heade
 
 	// If the block is an epoch end block, verify the validator list
 	// The verification can only be done when the state is ready, it can't be done in VerifyHeader.
-	if err := p.verifyValidators(chain, header); err != nil {
-		return err
-	}
-
-	if err := p.verifyTurnLength(chain, header); err != nil {
-		return err
+	//
+	// NOTE: Parlia's epoch verification reads validator-set/turn-length from the on-chain
+	// validator contract via eth_call (`ethapi.BlockChainAPI`). Some tools (e.g. mir_block_replay)
+	// construct Parlia with a nil ethAPI to avoid wiring the full RPC backend; in that case, skip
+	// these verifications. A real node should always provide ethAPI and run the checks.
+	if p.ethAPI != nil {
+		if err := p.verifyValidators(chain, header); err != nil {
+			return err
+		}
+		if err := p.verifyTurnLength(chain, header); err != nil {
+			return err
+		}
 	}
 
 	cx := chainContext{ChainHeaderReader: chain, parlia: p}

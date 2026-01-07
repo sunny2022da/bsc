@@ -54,6 +54,10 @@ type MIRBasicBlock struct {
 	// emittedOpCounts counts only those opcodes for which a MIR instruction was emitted
 	evmOpCounts     map[byte]uint32
 	emittedOpCounts map[byte]uint32
+	// evmOps records the original EVM opcode stream for this basic block (in PC order).
+	// This enables correct constant-gas accounting and correct GAS/call-gas semantics.
+	evmOps         []evmOpAtPC
+	evmPCToOpIndex map[uint]int
 	// SSA-like stack modeling
 	entryStack     []Value
 	exitStack      []Value
@@ -66,6 +70,11 @@ type MIRBasicBlock struct {
 	// Control-flow bookkeeping: indicates this block ends in a jump whose destination
 	// cannot be resolved at build time (dynamic JUMP/JUMPI). Interpreter may backfill CFG.
 	unresolvedJump bool
+}
+
+type evmOpAtPC struct {
+	pc uint
+	op byte
 }
 
 func (b *MIRBasicBlock) Size() uint {
@@ -173,16 +182,24 @@ func (b *MIRBasicBlock) CreateVoidMIR(op MirOperation) (mir *MIR) {
 func (b *MIRBasicBlock) appendMIR(mir *MIR) *MIR {
 	mir.idx = len(b.instructions)
 	mir.defBlockNum = b.blockNum
-	// Allocate a global result slot for this MIR (if we're in a CFG build context).
-	if currentCFGBuild != nil {
-		mir.resIdx = currentCFGBuild.allocResIdx()
-	}
 	// Attach EVM mapping captured by the CFG builder
 	mir.evmPC = currentEVMBuildPC
 	mir.evmOp = currentEVMBuildOp
-	// Register stable identity -> resIdx mapping (for rebuild-safe incoming stack resolution).
-	if currentCFGBuild != nil && currentCFGBuild.defKeyToResIdx != nil && mir.resIdx > 0 {
-		currentCFGBuild.defKeyToResIdx[keyForDef(mir)] = mir.resIdx
+	// Allocate a global result slot for this MIR (if we're in a CFG build context).
+	// IMPORTANT: reuse existing resIdx for the same stable def key across rebuilds, otherwise
+	// runtime rebuilds (dynamic jump backfill) can invalidate already-computed results and
+	// lead to "missing result for def MirPHI".
+	if currentCFGBuild != nil {
+		if currentCFGBuild.defKeyToResIdx != nil {
+			if ridx, ok := currentCFGBuild.defKeyToResIdx[keyForDef(mir)]; ok && ridx > 0 {
+				mir.resIdx = ridx
+			} else {
+				mir.resIdx = currentCFGBuild.allocResIdx()
+				currentCFGBuild.defKeyToResIdx[keyForDef(mir)] = mir.resIdx
+			}
+		} else {
+			mir.resIdx = currentCFGBuild.allocResIdx()
+		}
 	}
 	// Record that we emitted a MIR for this originating EVM opcode
 	if b.emittedOpCounts != nil {
@@ -326,6 +343,8 @@ func NewMIRBasicBlock(blockNum, pc uint) *MIRBasicBlock {
 	bb.instructions = []*MIR{}
 	bb.evmOpCounts = make(map[byte]uint32)
 	bb.emittedOpCounts = make(map[byte]uint32)
+	bb.evmOps = make([]evmOpAtPC, 0, 256)
+	bb.evmPCToOpIndex = make(map[uint]int, 256)
 	bb.entryStack = nil
 	bb.exitStack = nil
 	bb.incomingStacks = make(map[*MIRBasicBlock][]Value)
@@ -443,10 +462,12 @@ func (b *MIRBasicBlock) CreateSwapMIR(n int, stack *ValueStack) *MIR {
 }
 
 // CreatePhiMIR creates a PHI node merging incoming stack values.
-func (b *MIRBasicBlock) CreatePhiMIR(ops []*Value, stack *ValueStack) *MIR {
+// phiStackIndex is 0 for top-of-stack.
+func (b *MIRBasicBlock) CreatePhiMIR(ops []*Value, stack *ValueStack, phiStackIndex int) *MIR {
 	mir := new(MIR)
 	mir.op = MirPHI
 	mir.operands = ops
+	mir.phiStackIndex = phiStackIndex
 	stack.push(mir.Result())
 	mir = b.appendMIR(mir)
 	mir.genStackDepth = stack.size()
@@ -794,6 +815,13 @@ func (b *MIRBasicBlock) ResetForRebuild(preserveEntry bool) {
 			delete(b.emittedOpCounts, k)
 		}
 	}
+	// Clear recorded EVM opcode stream for this block; it will be recomputed during rebuild.
+	b.evmOps = b.evmOps[:0]
+	if b.evmPCToOpIndex != nil {
+		for k := range b.evmPCToOpIndex {
+			delete(b.evmPCToOpIndex, k)
+		}
+	}
 	// Clear exit-related metadata; it will be recomputed during rebuild
 	b.lastPC = 0
 	b.exitStack = nil
@@ -818,4 +846,24 @@ func (bb *MIRBasicBlock) GetNextOp() *MIR {
 	op := bb.instructions[bb.pos]
 	bb.pos++
 	return op
+}
+
+// recordEVMOp records the original EVM opcode stream for this basic block.
+// It should be called by the CFG builder once per decoded EVM opcode (in increasing pc order).
+func (b *MIRBasicBlock) recordEVMOp(pc uint, op byte) {
+	if b == nil {
+		return
+	}
+	if b.evmOps == nil {
+		b.evmOps = make([]evmOpAtPC, 0, 256)
+	}
+	if b.evmPCToOpIndex == nil {
+		b.evmPCToOpIndex = make(map[uint]int, 256)
+	}
+	// Only record first opcode seen at a given pc.
+	if _, ok := b.evmPCToOpIndex[pc]; ok {
+		return
+	}
+	b.evmPCToOpIndex[pc] = len(b.evmOps)
+	b.evmOps = append(b.evmOps, evmOpAtPC{pc: pc, op: op})
 }
