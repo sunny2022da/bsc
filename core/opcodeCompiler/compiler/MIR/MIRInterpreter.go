@@ -107,14 +107,15 @@ type MIRInterpreter struct {
 	curBlock *MIRBasicBlock
 	curEvmPC uint
 
-	// Cached per-block suffix sums of constant gas for original EVM opcode stream.
-	// Indexed by basic block number; each entry is len(block.evmOps)+1 where suffix[i] is sum from i..end.
-	blockConstSuffix [][]uint64
+	// Cached per-block prefix sums of constant gas for original EVM opcode stream.
+	// Indexed by basic block number; each entry is len(block.evmOps)+1 where prefix[i] is sum of 0..i-1.
+	//
+	// This enables O(1) constant-gas charging per executed MIR op (including optimized-away PUSH/DUP/SWAP),
+	// without the incorrect semantics of "charge the whole block upfront" (which breaks CALL gas forwarding).
+	blockConstPrefix [][]uint64
 
-	// Cached per-block total constant gas for original EVM opcode stream.
-	// This avoids per-op charging overhead without allocating per-block suffix slices.
-	blockConstTotal      []uint64
-	blockConstTotalKnown []bool
+	// Per-block execution cursor into evmOps for constant-gas charging.
+	curEvmOpIndex int
 
 	// manageStateSnapshots controls whether MIRInterpreter snapshots/reverts state internally.
 	// When MIR runs as a vm runner inside geth, the outer EVM already snapshots/reverts around
@@ -244,9 +245,7 @@ func (it *MIRInterpreter) ResetForRun(cfg *CFG) {
 	}
 	// If CFG changes (different contract), cached per-block gas tables are invalid.
 	if prevCfg != cfg {
-		it.blockConstSuffix = nil
-		it.blockConstTotal = nil
-		it.blockConstTotalKnown = nil
+		it.blockConstPrefix = nil
 	}
 	// Reset memory but keep capacity
 	if it.mem != nil {
@@ -494,16 +493,16 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 
 		// Reset instruction cursor for this block execution
 		cur.pos = 0
-
-		// Charge constant gas for all EVM opcodes in this block (including those optimized away in MIR).
-		if err := it.chargeBlockConstantGas(cur); err != nil {
-			return it.finishResult(ExecResult{Err: err})
-		}
+		it.curEvmOpIndex = -1
 
 	execBlock:
 		for {
 			m := cur.GetNextOp()
 			if m == nil {
+				// Charge any trailing constant gas in this block not yet accounted for.
+				if err := it.chargeConstGasToEndOfBlock(cur); err != nil {
+					return it.finishResult(ExecResult{Err: err})
+				}
 				// No explicit terminator MIR in this block: fallthrough if any child exists.
 				children := cur.Children()
 				if len(children) == 0 {
@@ -512,6 +511,12 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 				// Deterministic: fallthrough to the first child (for non-terminator blocks).
 				prev, cur = cur, children[0]
 				break execBlock
+			}
+			// Charge constant gas up to and including the originating EVM opcode for this MIR op.
+			// This accounts for optimized-away stack ops (PUSH/DUP/SWAP) by charging them in the delta
+			// between consecutive emitted MIR ops.
+			if err := it.chargeConstGasForMIR(cur, m); err != nil {
+				return it.finishResult(ExecResult{Err: err})
 			}
 			it.lastEvmPC = m.evmPC
 			it.curBlock = cur
@@ -844,7 +849,8 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 				}
 
 			case MirGAS:
-				it.resultSlot(m).SetUint64(it.gasLeftEffective())
+				// With incremental constant-gas charging, GAS observes the current gas remaining.
+				it.resultSlot(m).SetUint64(it.gasLeft())
 
 			case MirCALLDATALOAD:
 				off, err := it.evalOperand(m, 0)
@@ -1527,14 +1533,9 @@ func (it *MIRInterpreter) chargeBlockConstantGas(b *MIRBasicBlock) error {
 	if b == nil {
 		return nil
 	}
-	// Charge the total constant gas once per block entry instead of per opcode.
-	// We intentionally do NOT build the suffix table here; suffixes are only needed
-	// if the contract actually executes GAS/CALL-family and we need gasLeftEffective().
-	total := it.ensureBlockConstTotal(b)
-	if total == 0 {
-		return nil
-	}
-	return it.chargeGas(total)
+	// Deprecated: block-entry constant gas precharge breaks CALL gas forwarding semantics.
+	// Constant gas is now charged incrementally per MIR op via chargeConstGasForMIR.
+	return nil
 }
 
 // toWordSize matches geth's toWordSize: ceil(size/32).
@@ -1915,7 +1916,7 @@ func (it *MIRInterpreter) doCall(op MirOperation, gasReq *uint256.Int, to common
 		return 0, errors.New("call gas overflow")
 	}
 	req = gasReq.Uint64()
-	avail := it.gasLeftEffective()
+	avail := it.gasLeft()
 	if it.chainRules.IsEIP150 {
 		avail = avail - avail/64
 	}
@@ -2135,7 +2136,7 @@ func (it *MIRInterpreter) gasLeft() uint64 {
 	return it.gasLimit - it.gasUsed
 }
 
-func (it *MIRInterpreter) ensureBlockConstSuffix(b *MIRBasicBlock) []uint64 {
+func (it *MIRInterpreter) ensureBlockConstPrefix(b *MIRBasicBlock) []uint64 {
 	if it == nil || b == nil {
 		return nil
 	}
@@ -2143,15 +2144,10 @@ func (it *MIRInterpreter) ensureBlockConstSuffix(b *MIRBasicBlock) []uint64 {
 	if !it.constGasInit || it.constGasRules != it.chainRules {
 		it.rebuildConstGasTable()
 		// Cached per-block gas depends on constant schedule; drop and rebuild lazily.
-		it.blockConstSuffix = nil
-		if it.blockConstTotalKnown != nil {
-			for i := range it.blockConstTotalKnown {
-				it.blockConstTotalKnown[i] = false
-			}
-		}
+		it.blockConstPrefix = nil
 	}
 	// Allocate outer table lazily.
-	if it.blockConstSuffix == nil {
+	if it.blockConstPrefix == nil {
 		// Basic block numbers are dense from 0..basicBlockCount-1.
 		n := 0
 		if it.cfg != nil {
@@ -2160,97 +2156,87 @@ func (it *MIRInterpreter) ensureBlockConstSuffix(b *MIRBasicBlock) []uint64 {
 		if n == 0 {
 			n = int(b.blockNum) + 1
 		}
-		it.blockConstSuffix = make([][]uint64, n)
-	} else if int(b.blockNum) >= len(it.blockConstSuffix) {
+		it.blockConstPrefix = make([][]uint64, n)
+	} else if int(b.blockNum) >= len(it.blockConstPrefix) {
 		// Grow defensively (shouldn't happen if cfg.basicBlockCount is set).
 		newTab := make([][]uint64, int(b.blockNum)+1)
-		copy(newTab, it.blockConstSuffix)
-		it.blockConstSuffix = newTab
+		copy(newTab, it.blockConstPrefix)
+		it.blockConstPrefix = newTab
 	}
-	if it.blockConstSuffix[b.blockNum] != nil && len(it.blockConstSuffix[b.blockNum]) == len(b.evmOps)+1 {
-		return it.blockConstSuffix[b.blockNum]
+	if it.blockConstPrefix[b.blockNum] != nil && len(it.blockConstPrefix[b.blockNum]) == len(b.evmOps)+1 {
+		return it.blockConstPrefix[b.blockNum]
 	}
-	suf := make([]uint64, len(b.evmOps)+1)
-	for i := len(b.evmOps) - 1; i >= 0; i-- {
+	pfx := make([]uint64, len(b.evmOps)+1)
+	for i := 0; i < len(b.evmOps); i++ {
 		op := b.evmOps[i].op
-		suf[i] = suf[i+1] + it.constGas[int(op)]
+		pfx[i+1] = pfx[i] + it.constGas[int(op)]
 	}
-	it.blockConstSuffix[b.blockNum] = suf
-	return suf
-}
-
-func (it *MIRInterpreter) ensureBlockConstTotal(b *MIRBasicBlock) uint64 {
-	if it == nil || b == nil {
-		return 0
-	}
-	// Ensure const gas table is initialized for current rules. If rules changed, invalidate caches.
-	if !it.constGasInit || it.constGasRules != it.chainRules {
-		it.rebuildConstGasTable()
-		it.blockConstSuffix = nil
-		if it.blockConstTotalKnown != nil {
-			for i := range it.blockConstTotalKnown {
-				it.blockConstTotalKnown[i] = false
-			}
-		}
-	}
-	// Allocate per-block total cache lazily.
-	if it.blockConstTotal == nil || it.blockConstTotalKnown == nil {
-		n := 0
-		if it.cfg != nil {
-			n = int(it.cfg.basicBlockCount)
-		}
-		if n == 0 {
-			n = int(b.blockNum) + 1
-		}
-		it.blockConstTotal = make([]uint64, n)
-		it.blockConstTotalKnown = make([]bool, n)
-	} else if int(b.blockNum) >= len(it.blockConstTotal) {
-		need := int(b.blockNum) + 1
-		newTot := make([]uint64, need)
-		copy(newTot, it.blockConstTotal)
-		it.blockConstTotal = newTot
-		newKnown := make([]bool, need)
-		copy(newKnown, it.blockConstTotalKnown)
-		it.blockConstTotalKnown = newKnown
-	}
-	idx := int(b.blockNum)
-	if it.blockConstTotalKnown[idx] {
-		return it.blockConstTotal[idx]
-	}
-	var sum uint64
-	for _, e := range b.evmOps {
-		sum += it.constGas[int(e.op)]
-	}
-	it.blockConstTotal[idx] = sum
-	it.blockConstTotalKnown[idx] = true
-	return sum
+	it.blockConstPrefix[b.blockNum] = pfx
+	return pfx
 }
 
 // gasLeftEffective returns the gas remaining *as observed by the currently executing EVM opcode*,
 // i.e. after paying the current opcode's cost but before paying costs of future opcodes.
-// This compensates for MIR's block-entry constant gas precharge.
+// With incremental constant-gas charging, this equals gasLeft().
 func (it *MIRInterpreter) gasLeftEffective() uint64 {
-	g := it.gasLeft()
-	if it == nil || it.curBlock == nil || it.gasLimit == 0 {
-		return g
+	return it.gasLeft()
+}
+
+func (it *MIRInterpreter) chargeConstGasForMIR(b *MIRBasicBlock, m *MIR) error {
+	if it == nil || b == nil || m == nil {
+		return nil
 	}
-	idx, ok := it.curBlock.evmPCToOpIndex[it.curEvmPC]
+	pfx := it.ensureBlockConstPrefix(b)
+	if pfx == nil || len(pfx) == 0 {
+		return nil
+	}
+	idx, ok := b.evmPCToOpIndex[m.evmPC]
 	if !ok {
-		return g
+		return nil
 	}
-	suf := it.ensureBlockConstSuffix(it.curBlock)
-	if suf == nil {
-		return g
+	// Clamp in case of any weirdness.
+	if idx < 0 {
+		idx = 0
 	}
-	// Add back constant gas for future opcodes in this block.
-	rebate := uint64(0)
-	if idx+1 < len(suf) {
-		rebate = suf[idx+1]
+	if idx+1 >= len(pfx) {
+		return nil
 	}
-	if g > ^uint64(0)-rebate {
-		return ^uint64(0)
+	last := it.curEvmOpIndex
+	if last < -1 {
+		last = -1
 	}
-	return g + rebate
+	if last+1 >= len(pfx) {
+		last = len(pfx) - 2
+	}
+	delta := pfx[idx+1] - pfx[last+1]
+	it.curEvmOpIndex = idx
+	if delta == 0 {
+		return nil
+	}
+	return it.chargeGas(delta)
+}
+
+func (it *MIRInterpreter) chargeConstGasToEndOfBlock(b *MIRBasicBlock) error {
+	if it == nil || b == nil {
+		return nil
+	}
+	pfx := it.ensureBlockConstPrefix(b)
+	if pfx == nil || len(pfx) == 0 {
+		return nil
+	}
+	last := it.curEvmOpIndex
+	if last < -1 {
+		last = -1
+	}
+	if last+1 >= len(pfx) {
+		last = len(pfx) - 2
+	}
+	delta := pfx[len(pfx)-1] - pfx[last+1]
+	it.curEvmOpIndex = len(pfx) - 2
+	if delta == 0 {
+		return nil
+	}
+	return it.chargeGas(delta)
 }
 
 func (it *MIRInterpreter) chargeSLoadGas(slot common.Hash) error {
