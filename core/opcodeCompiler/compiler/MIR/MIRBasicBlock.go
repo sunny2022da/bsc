@@ -185,6 +185,14 @@ func (b *MIRBasicBlock) appendMIR(mir *MIR) *MIR {
 	// Attach EVM mapping captured by the CFG builder
 	mir.evmPC = currentEVMBuildPC
 	mir.evmOp = currentEVMBuildOp
+	// Attach EVM op index (best-effort) for fast constant gas charging at runtime.
+	// This is safe even during rebuild: evmPCToOpIndex is rebuilt alongside evmOps.
+	mir.evmOpIndex = -1
+	if b.evmPCToOpIndex != nil {
+		if idx, ok := b.evmPCToOpIndex[mir.evmPC]; ok {
+			mir.evmOpIndex = idx
+		}
+	}
 	// Allocate a global result slot for this MIR (if we're in a CFG build context).
 	// IMPORTANT: reuse existing resIdx for the same stable def key across rebuilds, otherwise
 	// runtime rebuilds (dynamic jump backfill) can invalidate already-computed results and

@@ -42,6 +42,9 @@ type MIR struct {
 	// EVM mapping metadata (set during CFG build)
 	evmPC uint // byte offset of the originating EVM opcode
 	evmOp byte // originating EVM opcode byte value
+	// evmOpIndex is the index into the containing basic block's recorded EVM opcode stream (b.evmOps).
+	// Set during CFG build to avoid runtime map lookups when charging constant gas incrementally.
+	evmOpIndex int
 	// Optional auxiliary MIR attached for diagnostics (e.g., original EVM op at invalid jump target)
 	aux *MIR
 	// For PHI nodes only: the stack slot index this PHI represents (0 = top of stack)
