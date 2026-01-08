@@ -2183,50 +2183,65 @@ func (p *Parlia) applyTransaction(
 		}
 		actualTx := (*receivedTxs)[0]
 		if !bytes.Equal(p.signer.Hash(actualTx).Bytes(), expectedHash.Bytes()) {
-				sysBal := state.GetBalance(consensus.SystemAddress)
-				sysRewardBal := state.GetBalance(common.HexToAddress(systemcontracts.SystemRewardContract))
-				// Summarize receipts processed so far (useful to debug gas/fee-driven system tx values).
-				lastReceipt := (*types.Receipt)(nil)
-				if receipts != nil && len(*receipts) > 0 {
-					lastReceipt = (*receipts)[len(*receipts)-1]
-				}
-				return fmt.Errorf(
-					"expected tx hash %v, get %v (txIndex=%d usedGasSoFar=%d lastReceiptGasUsed=%v lastReceiptCumGas=%v stateNonce=%d actualNonce=%d actualTo=%s actualValue=%s actualGas=%d actualGasPrice=%s actualData=%s sysBal=%s sysRewardBal=%s), expected(nonce=%d to=%s value=%s gas=%d gasPrice=%s data=%s)",
-					expectedHash.String(), actualTx.Hash().String(),
-					len(*txs), func() uint64 { if usedGas == nil { return 0 }; return *usedGas }(),
-					func() any { if lastReceipt == nil { return nil }; return lastReceipt.GasUsed }(),
-					func() any { if lastReceipt == nil { return nil }; return lastReceipt.CumulativeGasUsed }(),
-					nonce,
-					actualTx.Nonce(),
-					func() string {
-						if actualTx.To() == nil {
-							return "<create>"
-						}
-						return actualTx.To().String()
-					}(),
-					actualTx.Value().String(),
-					actualTx.Gas(),
-					actualTx.GasPrice().String(),
-					hex.EncodeToString(actualTx.Data()),
-					func() string {
-						if sysBal == nil {
-							return "<nil>"
-						}
-						return sysBal.String()
-					}(),
-					func() string {
-						if sysRewardBal == nil {
-							return "<nil>"
-						}
-						return sysRewardBal.String()
-					}(),
-					expectedTx.Nonce(),
-					expectedTx.To().String(),
-					expectedTx.Value().String(),
-					expectedTx.Gas(),
-					expectedTx.GasPrice().String(),
-					hex.EncodeToString(expectedTx.Data()),
-				)
+			sysBal := state.GetBalance(consensus.SystemAddress)
+			sysRewardBal := state.GetBalance(common.HexToAddress(systemcontracts.SystemRewardContract))
+			// Summarize receipts processed so far (useful to debug gas/fee-driven system tx values).
+			lastReceipt := (*types.Receipt)(nil)
+			if receipts != nil && len(*receipts) > 0 {
+				lastReceipt = (*receipts)[len(*receipts)-1]
+			}
+			return fmt.Errorf(
+				"expected tx hash %v, get %v (txIndex=%d usedGasSoFar=%d lastReceiptGasUsed=%v lastReceiptCumGas=%v stateNonce=%d actualNonce=%d actualTo=%s actualValue=%s actualGas=%d actualGasPrice=%s actualData=%s sysBal=%s sysRewardBal=%s), expected(nonce=%d to=%s value=%s gas=%d gasPrice=%s data=%s)",
+				expectedHash.String(), actualTx.Hash().String(),
+				len(*txs), func() uint64 {
+					if usedGas == nil {
+						return 0
+					}
+					return *usedGas
+				}(),
+				func() any {
+					if lastReceipt == nil {
+						return nil
+					}
+					return lastReceipt.GasUsed
+				}(),
+				func() any {
+					if lastReceipt == nil {
+						return nil
+					}
+					return lastReceipt.CumulativeGasUsed
+				}(),
+				nonce,
+				actualTx.Nonce(),
+				func() string {
+					if actualTx.To() == nil {
+						return "<create>"
+					}
+					return actualTx.To().String()
+				}(),
+				actualTx.Value().String(),
+				actualTx.Gas(),
+				actualTx.GasPrice().String(),
+				hex.EncodeToString(actualTx.Data()),
+				func() string {
+					if sysBal == nil {
+						return "<nil>"
+					}
+					return sysBal.String()
+				}(),
+				func() string {
+					if sysRewardBal == nil {
+						return "<nil>"
+					}
+					return sysRewardBal.String()
+				}(),
+				expectedTx.Nonce(),
+				expectedTx.To().String(),
+				expectedTx.Value().String(),
+				expectedTx.Gas(),
+				expectedTx.GasPrice().String(),
+				hex.EncodeToString(expectedTx.Data()),
+			)
 		}
 		expectedTx = actualTx
 		// move to next
