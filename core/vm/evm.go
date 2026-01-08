@@ -19,7 +19,6 @@ package vm
 import (
 	"errors"
 	"math/big"
-	"strings"
 	"sync/atomic"
 
 	"github.com/holiman/uint256"
@@ -30,6 +29,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/tracing"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
 )
 
@@ -68,6 +68,31 @@ func isSystemContract(to *common.Address) bool {
 		return false
 	}
 	return isToSystemContract(*to)
+}
+
+// MIR dispatch counters (low-overhead) to validate MIR usage during sync.
+// These are intentionally package-level so they can be sampled cheaply.
+var (
+	mirTopLevelAttempts  atomic.Uint64
+	mirTopLevelSucceeded atomic.Uint64
+	mirTopLevelFallbacks atomic.Uint64
+	mirTopLevelLogsTick  atomic.Uint64
+)
+
+func maybeLogMIRCounters() {
+	// Throttle: log at most once per 4096 MIR attempts.
+	const every = uint64(4096)
+	n := mirTopLevelAttempts.Load()
+	if n == 0 || (n%every) != 0 {
+		return
+	}
+	// Ensure only one goroutine logs per tick.
+	if !mirTopLevelLogsTick.CompareAndSwap(n-every, n) {
+		return
+	}
+	succ := mirTopLevelSucceeded.Load()
+	fb := mirTopLevelFallbacks.Load()
+	log.Info("MIR counters", "attempts", n, "succeeded", succ, "fallbacks", fb, "fallbackRate", float64(fb)/float64(n))
 }
 
 type (
@@ -338,19 +363,17 @@ func (evm *EVM) Call(caller common.Address, addr common.Address, input []byte, g
 		} else {
 			// Optional MIR dispatch for top-level execution only.
 			if evm.shouldUseMIR() && !isSystemContract(&addr) {
+				mirTopLevelAttempts.Add(1)
+				maybeLogMIRCounters()
 				contract := GetContract(caller, addr, value, gas, evm.jumpDests)
 				defer ReturnContract(contract)
 				contract.IsSystemCall = isSystemCall(caller)
 				// IMPORTANT: run raw code (not optimized/super-instructions), since MIR parses EVM bytecode.
 				contract.SetCallCode(&addr, evm.resolveCodeHash(addr), code)
-				gasBefore := contract.Gas
 				ret, err = evm.runWithRunner(evm.mirRunner, contract, input, false)
-				// Safety valve: if MIR fails with an internal runtime/IR error, fall back to the native interpreter.
-				// This keeps block processing progressing while we iteratively turn mismatches into fixes.
-				if err != nil && (strings.Contains(err.Error(), "missing result for def") || strings.Contains(err.Error(), "unimplemented MIR op:")) {
-					contract.Gas = gasBefore
-					evm.UseBaseInterpreter()
-					ret, err = evm.interpreter.Run(contract, input, false)
+				if err == nil {
+					mirTopLevelSucceeded.Add(1)
+					maybeLogMIRCounters()
 				}
 				gas = contract.Gas
 			} else if evm.Config.EnableOpcodeOptimizations {

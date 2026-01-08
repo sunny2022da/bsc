@@ -138,6 +138,18 @@ func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]b
 	// Fork rules + block context (cached in runner)
 	it.blockNumber = r.blockNumber
 	it.SetChainRules(r.chainRules)
+	// Block context for block-environment opcodes (NUMBER/TIMESTAMP/COINBASE/etc).
+	if r.evm != nil {
+		it.blockTime = r.evm.Context.Time
+		it.blockCoinbase = r.evm.Context.Coinbase
+		it.blockGasLimit = r.evm.Context.GasLimit
+		it.blockDifficulty = r.evm.Context.Difficulty
+		it.blockRandom = r.evm.Context.Random
+		it.blockBaseFee = r.evm.Context.BaseFee
+		it.blockBlobBaseFee = r.evm.Context.BlobBaseFee
+		it.blockGetHash = r.evm.Context.GetHash
+		it.txBlobHashes = r.evm.BlobHashes
+	}
 
 	// Call context
 	it.SetContractAddress(contract.Address())

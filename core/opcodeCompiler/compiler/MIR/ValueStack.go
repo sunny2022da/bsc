@@ -142,15 +142,20 @@ func (v *Value) Equal(other *Value) bool {
 		return false
 	}
 	if v.kind == Konst {
-		if len(v.payload) != len(other.payload) {
-			return false
+		// Compare by numeric value, not payload bytes. Payloads may differ in length/encoding
+		// (e.g. PUSH0 vs PUSH1 0x00), but the EVM constant is the same.
+		var a, b uint256.Int
+		if v.u != nil {
+			a.Set(v.u)
+		} else {
+			a.SetBytes(v.payload)
 		}
-		for i := range v.payload {
-			if v.payload[i] != other.payload[i] {
-				return false
-			}
+		if other.u != nil {
+			b.Set(other.u)
+		} else {
+			b.SetBytes(other.payload)
 		}
-		return true
+		return a.Eq(&b)
 	}
 	return v.def == other.def // fallback for non-const
 }

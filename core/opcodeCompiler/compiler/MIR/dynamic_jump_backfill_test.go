@@ -6,9 +6,11 @@ import (
 )
 
 func TestDynamicJumpBackfill_ConnectsEdgeAndBuildsTarget(t *testing.T) {
-	// Build-time dest is non-constant (ADD result), so builder marks unresolvedJump and does not connect edge.
-	// Runtime dest becomes 0x0a and should jump to JUMPDEST at pc=10.
-	codeHex := "600560050156000000005b00"
+	// Build-time dest is non-constant (CALLDATALOAD result), so builder marks unresolvedJump and does not connect edge.
+	// Runtime dest becomes 0x0a (from calldata) and should jump to JUMPDEST at pc=10.
+	//
+	// PUSH1 0x00; CALLDATALOAD; JUMP; [padding]; JUMPDEST(at pc=10); STOP
+	codeHex := "600035560000000000005b00"
 	code, err := hex.DecodeString(codeHex)
 	if err != nil {
 		t.Fatalf("decode hex: %v", err)
@@ -29,6 +31,10 @@ func TestDynamicJumpBackfill_ConnectsEdgeAndBuildsTarget(t *testing.T) {
 	}
 
 	it := NewMIRInterpreter(cfg)
+	// Provide calldata such that CALLDATALOAD(0) yields 0x0a.
+	calldata := make([]byte, 32)
+	calldata[31] = 0x0a
+	it.SetCallData(calldata)
 	res := it.Run()
 	if res.Err != nil {
 		t.Fatalf("Run error: %v", res.Err)
@@ -61,9 +67,9 @@ func TestDynamicJumpBackfill_ConnectsEdgeAndBuildsTarget(t *testing.T) {
 }
 
 func TestDynamicJumpBackfill_InvalidJumpdestErrors(t *testing.T) {
-	// Jump to pc=9 (not a JUMPDEST) => should error.
-	// PUSH1 4; PUSH1 5; ADD (=9); JUMP; [..] no JUMPDEST at 9
-	codeHex := "600460050156000000005b00"
+	// Jump to pc=9 (not a JUMPDEST) => should error at runtime.
+	// Build-time dest is non-constant (CALLDATALOAD result) so Parse succeeds.
+	codeHex := "600035560000000000005b00"
 	code, err := hex.DecodeString(codeHex)
 	if err != nil {
 		t.Fatalf("decode hex: %v", err)
@@ -73,6 +79,10 @@ func TestDynamicJumpBackfill_InvalidJumpdestErrors(t *testing.T) {
 		t.Fatalf("Parse failed: %v", err)
 	}
 	it := NewMIRInterpreter(cfg)
+	// Provide calldata such that CALLDATALOAD(0) yields 0x09 (not a JUMPDEST).
+	calldata := make([]byte, 32)
+	calldata[31] = 0x09
+	it.SetCallData(calldata)
 	res := it.Run()
 	if res.Err == nil {
 		t.Fatalf("expected invalid jumpdest error, got nil")

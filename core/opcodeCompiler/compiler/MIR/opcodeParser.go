@@ -7,6 +7,27 @@ import (
 	"github.com/ethereum/go-ethereum/core/opcodeCompiler/compiler"
 )
 
+// cfgNonConvergentPrefix is used as a stable marker so higher-level callers (runner/tools)
+// can identify a non-convergent CFG build without importing extra error types.
+const cfgNonConvergentPrefix = "MIR CFG parse did not converge"
+
+// CFGNonConvergentError reports that CFG.Parse exceeded its build bound and did not reach a fixpoint.
+// This should be treated as a correctness/debugging failure that must be fixed (not silently ignored).
+type CFGNonConvergentError struct {
+	Builds    int
+	MaxBuilds int
+	CodeHash  common.Hash
+	CodeLen   int
+}
+
+func (e *CFGNonConvergentError) Error() string {
+	if e == nil {
+		return cfgNonConvergentPrefix
+	}
+	return fmt.Sprintf("%s after %d block builds (max=%d) codeHash=%s codeLen=%d",
+		cfgNonConvergentPrefix, e.Builds, e.MaxBuilds, e.CodeHash.Hex(), e.CodeLen)
+}
+
 // CFG is the IR record the control flow of the contract.
 // It records not only the control flow info but also the state and memory accesses.
 // CFG is mapping to <addr, code> pair, and there is no need to record CFG for every contract
@@ -138,6 +159,13 @@ func (c *CFG) Parse() error {
 	// 3. Worklist for processing blocks
 	// Queue stores blocks that need to be built.
 	queue := []*MIRBasicBlock{entryBlock}
+	// Safety valve: in the presence of complex back-edges/dynamic CFG backfill, the iterative
+	// rebuild process should converge quickly. If it doesn't, it's safer to fall back to the
+	// native EVM than to spin indefinitely during block processing.
+	//
+	// The bound is intentionally generous and scales with bytecode size.
+	maxBuilds := 1024 + 64*len(c.rawCode)
+	builds := 0
 
 	for len(queue) > 0 {
 		block := queue[0]
@@ -157,6 +185,15 @@ func (c *CFG) Parse() error {
 		}
 
 		// Build the block (emit MIR instructions)
+		builds++
+		if builds > maxBuilds {
+			return &CFGNonConvergentError{
+				Builds:    builds,
+				MaxBuilds: maxBuilds,
+				CodeHash:  c.codeAddr,
+				CodeLen:   len(c.rawCode),
+			}
+		}
 		err := c.buildBasicBlock(block, validJumpDests)
 		if err != nil {
 			return err
@@ -175,8 +212,16 @@ func (c *CFG) Parse() error {
 func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 	stack := new(ValueStack)
 
-	// Case 1: Entry Block (No parents)
-	if block.blockNum == 0 {
+	// Case 1: Entry block (true entry, no predecessors).
+	//
+	// IMPORTANT: the entry block can still gain predecessors later (e.g. due to a back-edge/self-loop
+	// discovered while building the CFG). In that case we must NOT early-return an empty stack,
+	// otherwise CFG build can get stuck in a rebuild loop for self-loops. Only treat it as a "true"
+	// entry when there are no recorded incomings at all.
+	if block.blockNum == 0 && block.entryStack == nil && len(block.parents) == 0 && len(block.incomingStacks) == 0 {
+		// Make the "known empty" entry snapshot explicit (non-nil) so later logic can distinguish
+		// between "unknown/uncomputed" vs "computed empty".
+		block.SetEntryStack([]Value{})
 		return stack
 	}
 
@@ -203,29 +248,37 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 		if len(incomings) == 0 {
 			return stack
 		}
-		// EVM requires identical stack height at merge points, but during dynamic CFG
-		// expansion (runtime backfill) we can temporarily observe incomplete/missing
-		// incoming snapshots. Instead of bailing out to an empty stack (which later
-		// causes silent Unknown->0 behavior), pad shorter stacks with Unknown values
-		// from the *bottom* so top-of-stack alignment is preserved.
-		height := 0
-		for i := 0; i < len(incomings); i++ {
-			if len(incomings[i]) > height {
-				height = len(incomings[i])
+		// EVM requires identical stack height at merge points. During dynamic CFG expansion we can
+		// temporarily record infeasible edges with a different stack height; padding them with
+		// Unknown values poisons PHI generation (and later leads to Unknown->0 at runtime).
+		//
+		// Strategy: keep only the most common incoming stack height, breaking ties toward the
+		// smaller height (safer than assuming extra values exist).
+		modeLen := len(incomings[0])
+		if len(incomings) > 1 {
+			counts := make(map[int]int, 4)
+			for _, s := range incomings {
+				counts[len(s)]++
+			}
+			modeCnt := -1
+			modeLen = -1
+			for l, c := range counts {
+				if c > modeCnt || (c == modeCnt && (modeLen < 0 || l < modeLen)) {
+					modeLen = l
+					modeCnt = c
+				}
+			}
+			filtered := make([][]Value, 0, len(incomings))
+			for _, s := range incomings {
+				if len(s) == modeLen {
+					filtered = append(filtered, s)
+				}
+			}
+			if len(filtered) > 0 {
+				incomings = filtered
 			}
 		}
-		for i := 0; i < len(incomings); i++ {
-			if len(incomings[i]) == height {
-				continue
-			}
-			padded := make([]Value, height)
-			// Default Value is kind=Konst zero-ish; explicitly mark padding as Unknown.
-			for j := 0; j < height-len(incomings[i]); j++ {
-				padded[j] = Value{kind: Unknown}
-			}
-			copy(padded[height-len(incomings[i]):], incomings[i])
-			incomings[i] = padded
-		}
+		height := modeLen
 
 		for i := 0; i < height; i++ {
 			base := incomings[0][i]
@@ -274,8 +327,37 @@ func (c *CFG) connectEdge(parent, child *MIRBasicBlock, exitSnapshot []Value) {
 	if parent == nil || child == nil {
 		return
 	}
-	parent.SetChildren([]*MIRBasicBlock{child})
-	child.SetParents([]*MIRBasicBlock{parent})
+	// Append edge (parent -> child) without clobbering existing edges.
+	// Many real-world contracts (jump tables, loops) have multiple predecessors/successors.
+	// Overwriting here corrupts CFG structure and PHI construction.
+	{
+		children := parent.Children()
+		found := false
+		for _, ch := range children {
+			if ch == child {
+				found = true
+				break
+			}
+		}
+		if !found {
+			children = append(children, child)
+			parent.SetChildren(children)
+		}
+	}
+	{
+		parents := child.Parents()
+		found := false
+		for _, p := range parents {
+			if p == parent {
+				found = true
+				break
+			}
+		}
+		if !found {
+			parents = append(parents, parent)
+			child.SetParents(parents)
+		}
+	}
 	// Treat nil snapshot as an empty stack snapshot (important to record the predecessor).
 	if exitSnapshot == nil {
 		exitSnapshot = []Value{}

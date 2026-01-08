@@ -4,6 +4,168 @@ import (
 	"github.com/holiman/uint256"
 )
 
+func newConstValueFromU(x *uint256.Int) *Value {
+	if x == nil {
+		return newValue(Konst, nil, nil, []byte{0x00})
+	}
+	// Canonical payload: minimal big-endian, but keep 0 as a single 0 byte so that
+	// constants produced here match common PUSH encodings and are stable for dumps/tests.
+	payload := x.Bytes()
+	if len(payload) == 0 {
+		payload = []byte{0x00}
+	}
+	v := newValue(Konst, nil, nil, payload)
+	// Avoid re-decoding the payload; keep a direct copy of x.
+	v.u = new(uint256.Int).Set(x)
+	return v
+}
+
+func constU256(v *Value) (*uint256.Int, bool) {
+	if v == nil || v.kind != Konst {
+		return nil, false
+	}
+	if v.u != nil {
+		return new(uint256.Int).Set(v.u), true
+	}
+	return uint256.NewInt(0).SetBytes(v.payload), true
+}
+
+func tryConstFoldUnary(op MirOperation, aVal *Value) (*Value, bool) {
+	a, ok := constU256(aVal)
+	if !ok {
+		return nil, false
+	}
+	out := new(uint256.Int)
+	switch op {
+	case MirNOT:
+		out.Not(a)
+	case MirISZERO:
+		if a.IsZero() {
+			out.SetOne()
+		} else {
+			out.Clear()
+		}
+	default:
+		return nil, false
+	}
+	return newConstValueFromU(out), true
+}
+
+func tryConstFoldBinary(op MirOperation, aVal, bVal *Value) (*Value, bool) {
+	// IMPORTANT: operand order here must match MIRInterpreter, which evaluates operand0 as 'a'
+	// and operand1 as 'b' and then executes the opcode-specific logic.
+	a, okA := constU256(aVal)
+	b, okB := constU256(bVal)
+	if !okA || !okB {
+		return nil, false
+	}
+	out := new(uint256.Int)
+	switch op {
+	case MirADD:
+		out.Add(a, b)
+	case MirMUL:
+		out.Mul(a, b)
+	case MirSUB:
+		out.Sub(a, b)
+	case MirDIV:
+		out.Div(a, b)
+	case MirSDIV:
+		out.SDiv(a, b)
+	case MirMOD:
+		out.Mod(a, b)
+	case MirSMOD:
+		out.SMod(a, b)
+	case MirSIGNEXT:
+		// Mirror the previously implemented peephole semantics: ExtendSign(byteIndex=b, value=a).
+		out.ExtendSign(b, a)
+	case MirLT:
+		if a.Lt(b) {
+			out.SetOne()
+		} else {
+			out.Clear()
+		}
+	case MirGT:
+		if a.Gt(b) {
+			out.SetOne()
+		} else {
+			out.Clear()
+		}
+	case MirSLT:
+		if a.Slt(b) {
+			out.SetOne()
+		} else {
+			out.Clear()
+		}
+	case MirSGT:
+		if a.Sgt(b) {
+			out.SetOne()
+		} else {
+			out.Clear()
+		}
+	case MirEQ:
+		if a.Eq(b) {
+			out.SetOne()
+		} else {
+			out.Clear()
+		}
+	case MirAND:
+		out.And(a, b)
+	case MirOR:
+		out.Or(a, b)
+	case MirXOR:
+		out.Xor(a, b)
+	case MirBYTE:
+		// EVM: BYTE(n, x) => nth byte of x (0=most significant), or 0 if n>=32.
+		n := a.Uint64()
+		if n >= 32 {
+			out.Clear()
+		} else {
+			b32 := b.Bytes32()
+			out.SetUint64(uint64(b32[n]))
+		}
+	case MirSHL:
+		out.Lsh(b, uint(a.Uint64()))
+	case MirSHR:
+		out.Rsh(b, uint(a.Uint64()))
+	case MirSAR:
+		out.SRsh(b, uint(a.Uint64()))
+	default:
+		return nil, false
+	}
+	return newConstValueFromU(out), true
+}
+
+func tryConstFoldTernary(op MirOperation, aVal, bVal, cVal *Value) (*Value, bool) {
+	a, okA := constU256(aVal)
+	b, okB := constU256(bVal)
+	c, okC := constU256(cVal)
+	if !okA || !okB || !okC {
+		return nil, false
+	}
+	out := new(uint256.Int)
+	switch op {
+	case MirADDMOD:
+		// (a + b) % c, but EVM returns 0 if c==0.
+		if c.IsZero() {
+			out.Clear()
+		} else {
+			tmp := new(uint256.Int).Add(a, b)
+			out.Mod(tmp, c)
+		}
+	case MirMULMOD:
+		// (a * b) % c, but EVM returns 0 if c==0.
+		if c.IsZero() {
+			out.Clear()
+		} else {
+			tmp := new(uint256.Int).Mul(a, b)
+			out.Mod(tmp, c)
+		}
+	default:
+		return nil, false
+	}
+	return newConstValueFromU(out), true
+}
+
 // bitmap is a bit map which maps basicblock in to a bit
 type bitmap []byte
 
@@ -260,6 +422,16 @@ func (b *MIRBasicBlock) appendMIR(mir *MIR) *MIR {
 
 func (b *MIRBasicBlock) CreateUnaryOpMIR(op MirOperation, stack *ValueStack) (mir *MIR) {
 	opnd1 := stack.pop()
+	// Constant fold if possible (build-time only). If folded, do not emit MIR; gas is accounted
+	// by per-block EVM opcode stream aggregation.
+	switch op {
+	case MirNOT, MirISZERO:
+		if folded, ok := tryConstFoldUnary(op, &opnd1); ok {
+			stack.push(folded)
+			return nil
+		}
+	}
+
 	mir = newUnaryOpMIR(op, &opnd1, stack)
 
 	// Only push result if the operation wasn't optimized away (MirNOP)
@@ -272,8 +444,11 @@ func (b *MIRBasicBlock) CreateUnaryOpMIR(op MirOperation, stack *ValueStack) (mi
 			stack.push(mir.Result())
 		}
 	}
-	// If mir.op == MirNOP, doPeepHole already pushed the optimized constant to stack
-	// Still emit the NOP so that runtime gas accounting can charge for the original opcode
+	// If mir.op == MirNOP, peephole already pushed the optimized constant to stack.
+	// Do not emit runtime MIR for NOP; gas is accounted via per-block opcode stream aggregation.
+	if mir.op == MirNOP {
+		return nil
+	}
 	mir = b.appendMIR(mir)
 	mir.genStackDepth = stack.size()
 	return mir
@@ -282,6 +457,12 @@ func (b *MIRBasicBlock) CreateUnaryOpMIR(op MirOperation, stack *ValueStack) (mi
 func (b *MIRBasicBlock) CreateBinOpMIR(op MirOperation, stack *ValueStack) (mir *MIR) {
 	opnd1 := stack.pop()
 	opnd2 := stack.pop()
+	// Constant fold if possible (build-time only). If folded, do not emit MIR; gas is accounted
+	// by per-block EVM opcode stream aggregation.
+	if folded, ok := tryConstFoldBinary(op, &opnd1, &opnd2); ok {
+		stack.push(folded)
+		return nil
+	}
 	mir = newBinaryOpMIR(op, &opnd1, &opnd2, stack)
 
 	// Only push result if the operation wasn't optimized away (MirNOP)
@@ -306,6 +487,13 @@ func (b *MIRBasicBlock) CreateTernaryOpMIR(op MirOperation, stack *ValueStack) (
 	opndA := stack.pop() // first (top)
 	opndB := stack.pop() // second
 	opndC := stack.pop() // third (e.g., modulus)
+
+	// Constant fold if possible (build-time only). If folded, do not emit MIR; gas is accounted
+	// by per-block EVM opcode stream aggregation.
+	if folded, ok := tryConstFoldTernary(op, &opndA, &opndB, &opndC); ok {
+		stack.push(folded)
+		return nil
+	}
 
 	// Try peephole optimization for 3-operand operations  // todo clyde add peephole optimization later
 	// if doPeepHole3Ops(op, &opndA, &opndB, &opndC, stack, nil) {
