@@ -127,14 +127,8 @@ type MIRInterpreter struct {
 		outSz uint256.Int, outSzDefPC uint, outSzDefOp MirOperation,
 		inOffOv bool, inSzOv bool, outOffOv bool, outSzOv bool)
 
-	// Guard against accidental duplicate log emission at the same EVM pc.
-	// This should never happen in a correct interpreter (a single LOG opcode emits at most one log).
-	lastLogSet    bool
-	lastLogPC     uint
-	lastLogAddr   common.Address
-	lastLogTopics []common.Hash
-	lastLogData   []byte
-	seenLogSigs   map[common.Hash]struct{}
+	// NOTE: Do not add "duplicate log" guards here. Emitting identical logs multiple times
+	// is perfectly legal EVM behavior (e.g. loops), and strict MIR must preserve it.
 
 	// Execution cursor (for GAS/call-gas semantics when constant gas is precharged at block entry).
 	curBlock *MIRBasicBlock
@@ -325,11 +319,7 @@ func (it *MIRInterpreter) ResetForRun(cfg *CFG) {
 	it.debugOperandHookEx = nil
 	it.debugKeccakHook = nil
 	it.debugPhiHook = nil
-	it.lastLogSet = false
-	it.lastLogPC = 0
-	it.lastLogTopics = nil
-	it.lastLogData = nil
-	it.seenLogSigs = nil
+	// (no log de-dup guards)
 }
 
 func (it *MIRInterpreter) SetStepHook(h func(evmPC uint, evmOp byte, op MirOperation)) {
@@ -1362,68 +1352,7 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 
 				// 4. Record log via backend
 				if it.state != nil {
-					// If we observe the exact same log payload more than once in a single MIR run,
-					// treat this as an unsupported MIR control-flow divergence and fall back to native.
-					// (Legitimate identical duplicate logs are extremely rare; this is a pragmatic guard
-					// to keep fullnode sync progressing while we debug IR/CFG issues.)
-					if it.seenLogSigs == nil {
-						it.seenLogSigs = make(map[common.Hash]struct{}, 4)
-					}
-					buf := make([]byte, 0, len(it.contractAddr)+32*len(topics)+len(data))
-					buf = append(buf, it.contractAddr.Bytes()...)
-					for i := range topics {
-						buf = append(buf, topics[i].Bytes()...)
-					}
-					buf = append(buf, data...)
-					sig := crypto.Keccak256Hash(buf)
-					if _, ok := it.seenLogSigs[sig]; ok {
-						return it.finishResult(ExecResult{Err: fmt.Errorf("MIR unsupported: duplicate log payload")})
-					}
-					it.seenLogSigs[sig] = struct{}{}
-
-					// Defensive: if we observe the exact same log emitted twice at the same EVM pc,
-					// bail out and let the caller fall back to native EVM. This is a strong signal
-					// of MIR control-flow divergence (re-executing a LOG without corresponding trace).
-					if it.lastLogSet && it.lastLogPC == m.evmPC && it.lastLogAddr == it.contractAddr {
-						sameTopics := len(topics) == len(it.lastLogTopics)
-						if sameTopics {
-							for i := range topics {
-								if topics[i] != it.lastLogTopics[i] {
-									sameTopics = false
-									break
-								}
-							}
-						}
-						sameData := len(data) == len(it.lastLogData)
-						if sameData {
-							for i := range data {
-								if data[i] != it.lastLogData[i] {
-									sameData = false
-									break
-								}
-							}
-						}
-						if sameTopics && sameData {
-							return it.finishResult(ExecResult{Err: fmt.Errorf("MIR unsupported: duplicate log at pc=%d", m.evmPC)})
-						}
-					}
 					it.state.AddLog(it.contractAddr, topics, data, it.blockNumber)
-					// Remember last log payload (copy) for the duplicate-at-same-pc guard.
-					it.lastLogSet = true
-					it.lastLogPC = m.evmPC
-					it.lastLogAddr = it.contractAddr
-					if len(topics) == 0 {
-						it.lastLogTopics = nil
-					} else {
-						it.lastLogTopics = make([]common.Hash, len(topics))
-						copy(it.lastLogTopics, topics)
-					}
-					if len(data) == 0 {
-						it.lastLogData = nil
-					} else {
-						it.lastLogData = make([]byte, len(data))
-						copy(it.lastLogData, data)
-					}
 				}
 
 			case MirBALANCE:
