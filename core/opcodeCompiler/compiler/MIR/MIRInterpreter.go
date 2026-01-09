@@ -163,6 +163,19 @@ type MIRInterpreter struct {
 	manageStateSnapshots bool
 }
 
+func snapshotHasDefsFromBlock(snap []Value, blockNum uint) bool {
+	for i := range snap {
+		v := &snap[i]
+		if v == nil || v.kind != Variable || v.def == nil {
+			continue
+		}
+		if v.def.defBlockNum == blockNum {
+			return true
+		}
+	}
+	return false
+}
+
 func NewMIRInterpreter(cfg *CFG) *MIRInterpreter {
 	it := &MIRInterpreter{
 		cfg:            cfg,
@@ -617,11 +630,20 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 					return it.finishResult(ExecResult{HaltOp: MirSTOP})
 				}
 				// Deterministic: fallthrough to the first child (for non-terminator blocks).
-				// Record the edge snapshot using the actual runtime entry for this block. This matters
-				// for blocks entered via different predecessors (loops): using cur.ExitStack() directly
-				// can poison downstream PHIs and cause invalid jumpdests.
+				// Record the edge snapshot using the actual runtime entry for this block only when needed.
+				// Computing snapshots is allocation-heavy; avoid doing it on steady-state forward edges.
+				//
+				// Correctness: still refresh for back-edges/self-loops, unresolved jumps, and when an
+				// existing snapshot carries "future defs" from the target block.
 				if it.cfg != nil && cur != nil && children[0] != nil {
-					it.cfg.connectEdge(cur, children[0], it.computeExitSnapshotForEdgeTo(prev, cur, children[0]))
+					to := children[0]
+					if to.incomingStacks == nil {
+						it.cfg.connectEdge(cur, to, it.computeExitSnapshotForEdgeTo(prev, cur, to))
+					} else if snap, ok := to.incomingStacks[cur]; !ok || snap == nil {
+						it.cfg.connectEdge(cur, to, it.computeExitSnapshotForEdgeTo(prev, cur, to))
+					} else if to.firstPC <= cur.firstPC || cur.unresolvedJump || snapshotHasDefsFromBlock(snap, to.blockNum) {
+						it.cfg.connectEdge(cur, to, it.computeExitSnapshotForEdgeTo(prev, cur, to))
+					}
 				}
 				prev, cur = cur, children[0]
 				break execBlock
@@ -1572,7 +1594,13 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 							// snapshots can be symbolic and may miss runtime-dependent values (e.g. MLOAD),
 							// which will break stack-dependent control flow in jump-table code.
 							if it.cfg != nil {
-								it.cfg.connectEdge(cur, ch, it.computeExitSnapshotForEdgeTo(prev, cur, ch))
+								if ch.incomingStacks == nil {
+									it.cfg.connectEdge(cur, ch, it.computeExitSnapshotForEdgeTo(prev, cur, ch))
+								} else if snap, ok := ch.incomingStacks[cur]; !ok || snap == nil {
+									it.cfg.connectEdge(cur, ch, it.computeExitSnapshotForEdgeTo(prev, cur, ch))
+								} else if ch.firstPC <= cur.firstPC || cur.unresolvedJump || snapshotHasDefsFromBlock(snap, ch.blockNum) {
+									it.cfg.connectEdge(cur, ch, it.computeExitSnapshotForEdgeTo(prev, cur, ch))
+								}
 							}
 							prev, cur = cur, ch
 							break execBlock
@@ -1602,7 +1630,13 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 						for _, ch := range cur.Children() {
 							if ch != nil && ch.firstPC == target {
 								if it.cfg != nil {
-									it.cfg.connectEdge(cur, ch, it.computeExitSnapshotForEdgeTo(prev, cur, ch))
+									if ch.incomingStacks == nil {
+										it.cfg.connectEdge(cur, ch, it.computeExitSnapshotForEdgeTo(prev, cur, ch))
+									} else if snap, ok := ch.incomingStacks[cur]; !ok || snap == nil {
+										it.cfg.connectEdge(cur, ch, it.computeExitSnapshotForEdgeTo(prev, cur, ch))
+									} else if ch.firstPC <= cur.firstPC || cur.unresolvedJump || snapshotHasDefsFromBlock(snap, ch.blockNum) {
+										it.cfg.connectEdge(cur, ch, it.computeExitSnapshotForEdgeTo(prev, cur, ch))
+									}
 								}
 								prev, cur = cur, ch
 								break execBlock
@@ -1647,7 +1681,13 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 				// connectEdge is idempotent (it returns early if the snapshot is unchanged), so this avoids
 				// churn while still fixing correctness for loop-induced predecessor-sensitive stacks.
 				if cur != nil && ft != nil && it.cfg != nil {
-					it.cfg.connectEdge(cur, ft, it.computeExitSnapshotForEdgeTo(prev, cur, ft))
+					if ft.incomingStacks == nil {
+						it.cfg.connectEdge(cur, ft, it.computeExitSnapshotForEdgeTo(prev, cur, ft))
+					} else if snap, ok := ft.incomingStacks[cur]; !ok || snap == nil {
+						it.cfg.connectEdge(cur, ft, it.computeExitSnapshotForEdgeTo(prev, cur, ft))
+					} else if ft.firstPC <= cur.firstPC || cur.unresolvedJump || snapshotHasDefsFromBlock(snap, ft.blockNum) {
+						it.cfg.connectEdge(cur, ft, it.computeExitSnapshotForEdgeTo(prev, cur, ft))
+					}
 				}
 				prev, cur = cur, ft
 				break execBlock
