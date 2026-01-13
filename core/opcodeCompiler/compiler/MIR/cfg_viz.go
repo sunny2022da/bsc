@@ -15,19 +15,41 @@ func (c *CFG) ToDot() string {
 	for _, block := range c.basicBlocks {
 		// Node Label: Block ID + PC Range + stack heights
 		entryH := 0
+		entryNote := ""
 		if block.entryStack != nil {
 			entryH = len(block.entryStack)
+		} else if block.incomingStacks != nil && len(block.incomingStacks) > 0 {
+			// entryStack is frequently invalidated during CFG construction whenever a new predecessor edge is
+			// connected (to force PHI/entry recomputation). For visualization, infer the likely entry height
+			// from recorded incoming snapshots.
+			counts := make(map[int]int, 4)
+			for _, s := range block.incomingStacks {
+				counts[len(s)]++
+			}
+			modeLen := -1
+			modeCnt := -1
+			for l, c := range counts {
+				if c > modeCnt || (c == modeCnt && (modeLen < 0 || l < modeLen)) {
+					modeLen = l
+					modeCnt = c
+				}
+			}
+			if modeLen >= 0 {
+				entryH = modeLen
+				entryNote = " (inferred)"
+			}
 		}
 		exitH := 0
 		if block.exitStack != nil {
 			exitH = len(block.exitStack)
 		}
 		label := fmt.Sprintf(
-			"Block %d\\nPC: %d..%d\\nStack: in=%d out=%d",
+			"Block %d\\nPC: %d..%d\\nStack: in=%d%s out=%d",
 			block.blockNum,
 			block.firstPC,
 			block.lastPC,
 			entryH,
+			entryNote,
 			exitH,
 		)
 		if block.unresolvedJump {

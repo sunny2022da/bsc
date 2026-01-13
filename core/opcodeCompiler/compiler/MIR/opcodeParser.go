@@ -308,7 +308,14 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 			phiStackIndex := (height - 1) - i
 			block.CreatePhiMIR(ops, stack, phiStackIndex)
 		}
-		block.SetEntryStack(stack.data)
+		// IMPORTANT: distinguish "computed empty entry stack" from "unknown/uncomputed".
+		// ValueStack.data is nil for height=0, but we use nil entryStack as an invalidation marker.
+		// Use an explicit empty slice so callers/tools (e.g., mir_visualizer) don't treat it as unknown.
+		if stack.data == nil {
+			block.SetEntryStack([]Value{})
+		} else {
+			block.SetEntryStack(stack.data)
+		}
 		return stack
 	}
 

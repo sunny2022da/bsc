@@ -4,10 +4,12 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"sync/atomic"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/holiman/uint256"
 )
@@ -28,6 +30,50 @@ type ExecResult struct {
 
 // Shared immutable zero value to avoid allocations in hot paths.
 var u256Zero = new(uint256.Int)
+
+// entryStack mismatch counters: helpful signal for invalid bytecode or CFG/snapshot bugs.
+// Throttled to avoid log spam during fullnode sync.
+var (
+	mirEntryStackMismatchCount atomic.Uint64
+	mirEntryStackMismatchTick  atomic.Uint64
+)
+
+func maybeLogEntryStackMismatch(it *MIRInterpreter, cur, prev *MIRBasicBlock, entryLen, incomingLen int) {
+	// Throttle: log at most once per 1024 mismatches globally.
+	const every = uint64(1024)
+	n := mirEntryStackMismatchCount.Add(1)
+	if (n % every) != 1 {
+		return
+	}
+	// Ensure only one goroutine logs per tick.
+	if !mirEntryStackMismatchTick.CompareAndSwap(n-every, n) && n != 1 {
+		return
+	}
+	codeHash := common.Hash{}
+	if it != nil && it.cfg != nil {
+		codeHash = it.cfg.codeAddr
+	}
+	curPC, prevPC := uint(0), uint(0)
+	curUnr, prevUnr := false, false
+	if cur != nil {
+		curPC = cur.firstPC
+		curUnr = cur.unresolvedJump
+	}
+	if prev != nil {
+		prevPC = prev.firstPC
+		prevUnr = prev.unresolvedJump
+	}
+	log.Warn("MIR entryStack length mismatch (potential CFG/snapshot bug or invalid bytecode)",
+		"count", n,
+		"codeHash", codeHash.Hex(),
+		"cur", fmt.Sprintf("0x%x", curPC),
+		"prev", fmt.Sprintf("0x%x", prevPC),
+		"entryLen", entryLen,
+		"incomingLen", incomingLen,
+		"curUnresolvedJump", curUnr,
+		"prevUnresolvedJump", prevUnr,
+	)
+}
 
 // MIRInterpreter executes MIRBasicBlocks produced by CFG.Parse().
 // This is a "minimal" interpreter: enough to validate CFG/PHI/control-flow and core arithmetic.
@@ -575,7 +621,51 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 		if prev != nil && cur != nil && cur.incomingStacks != nil {
 			if in, ok := cur.incomingStacks[prev]; ok && in != nil {
 				es := cur.EntryStack()
-				if es == nil || len(es) != len(in) {
+				// If the block's entry stack height differs from the concrete incoming snapshot height
+				// for this predecessor edge, we must rebuild with the correct shape.
+				//
+				// IMPORTANT:
+				// - entryStack==nil is often used as an invalidation marker when CFG edges/snapshots change.
+				//   In that common case, if all incoming stacks have the same height, we want
+				//   buildBasicBlock -> getEntryStackForBlock to recompute from *all* incomings and
+				//   (re)introduce PHIs as needed (instead of specializing to a single predecessor).
+				// - however, when incoming stack *heights vary* (dynamic CFG backfill / invalid bytecode),
+				//   we must specialize the entry stack to this predecessor edge, otherwise the mode-height
+				//   filter may discard the current edge and we won't rebuild to the needed shape.
+				needSeed := false
+				if es != nil {
+					needSeed = len(es) != len(in)
+				} else {
+					// entryStack is nil; only seed if incoming stack heights vary and this edge's height
+					// is not the mode height.
+					modeLen := -1
+					modeCnt := -1
+					counts := make(map[int]int, 4)
+					for _, s := range cur.incomingStacks {
+						counts[len(s)]++
+					}
+					for l, c := range counts {
+						if c > modeCnt || (c == modeCnt && (modeLen < 0 || l < modeLen)) {
+							modeLen, modeCnt = l, c
+						}
+					}
+					if len(counts) > 1 && modeLen >= 0 && len(in) != modeLen {
+						needSeed = true
+					}
+				}
+				if needSeed {
+					// This should be rare for valid bytecode: feasible paths reaching the same JUMPDEST
+					// should have the same stack height. When it happens, it often indicates either:
+					// - incomplete/unstable dynamic CFG discovery (transient), or
+					// - a CFG/snapshot bookkeeping bug.
+					//
+					// Log (throttled) so we can notice it during long sync runs.
+					maybeLogEntryStackMismatch(it, cur, prev, func() int {
+						if es == nil {
+							return -1
+						}
+						return len(es)
+					}(), len(in))
 					// Seed entryStack from the concrete incoming snapshot for this predecessor edge.
 					seed := make([]Value, len(in))
 					copy(seed, in)
@@ -669,6 +759,8 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 			if it.stepHook != nil {
 				it.stepHook(m.evmPC, m.evmOp, m.op)
 			}
+
+			// Optional debug hooks
 			if it.debugOperandHook != nil {
 				// Targeted operand capture for diagnosing control-flow divergence.
 				switch m.op {
@@ -910,6 +1002,7 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 				}
 			}
 
+			// executes the MIR operation
 			switch m.op {
 			case MirPHI:
 				v, err := it.evalPhi(cur, prev, m)
@@ -2808,7 +2901,7 @@ func (it *MIRInterpreter) ensureBlockConstPrefix(b *MIRBasicBlock) []uint64 {
 		return it.blockConstPrefix[b.blockNum]
 	}
 	pfx := make([]uint64, len(b.evmOps)+1)
-	for i := 0; i < len(b.evmOps); i++ {
+	for i := 0; i < len(b.evmOps); i++ { // compute constGas here
 		op := b.evmOps[i].op
 		pfx[i+1] = pfx[i] + it.constGas[int(op)]
 	}

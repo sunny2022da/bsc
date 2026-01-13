@@ -29,10 +29,8 @@ func keyForDef(def *MIR) mirDefKey {
 // MIR is register based intermediate representation
 type MIR struct {
 	op       MirOperation
-	operands []*Value
-	meta     []byte
-	pc       *uint // Program counter of the original instruction (optional)
-	idx      int   // Index within its basic block, set by appendMIR
+	operands []*Value // representing the inputs to this MIR op.
+	idx      int      // Index within its basic block, set by appendMIR
 	// resIdx is a global, per-CFG result slot index assigned during CFG build.
 	// It enables fast operand evaluation and dense result storage at runtime.
 	// 0 means "unassigned" (e.g. tests constructing MIR manually).
@@ -92,8 +90,6 @@ func newNopMIR(operation MirOperation, original_opnds []*Value) *MIR {
 	mir := new(MIR)
 	mir.op = MirNOP
 	mir.operands = original_opnds
-	// no deprecated alias
-	mir.meta = []byte{byte(operation)}
 	return mir
 }
 

@@ -28,7 +28,25 @@
                 <button type="button" onclick="clearHistory()" style="background:#6c757d;">Clear</button>
             </div>
             <textarea id="bytecode" placeholder="0x6001600201..."></textarea>
-            <button onclick="visualize()">Visualize</button>
+            <div style="display:flex; gap:10px; margin-bottom:10px;">
+                <button style="flex:1;" onclick="initSession()">Parse (CFG.Parse)</button>
+                <button style="flex:1; background:#198754;" onclick="runWithCalldata()">Run (expand CFG)</button>
+            </div>
+            <div style="margin-bottom:10px;">
+                <div style="font-weight:600; margin-bottom:6px;">Calldata (Hex, optional)</div>
+                <input id="calldata" placeholder="0x..." style="width:100%; padding:8px; font-family:monospace;" />
+                <div style="display:flex; align-items:center; gap:8px; margin-top:8px;">
+                    <input id="pad32" type="checkbox" checked />
+                    <label for="pad32" style="font-size:12px; color:#333;">
+                        Right-align and pad to 32 bytes (so <code>0x01</code> means last byte is 0x01)
+                    </label>
+                </div>
+                <div style="font-size:12px; color:#666; margin-top:6px;">
+                    Tip: for `cfg_example_dynamic_jump_table.hex`, the jump uses <code>CALLDATALOAD(0) &amp; 1</code>, i.e. the LSB of the 256-bit word (the last byte of a 32-byte word).
+                    With padding enabled, try <code>0x00</code> (bit0=0 → jump 0x20) then <code>0x01</code> (bit0=1 → jump 0x30).
+                </div>
+            </div>
+            <div id="run-info" style="font-family:monospace; font-size:12px; color:#333; margin-bottom:10px;"></div>
             <div id="error"></div>
         </div>
         <div id="output-pane">
@@ -40,6 +58,7 @@
         const viz = new Viz();
         const HISTORY_KEY = "mir_visualizer_bytecode_history_v1";
         const HISTORY_LIMIT = 30;
+        let currentSessionId = "";
 
         function normalizeInput(s) {
             if (!s) return "";
@@ -121,17 +140,33 @@
         // Initialize history dropdown on page load
         refreshHistoryDropdown();
 
-        async function visualize() {
+        async function renderDot(dot) {
+            const errorDiv = document.getElementById('error');
+            const graphDiv = document.getElementById('graph');
+            viz.renderSVGElement(dot)
+                .then(element => {
+                    graphDiv.innerHTML = '';
+                    graphDiv.appendChild(element);
+                })
+                .catch(error => {
+                    graphDiv.innerHTML = '';
+                    errorDiv.textContent = 'Render error: ' + error;
+                });
+        }
+
+        async function initSession() {
             const bytecode = document.getElementById('bytecode').value;
             const errorDiv = document.getElementById('error');
             const graphDiv = document.getElementById('graph');
+            const runInfo = document.getElementById('run-info');
             
             errorDiv.textContent = '';
             graphDiv.innerHTML = 'Generating...';
+            runInfo.textContent = '';
 
             try {
                 addToHistory(bytecode);
-                const response = await fetch('/visualize', {
+                const response = await fetch('/init', {
                     method: 'POST',
                     body: bytecode
                 });
@@ -140,18 +175,60 @@
                     throw new Error(await response.text());
                 }
 
-                const dot = await response.text();
-                
-                viz.renderSVGElement(dot)
-                    .then(element => {
-                        graphDiv.innerHTML = '';
-                        graphDiv.appendChild(element);
-                    })
-                    .catch(error => {
-                        graphDiv.innerHTML = '';
-                        errorDiv.textContent = 'Render error: ' + error;
-                    });
+                const data = await response.json();
+                currentSessionId = data.sessionId || "";
+                runInfo.textContent = currentSessionId ? ("sessionId=" + currentSessionId) : "";
+                await renderDot(data.dot);
 
+            } catch (err) {
+                graphDiv.innerHTML = '';
+                errorDiv.textContent = err.message;
+            }
+        }
+
+        async function runWithCalldata() {
+            const errorDiv = document.getElementById('error');
+            const graphDiv = document.getElementById('graph');
+            const runInfo = document.getElementById('run-info');
+            const calldata = document.getElementById('calldata').value || "";
+            const pad32 = document.getElementById('pad32').checked;
+
+            errorDiv.textContent = '';
+            if (!currentSessionId) {
+                errorDiv.textContent = "No session yet. Click 'Parse (CFG.Parse)' first.";
+                return;
+            }
+            graphDiv.innerHTML = 'Running...';
+
+            try {
+                let cd = calldata;
+                // For demos: right-align to 32 bytes so that `0x01` sets the least significant byte
+                // of CALLDATALOAD(0). Without this, a 1-byte calldata means byte[0] (MSB), and `& 1` is still 0.
+                if (pad32) {
+                    const norm = normalizeInput(calldata);
+                    if (norm && norm.length <= 64) {
+                        const padded = norm.padStart(64, "0");
+                        cd = "0x" + padded;
+                    }
+                }
+                const response = await fetch('/run', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ sessionId: currentSessionId, calldata: cd })
+                });
+                if (!response.ok) {
+                    throw new Error(await response.text());
+                }
+                const data = await response.json();
+                const parts = [];
+                parts.push("sessionId=" + currentSessionId);
+                if (data.haltOp) parts.push("halt=" + data.haltOp);
+                if (data.gasUsed !== undefined) parts.push("gasUsed=" + data.gasUsed);
+                if (data.gasLeft !== undefined) parts.push("gasLeft=" + data.gasLeft);
+                if (data.returnHex) parts.push("return=" + data.returnHex);
+                if (data.err) parts.push("err=" + data.err);
+                runInfo.textContent = parts.join(" | ");
+                await renderDot(data.dot);
             } catch (err) {
                 graphDiv.innerHTML = '';
                 errorDiv.textContent = err.message;
