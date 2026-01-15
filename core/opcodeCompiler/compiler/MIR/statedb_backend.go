@@ -135,6 +135,20 @@ func (b *StateDBBackend) SetState(addr common.Address, slot common.Hash, value c
 	b.db.SetState(addr, slot, value)
 }
 
+func (b *StateDBBackend) GetTransientState(addr common.Address, slot common.Hash) common.Hash {
+	if b == nil || b.db == nil {
+		return common.Hash{}
+	}
+	return b.db.GetTransientState(addr, slot)
+}
+
+func (b *StateDBBackend) SetTransientState(addr common.Address, slot common.Hash, value common.Hash) {
+	if b == nil || b.db == nil {
+		return
+	}
+	b.db.SetTransientState(addr, slot, value)
+}
+
 func (b *StateDBBackend) AddRefund(gas uint64) {
 	if b == nil || b.db == nil {
 		return

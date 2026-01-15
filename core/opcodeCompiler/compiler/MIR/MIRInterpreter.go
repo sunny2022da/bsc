@@ -1014,7 +1014,7 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 			case MirPOP:
 				// effect already modeled by IR; no runtime action needed here
 
-			case MirADD, MirMUL, MirSUB, MirDIV, MirSDIV, MirMOD, MirSMOD, MirEXP,
+			case MirADD, MirMUL, MirSUB, MirDIV, MirSDIV, MirMOD, MirSMOD, MirEXP, MirSIGNEXT,
 				MirAND, MirOR, MirXOR, MirBYTE, MirSHL, MirSHR, MirSAR,
 				MirLT, MirGT, MirSLT, MirSGT, MirEQ:
 				// Dynamic gas: EXP charges per-byte of exponent (on top of constant gas).
@@ -1045,6 +1045,9 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 					out.SMod(a, b)
 				case MirEXP:
 					out.Exp(a, b)
+				case MirSIGNEXT:
+					// EVM SIGNEXTEND: stack is [byteIndex(top)=a, value=b]; ExtendSign(value, byteIndex).
+					out.ExtendSign(b, a)
 				case MirAND:
 					out.And(a, b)
 				case MirOR:
@@ -1097,6 +1100,28 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 					} else {
 						out.Clear()
 					}
+				}
+
+			case MirADDMOD, MirMULMOD:
+				// Ternary ops: operands are [a(top), b, c(modulus)].
+				a, err := it.evalOperand(m, 0)
+				if err != nil {
+					return it.finishResult(ExecResult{Err: err})
+				}
+				b, err := it.evalOperand(m, 1)
+				if err != nil {
+					return it.finishResult(ExecResult{Err: err})
+				}
+				c, err := it.evalOperand(m, 2)
+				if err != nil {
+					return it.finishResult(ExecResult{Err: err})
+				}
+				out := it.resultSlot(m)
+				switch m.op {
+				case MirADDMOD:
+					out.AddMod(a, b, c)
+				case MirMULMOD:
+					out.MulMod(a, b, c)
 				}
 
 			case MirNOT, MirISZERO:
@@ -1398,6 +1423,31 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 				}
 				if it.state != nil {
 					it.state.SetState(it.contractAddr, slot, val)
+				}
+
+			case MirTLOAD:
+				keyU, err := it.evalOperand(m, 0)
+				if err != nil {
+					return it.finishResult(ExecResult{Err: err})
+				}
+				slot := common.Hash(keyU.Bytes32())
+				var hv common.Hash
+				if it.state != nil {
+					hv = it.state.GetTransientState(it.contractAddr, slot)
+				}
+				it.resultSlot(m).SetBytes(hv[:])
+
+			case MirTSTORE:
+				keyU, err := it.evalOperand(m, 0)
+				if err != nil {
+					return it.finishResult(ExecResult{Err: err})
+				}
+				valU, err := it.evalOperand(m, 1)
+				if err != nil {
+					return it.finishResult(ExecResult{Err: err})
+				}
+				if it.state != nil {
+					it.state.SetTransientState(it.contractAddr, common.Hash(keyU.Bytes32()), common.Hash(valU.Bytes32()))
 				}
 
 			case MirMCOPY:

@@ -104,5 +104,3 @@ func TestCFGExampleDispatchLoop_ExecutesBlock3Phi(t *testing.T) {
 	// Note: debugPhiHook is best-effort (it only fires on some evalPhi paths).
 	_ = phiHookCalls
 }
-
-

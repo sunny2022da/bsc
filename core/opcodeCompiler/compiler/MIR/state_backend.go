@@ -26,6 +26,10 @@ type StateBackend interface {
 	GetCommittedState(addr common.Address, slot common.Hash) common.Hash
 	SetState(addr common.Address, slot common.Hash, value common.Hash)
 
+	// Transient storage (EIP-1153): per-transaction key/value store.
+	GetTransientState(addr common.Address, slot common.Hash) common.Hash
+	SetTransientState(addr common.Address, slot common.Hash, value common.Hash)
+
 	AddRefund(gas uint64)
 	SubRefund(gas uint64)
 	GetRefund() uint64
@@ -48,6 +52,7 @@ type StateBackend interface {
 type InMemoryState struct {
 	current   map[[52]byte]common.Hash
 	committed map[[52]byte]common.Hash
+	transient map[[52]byte]common.Hash
 	refund    uint64
 	addrWarm  map[[20]byte]bool
 	access    map[[20]byte]map[[32]byte]bool
@@ -67,6 +72,7 @@ type InMemoryState struct {
 type inMemorySnapshot struct {
 	current        map[[52]byte]common.Hash
 	committed      map[[52]byte]common.Hash
+	transient      map[[52]byte]common.Hash
 	refund         uint64
 	addrWarm       map[[20]byte]bool
 	access         map[[20]byte]map[[32]byte]bool
@@ -90,6 +96,7 @@ func NewInMemoryState() *InMemoryState {
 	return &InMemoryState{
 		current:        make(map[[52]byte]common.Hash),
 		committed:      make(map[[52]byte]common.Hash),
+		transient:      make(map[[52]byte]common.Hash),
 		refund:         0,
 		addrWarm:       make(map[[20]byte]bool, 64),
 		access:         make(map[[20]byte]map[[32]byte]bool),
@@ -143,6 +150,23 @@ func (s *InMemoryState) GetState(addr common.Address, slot common.Hash) common.H
 		return v
 	}
 	return common.Hash{}
+}
+
+func (s *InMemoryState) GetTransientState(addr common.Address, slot common.Hash) common.Hash {
+	if s == nil {
+		return common.Hash{}
+	}
+	if v, ok := s.transient[storageKey(addr, slot)]; ok {
+		return v
+	}
+	return common.Hash{}
+}
+
+func (s *InMemoryState) SetTransientState(addr common.Address, slot common.Hash, value common.Hash) {
+	if s == nil {
+		return
+	}
+	s.transient[storageKey(addr, slot)] = value
 }
 
 func (s *InMemoryState) GetBalance(addr common.Address) common.Hash {
@@ -356,6 +380,7 @@ func (s *InMemoryState) Snapshot() int {
 	snap := inMemorySnapshot{
 		current:        make(map[[52]byte]common.Hash, len(s.current)),
 		committed:      make(map[[52]byte]common.Hash, len(s.committed)),
+		transient:      make(map[[52]byte]common.Hash, len(s.transient)),
 		refund:         s.refund,
 		addrWarm:       make(map[[20]byte]bool, len(s.addrWarm)),
 		access:         make(map[[20]byte]map[[32]byte]bool, len(s.access)),
@@ -370,6 +395,9 @@ func (s *InMemoryState) Snapshot() int {
 	}
 	for k, v := range s.committed {
 		snap.committed[k] = v
+	}
+	for k, v := range s.transient {
+		snap.transient[k] = v
 	}
 	for k, v := range s.addrWarm {
 		snap.addrWarm[k] = v
@@ -413,6 +441,7 @@ func (s *InMemoryState) RevertToSnapshot(id int) {
 	snap := s.snapshots[id]
 	s.current = snap.current
 	s.committed = snap.committed
+	s.transient = snap.transient
 	s.refund = snap.refund
 	s.addrWarm = snap.addrWarm
 	s.access = snap.access
