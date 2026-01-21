@@ -1139,6 +1139,11 @@ func diffBlockCommonTxs(db ethdb.Database, cfg *params.ChainConfig, genesisHash 
 		baseRes, baseErr := env.processor.Process(blkBase, baseState2, vm.Config{EnableOpcodeOptimizations: false, EnableMIR: false})
 		mirRes, mirErr := env.processor.Process(blkMir, mirState2, vm.Config{EnableOpcodeOptimizations: false, EnableMIR: true})
 		if (baseErr == nil) != (mirErr == nil) {
+			// Helpful diagnosis: if full block processing diverges, print tx0 debug
+			// (this is typically where fee/state differences originate).
+			if len(blk.Transactions()) > 0 {
+				fmt.Print(debugOneTx(env.engine, env.chain, cfg, preStateForDebug, blk, 0))
+			}
 			return fmt.Errorf("full block Process error mismatch: baseErr=%v mirErr=%v", baseErr, mirErr)
 		}
 		if baseErr != nil {

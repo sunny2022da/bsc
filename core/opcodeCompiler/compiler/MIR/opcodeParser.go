@@ -37,6 +37,10 @@ type CFG struct {
 	rawCode         []byte
 	basicBlocks     []*MIRBasicBlock
 	basicBlockCount uint
+	// runtimeEpoch is bumped per top-level execution when CFG is pulled from cache.
+	// Runtime-recorded incoming snapshots are tagged with this epoch so we can ignore
+	// stale snapshots from previous executions (different calldata).
+	runtimeEpoch uint64
 	// nextResIdx allocates global MIR result slots for this CFG.
 	// Index 0 is reserved for "unassigned".
 	nextResIdx int
@@ -90,6 +94,18 @@ func (c *CFG) addBlock(block *MIRBasicBlock) {
 	c.basicBlocks = append(c.basicBlocks, block)
 	c.basicBlockCount++
 	c.pcToBlock[block.firstPC] = block
+}
+
+func (c *CFG) hasUnresolvedJumps() bool {
+	if c == nil {
+		return false
+	}
+	for _, b := range c.basicBlocks {
+		if b != nil && b.unresolvedJump {
+			return true
+		}
+	}
+	return false
 }
 
 // getOrCreateBlock returns the block starting at the given PC, creating it if it doesn't exist.
@@ -229,6 +245,27 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 	//
 	// Build entry stack from recorded incomingStacks, inserting PHIs when values differ.
 	if block.entryStack == nil {
+		// Filter helper: incoming snapshots must never reference defs in the target block itself.
+		// Such snapshots represent loop-carried runtime values and must be handled via PHIs, not by
+		// embedding "future defs" in the entry stack (which later manifests as missing result errors).
+		isValidIncoming := func(s []Value) bool {
+			// Only enforce this during runtime execution of cached CFGs (epoch != 0).
+			// During Parse() fixpoint construction we may temporarily observe self-defs before PHIs
+			// converge; filtering them there can prevent convergence.
+			if c == nil || c.runtimeEpoch == 0 {
+				return true
+			}
+			if len(s) == 0 {
+				return true
+			}
+			for i := range s {
+				v := s[i]
+				if v.kind == Variable && v.def != nil && v.def.defBlockNum == block.blockNum && v.def.op != MirPHI {
+					return false
+				}
+			}
+			return true
+		}
 		// Gather incoming snapshots in a deterministic order based on parents slice.
 		incomings := make([][]Value, 0, len(block.parents))
 		for _, p := range block.parents {
@@ -236,12 +273,29 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 				continue
 			}
 			if s, ok := block.incomingStacks[p]; ok {
+				// Filter stale runtime snapshots from previous executions when CFG is cached.
+				if c != nil && c.runtimeEpoch != 0 && block.incomingStacksGen != nil {
+					if g, okg := block.incomingStacksGen[p]; okg && g != 0 && g != c.runtimeEpoch {
+						continue
+					}
+				}
+				if !isValidIncoming(s) {
+					continue
+				}
 				incomings = append(incomings, s)
 			}
 		}
 		// Fallback: if parents list is empty but incomingStacks exists, use all snapshots.
 		if len(incomings) == 0 && len(block.incomingStacks) > 0 {
-			for _, s := range block.incomingStacks {
+			for p, s := range block.incomingStacks {
+				if c != nil && c.runtimeEpoch != 0 && block.incomingStacksGen != nil {
+					if g, okg := block.incomingStacksGen[p]; okg && g != 0 && g != c.runtimeEpoch {
+						continue
+					}
+				}
+				if !isValidIncoming(s) {
+					continue
+				}
 				incomings = append(incomings, s)
 			}
 		}
@@ -252,33 +306,56 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 		// temporarily record infeasible edges with a different stack height; padding them with
 		// Unknown values poisons PHI generation (and later leads to Unknown->0 at runtime).
 		//
-		// Strategy: keep only the most common incoming stack height, breaking ties toward the
-		// smaller height (safer than assuming extra values exist).
-		modeLen := len(incomings[0])
-		if len(incomings) > 1 {
-			counts := make(map[int]int, 4)
-			for _, s := range incomings {
-				counts[len(s)]++
-			}
-			modeCnt := -1
-			modeLen = -1
-			for l, c := range counts {
-				if c > modeCnt || (c == modeCnt && (modeLen < 0 || l < modeLen)) {
-					modeLen = l
-					modeCnt = c
-				}
-			}
+		// Strategy:
+		// - If runtime asked for a specific height (preferredEntryHeight), rebuild from all incomings
+		//   of that height (still inserting PHIs as needed).
+		// - Otherwise, keep only the most common incoming stack height, breaking ties toward the
+		//   smaller height (safer than assuming extra values exist).
+		height := -1
+		if block.preferredEntryHeight >= 0 {
+			height = block.preferredEntryHeight
 			filtered := make([][]Value, 0, len(incomings))
 			for _, s := range incomings {
-				if len(s) == modeLen {
+				if len(s) == height {
 					filtered = append(filtered, s)
 				}
 			}
 			if len(filtered) > 0 {
 				incomings = filtered
+			} else {
+				// No incomings with the preferred height; fall back to mode selection.
+				height = -1
 			}
+			// One-shot hint: clear after use so future builds aren't biased.
+			block.preferredEntryHeight = -1
 		}
-		height := modeLen
+		if height < 0 {
+			modeLen := len(incomings[0])
+			if len(incomings) > 1 {
+				counts := make(map[int]int, 4)
+				for _, s := range incomings {
+					counts[len(s)]++
+				}
+				modeCnt := -1
+				modeLen = -1
+				for l, c := range counts {
+					if c > modeCnt || (c == modeCnt && (modeLen < 0 || l < modeLen)) {
+						modeLen = l
+						modeCnt = c
+					}
+				}
+				filtered := make([][]Value, 0, len(incomings))
+				for _, s := range incomings {
+					if len(s) == modeLen {
+						filtered = append(filtered, s)
+					}
+				}
+				if len(filtered) > 0 {
+					incomings = filtered
+				}
+			}
+			height = modeLen
+		}
 
 		for i := 0; i < height; i++ {
 			base := incomings[0][i]
@@ -376,6 +453,11 @@ func (c *CFG) connectEdge(parent, child *MIRBasicBlock, exitSnapshot []Value) {
 		}
 	}
 	child.AddIncomingStack(parent, exitSnapshot)
+	if child.incomingStacksGen == nil {
+		child.incomingStacksGen = make(map[*MIRBasicBlock]uint64, 8)
+	}
+	// Tag runtime snapshots with the current epoch; epoch==0 means "base/parse-time".
+	child.incomingStacksGen[parent] = c.runtimeEpoch
 	child.SetEntryStack(nil)
 	child.built = false
 	// Conservative: when a block's incoming stack changes, its PHI set (and thus defs) can change,
@@ -720,9 +802,10 @@ func (c *CFG) buildBasicBlock(block *MIRBasicBlock, validJumpDests map[uint]bool
 				mir = block.appendMIR(mir)
 				mir.genStackDepth = stack.size()
 			case compiler.CREATE:
-				sz := stack.pop()
-				off := stack.pop()
+				// EVM CREATE pops: value(top), offset, size.
 				value := stack.pop()
+				off := stack.pop()
+				sz := stack.pop()
 				mir := new(MIR)
 				mir.op = MirCREATE
 				mir.operands = []*Value{&value, &off, &sz}
@@ -730,10 +813,11 @@ func (c *CFG) buildBasicBlock(block *MIRBasicBlock, validJumpDests map[uint]bool
 				mir = block.appendMIR(mir)
 				mir.genStackDepth = stack.size()
 			case compiler.CREATE2:
-				salt := stack.pop()
-				sz := stack.pop()
-				off := stack.pop()
+				// EVM CREATE2 pops: value(top), offset, size, salt.
 				value := stack.pop()
+				off := stack.pop()
+				sz := stack.pop()
+				salt := stack.pop()
 				mir := new(MIR)
 				mir.op = MirCREATE2
 				mir.operands = []*Value{&value, &off, &sz, &salt}

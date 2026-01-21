@@ -3,7 +3,6 @@ package MIR
 import (
 	"fmt"
 	"math/big"
-	"sync"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/vm"
@@ -20,13 +19,19 @@ import (
 type EVMRunner struct {
 	evm *vm.EVM
 
-	mu       sync.RWMutex
-	cfgCache map[common.Hash]*CFG
-
-	itPool sync.Pool
-
 	stateBackend StateDBBackend
 	callBackend  EVMCallCreateBackend
+
+	// localCFGCache caches CFGs for this EVMRunner instance. This is used for contracts with
+	// unresolved jumps (dynamic control flow), which are not safe to share globally across
+	// blocks/transactions due to runtime mutation (incoming snapshots + dynamic expansion).
+	localCFGCache map[common.Hash]*cfgCacheEntry
+
+	// lastEntry caches the most recently used CFG entry to avoid global cache lookups
+	// in hot repeated-call paths (benchmarks and common view calls).
+	lastAddr     common.Address
+	lastCodeHash common.Hash
+	lastEntry    *cfgCacheEntry
 
 	// Cached per-EVM block context (constant for this EVM instance).
 	blockNumber uint64
@@ -42,11 +47,9 @@ type EVMRunner struct {
 
 func NewEVMRunner(evm *vm.EVM) *EVMRunner {
 	r := &EVMRunner{
-		evm:      evm,
-		cfgCache: make(map[common.Hash]*CFG),
+		evm:           evm,
+		localCFGCache: make(map[common.Hash]*cfgCacheEntry, 128),
 	}
-	// Pool interpreters to avoid per-call allocations (maps/slices). ResetForRun() clears state.
-	r.itPool.New = func() any { return NewMIRInterpreter(nil) }
 	r.stateBackend = StateDBBackend{db: evm.StateDB}
 	r.callBackend = EVMCallCreateBackend{evm: evm}
 
@@ -95,44 +98,72 @@ func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]b
 
 	codeHash := contract.CodeHash
 	if (codeHash == common.Hash{}) {
-		// Some call paths may not set CodeHash; derive it to make caching effective.
-		codeHash = crypto.Keccak256Hash(contract.Code)
+		// Some call paths may not set CodeHash. Fast path: if we're repeatedly calling the
+		// same address, reuse the last computed code hash (avoid hashing large bytecode).
+		if r.lastEntry != nil && r.lastAddr == contract.Address() && (r.lastCodeHash != common.Hash{}) {
+			codeHash = r.lastCodeHash
+		} else {
+			// Fall back to hashing the bytecode.
+			codeHash = crypto.Keccak256Hash(contract.Code)
+		}
+		contract.CodeHash = codeHash
 	}
 
-	r.mu.RLock()
-	cfg := r.cfgCache[codeHash]
-	r.mu.RUnlock()
-
-	if cfg == nil {
-		built := NewCFG(codeHash, contract.Code)
-		if err := built.Parse(); err != nil {
+	// Use global (process-wide) CFG cache to avoid re-parsing hot contracts every block.
+	var entry *cfgCacheEntry
+	if r.lastEntry != nil && r.lastCodeHash == codeHash {
+		entry = r.lastEntry
+	}
+	if r.localCFGCache != nil {
+		if e := r.localCFGCache[codeHash]; e != nil && e.cfg != nil {
+			entry = e
+		}
+	}
+	if entry == nil {
+		e, err := getOrBuildCFGEntry(codeHash, contract.Code)
+		if err != nil {
 			return nil, err
 		}
-		r.mu.Lock()
-		// Another goroutine may have populated it while we were building; keep the first.
-		if existing := r.cfgCache[codeHash]; existing != nil {
-			cfg = existing
-		} else {
-			r.cfgCache[codeHash] = built
-			cfg = built
+		entry = e
+		// If this CFG contains unresolved jumps, keep it in the runner-local cache so
+		// repeated calls in the same EVM (benchmarks/tools) don't re-parse every time.
+		if entry != nil && entry.cfg != nil && entry.cfg.hasUnresolvedJumps() {
+			r.localCFGCache[codeHash] = entry
 		}
-		r.mu.Unlock()
+	}
+	// Update hot-path cache.
+	r.lastAddr = contract.Address()
+	r.lastCodeHash = codeHash
+	r.lastEntry = entry
+	// CFGs are mutated during execution (dynamic expansion + incoming snapshots).
+	cfg := entry.cfg
+	if entry.mutable {
+		// Serialize per-contract executions across goroutines.
+		entry.mu.Lock()
+		defer entry.mu.Unlock()
+		// Bump epoch so any runtime-recorded incoming snapshots from previous executions are ignored.
+		// (Parse-time/base snapshots are tagged with epoch 0 and remain valid for all runs.)
+		cfg.runtimeEpoch = globalCFGRuntimeEpoch.Add(1)
+	} else {
+		// Immutable CFG: avoid lock + epoch overhead (hot for small view calls).
+		cfg.runtimeEpoch = 0
 	}
 
-	it := r.itPool.Get().(*MIRInterpreter)
+	it := globalInterpreterPool.Get().(*MIRInterpreter)
 	it.ResetForRun(cfg)
-	defer r.itPool.Put(it)
-	it.SetGasLimit(contract.Gas)
+	defer globalInterpreterPool.Put(it)
+	// Hot-path setup: write fields directly (same package) to avoid setter call overhead.
+	it.gasLimit = contract.Gas
 	// IMPORTANT: Refund cap is applied by geth's state transition logic, not the runner.
 	// If MIR applies it internally, it will incorrectly refund against post-intrinsic call gas.
-	it.SetApplyRefundCapInFinish(false)
+	it.applyRefundCapInFinish = false
 	// EVM.Call/Create already wraps execution in a StateDB snapshot; avoid duplicating that work here.
-	it.SetManageStateSnapshots(false)
+	it.manageStateSnapshots = false
 	// Ensure we don't leak a previous hook across pooled interpreter instances.
 	if r.mirStepHookFactory != nil {
-		it.SetStepHook(r.mirStepHookFactory(it))
+		it.stepHook = r.mirStepHookFactory(it)
 	} else {
-		it.SetStepHook(r.mirStepHook)
+		it.stepHook = r.mirStepHook
 	}
 
 	// Fork rules + block context (cached in runner)
@@ -152,15 +183,20 @@ func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]b
 	}
 
 	// Call context
-	it.SetContractAddress(contract.Address())
-	it.SetCallerAddress(contract.Caller())
-	it.SetOriginAddress(r.evm.Origin)
-	it.SetCallValue(contract.Value())
-	it.SetCallData(input)
+	it.contractAddr = contract.Address()
+	it.callerAddr = contract.Caller()
+	it.originAddr = r.evm.Origin
+	if v := contract.Value(); v != nil {
+		it.callValue = v
+	} else {
+		it.callValue = u256Zero
+	}
+	it.callData = input
 
 	// Fullnode backends
-	it.SetStateBackend(&r.stateBackend)
-	it.SetCallCreateBackend(&r.callBackend)
+	it.state = &r.stateBackend
+	it.vmStateDB = r.stateBackend.db
+	it.callCreate = &r.callBackend
 
 	res := it.Run()
 	contract.Gas = res.GasLeft

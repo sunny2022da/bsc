@@ -224,6 +224,15 @@ type MIRBasicBlock struct {
 	entryStack     []Value
 	exitStack      []Value
 	incomingStacks map[*MIRBasicBlock][]Value
+	// incomingStacksGen tags runtime-recorded incoming snapshots by CFG runtimeEpoch so cached CFGs
+	// can ignore stale snapshots from previous executions (different calldata).
+	incomingStacksGen map[*MIRBasicBlock]uint64
+	// preferredEntryHeight is a runtime hint used to rebuild this block's entry stack to a
+	// specific height when incoming edge stack heights vary. This avoids seeding the entire
+	// entry stack from a single predecessor (which can introduce "future def" self-references
+	// in loops); instead we rebuild from all incomings of the chosen height and insert PHIs.
+	// -1 means "no preference".
+	preferredEntryHeight int
 	// Precomputed live-outs: definitions (MIR) whose values are live at block exit
 	liveOutDefs []*MIR
 	// Build bookkeeping
@@ -544,6 +553,8 @@ func NewMIRBasicBlock(blockNum, pc uint) *MIRBasicBlock {
 	bb.entryStack = nil
 	bb.exitStack = nil
 	bb.incomingStacks = make(map[*MIRBasicBlock][]Value)
+	bb.incomingStacksGen = make(map[*MIRBasicBlock]uint64)
+	bb.preferredEntryHeight = -1
 	bb.built = false
 	bb.queued = false
 

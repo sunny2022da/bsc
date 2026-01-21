@@ -2,7 +2,7 @@
 # with Go source code. If you know what GOPATH is then you probably
 # don't need to bother with make.
 
-.PHONY: geth evm faucet all test truffle-test lint fmt clean devtools help
+.PHONY: geth evm faucet all test truffle-test lint fmt clean devtools help testMIR
 .PHONY: docker
 
 GOBIN = ./build/bin
@@ -35,6 +35,12 @@ all:
 #? test: Run the tests.
 test: all
 	$(GORUN) build/ci.go test -timeout 1h
+
+#? testMIR: Run all MIR-related tests (including perf-gate) and MIR benchmark suite.
+testMIR:
+	go test ./core/opcodeCompiler/compiler/MIR/... -count=1
+	go test ./core/opcodeCompiler/compiler/MIR/evm_parity_test -count=1
+	go test ./core/opcodeCompiler/compiler/MIR/evm_parity_test -run '^$$' -bench . -benchmem -count=1
 
 #? truffle-test: Run the integration test.
 truffle-test:
