@@ -54,6 +54,18 @@ type CFG struct {
 
 	// Cached valid JUMPDEST map (computed once from rawCode)
 	jumpDests map[uint]bool
+
+	// runtimeBecameDynamic is set when execution discovers control-flow beyond what Parse() built
+	// (e.g. dynamic JUMP targets discovered at runtime). Such CFGs are unsafe to share globally
+	// across blocks/transactions because runtime edge snapshots and partial CFG expansion can leak
+	// path-dependent state and cause consensus divergence.
+	runtimeBecameDynamic bool
+	// hasUnresolvedJumpsFlag is set if any block in this CFG contains a dynamic jump target that cannot
+	// be resolved at build time. This is a cheap flag used to select safer runtime snapshot seeding.
+	hasUnresolvedJumpsFlag bool
+	// needsRuntimeEpochFlag is set if the CFG contains merge points with differing incoming stack heights.
+	// These contracts require runtime-epoch tagging to select the correct entry stack during cached runs.
+	needsRuntimeEpochFlag bool
 }
 
 func NewCFG(hash common.Hash, code []byte) (c *CFG) {
@@ -68,6 +80,13 @@ func NewCFG(hash common.Hash, code []byte) (c *CFG) {
 	c.pcToBlock = make(map[uint]*MIRBasicBlock)
 	c.jumpDests = nil
 	return c
+}
+
+func (c *CFG) needsRuntimeEpoch() bool {
+	if c == nil {
+		return false
+	}
+	return c.needsRuntimeEpochFlag || c.runtimeBecameDynamic || c.hasUnresolvedJumpsFlag
 }
 
 func (c *CFG) allocResIdx() int {
@@ -99,6 +118,9 @@ func (c *CFG) addBlock(block *MIRBasicBlock) {
 func (c *CFG) hasUnresolvedJumps() bool {
 	if c == nil {
 		return false
+	}
+	if c.hasUnresolvedJumpsFlag {
+		return true
 	}
 	for _, b := range c.basicBlocks {
 		if b != nil && b.unresolvedJump {
@@ -161,6 +183,10 @@ func (c *CFG) scanJumpDests() map[uint]bool {
 
 // Parse builds the Control Flow Graph from the raw EVM code.
 func (c *CFG) Parse() error {
+	// CFG building uses package-level globals; serialize builds across goroutines.
+	mirBuildMu.Lock()
+	defer mirBuildMu.Unlock()
+
 	// Set current CFG build context for MIR resIdx allocation.
 	currentCFGBuild = c
 	defer func() { currentCFGBuild = nil }()
@@ -221,6 +247,43 @@ func (c *CFG) Parse() error {
 			queue = append(queue, child)
 		}
 	}
+	// After reaching a parse-time fixpoint, detect whether this CFG needs runtime epoch tagging.
+	// If any merge point has incoming snapshots with differing heights, cached runs must avoid
+	// using a parse-time entry stack specialized to the wrong predecessor height.
+	c.needsRuntimeEpochFlag = false
+	for _, b := range c.basicBlocks {
+		if b == nil || len(b.parents) < 2 {
+			continue
+		}
+		// If we don't have a snapshot for every predecessor, we *must* enable runtime epoch
+		// so runtime edge tagging/repair can build a correct entry stack.
+		if b.incomingStacks == nil || len(b.incomingStacks) != len(b.parents) {
+			c.needsRuntimeEpochFlag = true
+			break
+		}
+		first := -1
+		for _, p := range b.parents {
+			if p == nil {
+				continue
+			}
+			s, ok := b.incomingStacks[p]
+			if !ok {
+				c.needsRuntimeEpochFlag = true
+				break
+			}
+			if first < 0 {
+				first = len(s)
+				continue
+			}
+			if len(s) != first {
+				c.needsRuntimeEpochFlag = true
+				break
+			}
+		}
+		if c.needsRuntimeEpochFlag {
+			break
+		}
+	}
 	return nil
 }
 
@@ -237,7 +300,13 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 	if block.blockNum == 0 && block.entryStack == nil && len(block.parents) == 0 && len(block.incomingStacks) == 0 {
 		// Make the "known empty" entry snapshot explicit (non-nil) so later logic can distinguish
 		// between "unknown/uncomputed" vs "computed empty".
-		block.SetEntryStack([]Value{})
+		gen := uint64(0)
+		// Tag runtime-built entry stacks with the current epoch so they won't leak across different
+		// executions (calldata/gas/state). Parse-time stacks remain gen=0.
+		if c != nil && c.runtimeEpoch != 0 {
+			gen = c.runtimeEpoch
+		}
+		block.SetEntryStackWithGen([]Value{}, gen)
 		return stack
 	}
 
@@ -258,17 +327,23 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 			if len(s) == 0 {
 				return true
 			}
-			for i := range s {
-				v := s[i]
-				if v.kind == Variable && v.def != nil && v.def.defBlockNum == block.blockNum && v.def.op != MirPHI {
-					return false
-				}
-			}
+			// NOTE: We intentionally do NOT filter out non-PHI self-defs here during runtime.
+			// These can appear as loop-carried values in real contracts, and dropping the entire
+			// incoming snapshot can freeze PHI construction (e.g. loop index stuck), ultimately
+			// causing invalid jumpdest 0x0. Runtime execution can still evaluate these defs from
+			// the interpreter result table (previous iteration) or repair via resIdx remapping.
 			return true
 		}
-		// Gather incoming snapshots in a deterministic order based on parents slice.
-		incomings := make([][]Value, 0, len(block.parents))
-		for _, p := range block.parents {
+		// Gather incoming snapshots in deterministic parent order, but KEEP alignment to parents.
+		//
+		// IMPORTANT: PHI operands are later selected by indexing into `phi.operands` using the
+		// predecessor's index in `block.parents` (see MIRInterpreter.evalPhi). If we drop a parent
+		// here (missing/invalid snapshot), the operand indices shift and PHI resolution can select
+		// a value from the wrong predecessor, causing "missing result for def" (consensus divergence).
+		incomingsByParent := make([][]Value, len(block.parents))
+		valid := make([][]Value, 0, len(block.parents))
+		haveCurEpoch := false
+		for i, p := range block.parents {
 			if p == nil {
 				continue
 			}
@@ -278,15 +353,89 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 					if g, okg := block.incomingStacksGen[p]; okg && g != 0 && g != c.runtimeEpoch {
 						continue
 					}
+					if g, okg := block.incomingStacksGen[p]; okg && g == c.runtimeEpoch {
+						haveCurEpoch = true
+					}
 				}
 				if !isValidIncoming(s) {
 					continue
 				}
-				incomings = append(incomings, s)
+				incomingsByParent[i] = s
+				valid = append(valid, s)
+			}
+		}
+		// Fallback: if runtimeEpoch filtering dropped all incomings, re-include snapshots regardless of epoch.
+		// This prevents rebuilding with an empty entry stack (which can cause SWAP/DUP underflow and
+		// corrupt operand mapping). This is a best-effort correctness fallback for cached CFGs.
+		if c != nil && c.runtimeEpoch != 0 && len(valid) == 0 && len(block.parents) > 0 {
+			for i, p := range block.parents {
+				if p == nil {
+					continue
+				}
+				s, ok := block.incomingStacks[p]
+				if !ok {
+					continue
+				}
+				if !isValidIncoming(s) {
+					continue
+				}
+				incomingsByParent[i] = s
+				valid = append(valid, s)
+			}
+		}
+		// Runtime preference: if we have incoming snapshots recorded for the *current* runtimeEpoch,
+		// prefer building the entry stack from those (to avoid mixing calldatas/runs).
+		//
+		// However, if runtime requested a specific entry height (preferredEntryHeight), we must be careful:
+		// blocks implementing "internal call/return" patterns often carry the return address on the stack,
+		// and that value differs per predecessor. If we drop non-current-epoch incomings, PHIs won't be
+		// created and we can bake the wrong return address as a constant, causing wrong JUMP targets.
+		//
+		// Therefore, when preferredEntryHeight is set, keep non-current-epoch incomings of that height
+		// so PHI construction can reconcile them.
+		if c != nil && c.runtimeEpoch != 0 && haveCurEpoch && block.incomingStacksGen != nil {
+			useCurOnly := block.preferredEntryHeight < 0
+			if block.preferredEntryHeight >= 0 {
+				h := block.preferredEntryHeight
+				for i, p := range block.parents {
+					if p == nil {
+						continue
+					}
+					s := incomingsByParent[i]
+					if s == nil {
+						continue
+					}
+					if g, okg := block.incomingStacksGen[p]; okg && g == c.runtimeEpoch && len(s) == h {
+						useCurOnly = true
+						break
+					}
+				}
+			}
+			if useCurOnly {
+				valid = valid[:0]
+				for i, p := range block.parents {
+					if p == nil {
+						continue
+					}
+					if s := incomingsByParent[i]; s != nil {
+						if g, okg := block.incomingStacksGen[p]; okg && g == c.runtimeEpoch {
+							valid = append(valid, s)
+							continue
+						}
+						// Keep non-current-epoch incomings if runtime requested this height (PHI needed).
+						if block.preferredEntryHeight >= 0 && len(s) == block.preferredEntryHeight {
+							valid = append(valid, s)
+							continue
+						}
+						incomingsByParent[i] = nil
+					}
+				}
 			}
 		}
 		// Fallback: if parents list is empty but incomingStacks exists, use all snapshots.
-		if len(incomings) == 0 && len(block.incomingStacks) > 0 {
+		// (No parent alignment is possible here; PHI selection will fall back to snapshot indexing.)
+		if len(valid) == 0 && len(block.parents) == 0 && len(block.incomingStacks) > 0 {
+			incomingsByParent = nil
 			for p, s := range block.incomingStacks {
 				if c != nil && c.runtimeEpoch != 0 && block.incomingStacksGen != nil {
 					if g, okg := block.incomingStacksGen[p]; okg && g != 0 && g != c.runtimeEpoch {
@@ -296,10 +445,10 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 				if !isValidIncoming(s) {
 					continue
 				}
-				incomings = append(incomings, s)
+				valid = append(valid, s)
 			}
 		}
-		if len(incomings) == 0 {
+		if len(valid) == 0 {
 			return stack
 		}
 		// EVM requires identical stack height at merge points. During dynamic CFG expansion we can
@@ -312,16 +461,22 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 		// - Otherwise, keep only the most common incoming stack height, breaking ties toward the
 		//   smaller height (safer than assuming extra values exist).
 		height := -1
+		// If we know the parse-time entry height for this block and we're executing a cached CFG,
+		// prefer sticking to that height. This prevents runtime rebuilds from accidentally selecting
+		// an infeasible smaller height (which can make SWAP/DUP become no-ops and corrupt semantics).
+		if c != nil && c.runtimeEpoch != 0 && block.fixedEntryHeight >= 0 && !c.hasUnresolvedJumps() {
+			block.preferredEntryHeight = block.fixedEntryHeight
+		}
 		if block.preferredEntryHeight >= 0 {
 			height = block.preferredEntryHeight
-			filtered := make([][]Value, 0, len(incomings))
-			for _, s := range incomings {
+			filtered := make([][]Value, 0, len(valid))
+			for _, s := range valid {
 				if len(s) == height {
 					filtered = append(filtered, s)
 				}
 			}
 			if len(filtered) > 0 {
-				incomings = filtered
+				valid = filtered
 			} else {
 				// No incomings with the preferred height; fall back to mode selection.
 				height = -1
@@ -330,10 +485,10 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 			block.preferredEntryHeight = -1
 		}
 		if height < 0 {
-			modeLen := len(incomings[0])
-			if len(incomings) > 1 {
+			modeLen := len(valid[0])
+			if len(valid) > 1 {
 				counts := make(map[int]int, 4)
-				for _, s := range incomings {
+				for _, s := range valid {
 					counts[len(s)]++
 				}
 				modeCnt := -1
@@ -344,24 +499,24 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 						modeCnt = c
 					}
 				}
-				filtered := make([][]Value, 0, len(incomings))
-				for _, s := range incomings {
+				filtered := make([][]Value, 0, len(valid))
+				for _, s := range valid {
 					if len(s) == modeLen {
 						filtered = append(filtered, s)
 					}
 				}
 				if len(filtered) > 0 {
-					incomings = filtered
+					valid = filtered
 				}
 			}
 			height = modeLen
 		}
 
 		for i := 0; i < height; i++ {
-			base := incomings[0][i]
+			base := valid[0][i]
 			same := true
-			for j := 1; j < len(incomings); j++ {
-				v := incomings[j][i]
+			for j := 1; j < len(valid); j++ {
+				v := valid[j][i]
 				if !equalValueForFlow(&base, &v) {
 					same = false
 					break
@@ -370,16 +525,38 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 			if same {
 				valCopy := base
 				valCopy.liveIn = true
+				valCopy.liveInPos = i
 				stack.push(&valCopy)
 				continue
 			}
 			// Create PHI merging all incoming values at this stack slot.
-			ops := make([]*Value, 0, len(incomings))
-			for _, s := range incomings {
-				v := s[i]
-				v.liveIn = true
-				vv := v // heap allocate per-operand
-				ops = append(ops, &vv)
+			//
+			// If we have parent alignment, we MUST emit one operand per parent (in the same index order),
+			// even if an incoming snapshot is missing. Missing operands are filled with Unknown; they
+			// should never be selected for real executed predecessors, but keep indices stable.
+			var ops []*Value
+			if incomingsByParent != nil && len(incomingsByParent) == len(block.parents) && len(block.parents) > 0 {
+				ops = make([]*Value, len(block.parents))
+				for j := range block.parents {
+					s := incomingsByParent[j]
+					if s == nil || len(s) != height {
+						vv := Value{kind: Unknown, liveIn: true, liveInPos: i}
+						ops[j] = &vv
+						continue
+					}
+					v := s[i]
+					v.liveIn = true
+					vv := v
+					ops[j] = &vv
+				}
+			} else {
+				ops = make([]*Value, 0, len(valid))
+				for _, s := range valid {
+					v := s[i]
+					v.liveIn = true
+					vv := v // heap allocate per-operand
+					ops = append(ops, &vv)
+				}
 			}
 			// phiStackIndex is 0 for top-of-stack.
 			phiStackIndex := (height - 1) - i
@@ -388,10 +565,14 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 		// IMPORTANT: distinguish "computed empty entry stack" from "unknown/uncomputed".
 		// ValueStack.data is nil for height=0, but we use nil entryStack as an invalidation marker.
 		// Use an explicit empty slice so callers/tools (e.g., mir_visualizer) don't treat it as unknown.
+		gen := uint64(0)
+		if c != nil && c.runtimeEpoch != 0 {
+			gen = c.runtimeEpoch
+		}
 		if stack.data == nil {
-			block.SetEntryStack([]Value{})
+			block.SetEntryStackWithGen([]Value{}, gen)
 		} else {
-			block.SetEntryStack(stack.data)
+			block.SetEntryStackWithGen(stack.data, gen)
 		}
 		return stack
 	}
@@ -449,6 +630,21 @@ func (c *CFG) connectEdge(parent, child *MIRBasicBlock, exitSnapshot []Value) {
 	// Only invalidate if this parent's incoming snapshot changed.
 	if prev, ok := child.incomingStacks[parent]; ok {
 		if stacksEqual(prev, exitSnapshot) {
+			// Even when the snapshot contents are equal, tag it with the current runtime epoch so
+			// cached CFG execution can correctly prefer "current run" incomings and avoid reusing
+			// stale snapshots across different calldata/contexts.
+			if c != nil && c.runtimeEpoch != 0 {
+				if child.incomingStacksGen == nil {
+					child.incomingStacksGen = make(map[*MIRBasicBlock]uint64, 8)
+				}
+				child.incomingStacksGen[parent] = c.runtimeEpoch
+				// Also refresh the preferred entry height hint for this edge. This matters when a block
+				// has multiple predecessors with differing stack heights: even if the snapshot for this
+				// (parent,child) pair is unchanged, we still want rebuild logic to prefer the current
+				// edge's height to avoid padding with Unknowns (which can corrupt return-address patterns
+				// and lead to invalid jumpdest 0x0).
+				child.preferredEntryHeight = len(exitSnapshot)
+			}
 			return
 		}
 	}
@@ -458,12 +654,23 @@ func (c *CFG) connectEdge(parent, child *MIRBasicBlock, exitSnapshot []Value) {
 	}
 	// Tag runtime snapshots with the current epoch; epoch==0 means "base/parse-time".
 	child.incomingStacksGen[parent] = c.runtimeEpoch
+	// Runtime hint: prefer rebuilding this block at the stack height observed on the edge we just
+	// recorded. This avoids mode/tie heuristics picking an infeasible smaller height, which can
+	// make SWAP/DUP become no-ops and corrupt semantics.
+	if c != nil && c.runtimeEpoch != 0 {
+		child.preferredEntryHeight = len(exitSnapshot)
+	}
 	child.SetEntryStack(nil)
 	child.built = false
 	// Conservative: when a block's incoming stack changes, its PHI set (and thus defs) can change,
-	// which can invalidate downstream blocks that captured stale defs. Mark descendants for rebuild
-	// so we don't attempt to execute with dangling def pointers.
-	c.markDescendantsForRebuild(child)
+	// which can invalidate downstream blocks that captured stale defs.
+	//
+	// During Parse() (runtimeEpoch==0), we aggressively mark descendants to reach a fixpoint.
+	// During runtime execution, doing so is often overkill (and can trigger large rebuild cascades);
+	// instead, rebuild is handled lazily as blocks are entered, except for dynamic-jump regions.
+	if c != nil && (c.runtimeEpoch == 0 || parent.unresolvedJump || child.unresolvedJump) {
+		c.markDescendantsForRebuild(child)
+	}
 }
 
 func (c *CFG) markDescendantsForRebuild(start *MIRBasicBlock) {
@@ -493,13 +700,44 @@ func (c *CFG) markDescendantsForRebuild(start *MIRBasicBlock) {
 }
 
 func (c *CFG) buildBasicBlock(block *MIRBasicBlock, validJumpDests map[uint]bool) error {
+	// CFG building uses package-level globals. Serialize builds across goroutines, but avoid
+	// self-deadlock when called from CFG.Parse() (which already holds mirBuildMu).
+	//
+	// During Parse(), currentCFGBuild is set to `c` while the lock is held. Use that as a
+	// signal that we're already in a serialized build context for this CFG.
+	needLock := currentCFGBuild != c
+	if needLock {
+		mirBuildMu.Lock()
+		defer mirBuildMu.Unlock()
+	}
+
 	// Set current CFG build context for MIR resIdx allocation.
 	// This also covers dynamic backfill builds invoked at runtime.
-	currentCFGBuild = c
-	defer func() { currentCFGBuild = nil }()
+	// IMPORTANT: if we're inside CFG.Parse(), currentCFGBuild is already set to `c` for the
+	// whole parse pass. Do not clobber it back to nil per-block, otherwise subsequent block
+	// builds in the same Parse() will incorrectly think they're outside the serialized build
+	// context and attempt to re-lock mirBuildMu (deadlock).
+	prevBuild := currentCFGBuild
+	if prevBuild == nil {
+		currentCFGBuild = c
+	}
+	defer func() { currentCFGBuild = prevBuild }()
 
 	pc := block.firstPC
 	codeLen := uint(len(c.rawCode))
+
+	// Retry loop for cached/runtime rebuilds. See `errNeedEntryHeight`.
+	retries := 0
+retryBuild:
+	// If retrying, clear prior build artifacts (partial MIR, opcode counts, etc).
+	if retries > 0 && len(block.instructions) > 0 {
+		block.ResetForRebuild(false)
+	}
+	// Per-build transient flags should be reset.
+	block.unresolvedJump = false
+
+	pc = block.firstPC
+	codeLen = uint(len(c.rawCode))
 
 	// 1. Initialize Stack
 	// Ensure any PHIs created as part of entry stack construction get a stable EVM mapping
@@ -511,6 +749,7 @@ func (c *CFG) buildBasicBlock(block *MIRBasicBlock, validJumpDests map[uint]bool
 		currentEVMBuildOp = 0
 	}
 	stack := c.getEntryStackForBlock(block)
+	initHeight := stack.size()
 
 	for pc < codeLen {
 		op := compiler.ByteCode(c.rawCode[pc])
@@ -557,6 +796,41 @@ func (c *CFG) buildBasicBlock(block *MIRBasicBlock, validJumpDests map[uint]bool
 		switch {
 		case isStackOp(op): // PUSH, DUP, SWAP, POP
 			pc, err = c.handleStackOp(block, op, stack, pc)
+			if err != nil {
+				// If this is a runtime rebuild and we can satisfy the required entry height,
+				// retry compilation of this block with the requested height.
+				if need, ok := err.(*errNeedEntryHeight); ok && c != nil && c.runtimeEpoch != 0 {
+					// Translate the observed underflow at the current PC into a minimum *entry* height.
+					//
+					// The stack height at this PC is: entryHeight + netDelta(prefixOps).
+					// If the current build saw `have` but needs `need`, then increasing the entry height by
+					// (need-have) is sufficient.
+					wantEntry := initHeight + (need.need - need.have)
+					if wantEntry < 0 {
+						wantEntry = 0
+					}
+					block.preferredEntryHeight = wantEntry
+					block.SetEntryStack(nil)
+					block.built = false
+					// Avoid spinning indefinitely.
+					if retries < 2 {
+						retries++
+						goto retryBuild
+					}
+				}
+				// Similar retry mechanism: prefer a specific entry height requested by runtime
+				// control-flow validation (e.g. invalid constant JUMP dest due to missing deep items).
+				if need, ok := err.(*errNeedPreferredEntryHeight); ok && c != nil && c.runtimeEpoch != 0 {
+					block.preferredEntryHeight = need.want
+					block.SetEntryStack(nil)
+					block.built = false
+					if retries < 2 {
+						retries++
+						goto retryBuild
+					}
+				}
+				return err
+			}
 		case isUnaryOp(op):
 			// Map EVM unary opcode to MIR op by meaning
 			var mirOp MirOperation
@@ -916,6 +1190,22 @@ func (c *CFG) buildBasicBlock(block *MIRBasicBlock, validJumpDests map[uint]bool
 					target = uint(dest.ConstValue())
 				}
 				if !validJumpDests[target] {
+					// During runtime rebuilds (cached CFG execution), the stack model can be temporarily
+					// specialized/stale for this edge, producing an incorrect constant jump target. Do not
+					// fail the build here. Instead, request a rebuild preferring the maximum incoming
+					// stack height so deep stack items (return addresses) are preserved.
+					if c != nil && c.runtimeEpoch != 0 {
+						if want := maxIncomingLenForBlock(block); want > 0 && want != initHeight {
+							return &errNeedPreferredEntryHeight{pc: pc, op: op, want: want}
+						}
+						// Fallback: treat as unresolved and let runtime resolve based on actual values.
+						block.unresolvedJump = true
+						c.hasUnresolvedJumpsFlag = true
+						block.SetLastPC(pc + 1)
+						block.SetExitStack(exitSnap)
+						block.built = true
+						return nil
+					}
 					return fmt.Errorf("invalid jumpdest 0x%x at pc %d", target, pc)
 				}
 				targetBlock := c.getOrCreateBlock(target)
@@ -929,6 +1219,7 @@ func (c *CFG) buildBasicBlock(block *MIRBasicBlock, validJumpDests map[uint]bool
 				}
 			} else {
 				block.unresolvedJump = true
+				c.hasUnresolvedJumpsFlag = true
 			}
 
 			block.SetLastPC(pc + 1)
@@ -959,6 +1250,18 @@ func (c *CFG) buildBasicBlock(block *MIRBasicBlock, validJumpDests map[uint]bool
 					target = uint(dest.ConstValue())
 				}
 				if !validJumpDests[target] {
+					if c != nil && c.runtimeEpoch != 0 {
+						if want := maxIncomingLenForBlock(block); want > 0 && want != initHeight {
+							return &errNeedPreferredEntryHeight{pc: pc, op: op, want: want}
+						}
+						// Fallback: treat as unresolved and keep only the fallthrough edge.
+						block.unresolvedJump = true
+						c.hasUnresolvedJumpsFlag = true
+						block.SetLastPC(pc + 1)
+						block.SetExitStack(exitSnap)
+						block.built = true
+						return nil
+					}
 					return fmt.Errorf("invalid jumpdest 0x%x at pc %d", target, pc)
 				}
 				targetBlock := c.getOrCreateBlock(target)
@@ -972,6 +1275,7 @@ func (c *CFG) buildBasicBlock(block *MIRBasicBlock, validJumpDests map[uint]bool
 			} else {
 				// Dynamic target: keep fallthrough edge; runtime will resolve jump target and backfill CFG.
 				block.unresolvedJump = true
+				c.hasUnresolvedJumpsFlag = true
 			}
 
 			block.SetLastPC(pc + 1)
@@ -1006,6 +1310,44 @@ func isStackOp(op compiler.ByteCode) bool {
 		(op == compiler.POP)
 }
 
+type errNeedEntryHeight struct {
+	pc   uint
+	op   compiler.ByteCode
+	need int
+	have int
+}
+
+func (e *errNeedEntryHeight) Error() string {
+	return fmt.Sprintf("need entry stack height >= %d for op=0x%02x at pc=%d (have=%d)", e.need, byte(e.op), e.pc, e.have)
+}
+
+// errNeedPreferredEntryHeight is used when a runtime rebuild discovers that the block was built
+// with an entry stack height that is inconsistent with the observed incoming stacks (even if no
+// immediate underflow occurs). This typically manifests as invalid constant JUMP destinations
+// (e.g. JUMP 0x0) due to missing deep stack items (return addresses).
+type errNeedPreferredEntryHeight struct {
+	pc   uint
+	op   compiler.ByteCode
+	want int
+}
+
+func (e *errNeedPreferredEntryHeight) Error() string {
+	return fmt.Sprintf("need preferred entry height=%d for op=0x%02x at pc=%d", e.want, byte(e.op), e.pc)
+}
+
+func maxIncomingLenForBlock(b *MIRBasicBlock) int {
+	if b == nil || b.incomingStacks == nil || len(b.incomingStacks) == 0 {
+		return -1
+	}
+	maxLen := -1
+	for _, s := range b.incomingStacks {
+		if l := len(s); l > maxLen {
+			maxLen = l
+		}
+	}
+	return maxLen
+}
+
 func (c *CFG) handleStackOp(block *MIRBasicBlock, op compiler.ByteCode, stack *ValueStack, pc uint) (uint, error) {
 	// PUSH0 pushes a single zero byte (EIP-3855)
 	if op == compiler.PUSH0 {
@@ -1037,8 +1379,30 @@ func (c *CFG) handleStackOp(block *MIRBasicBlock, op compiler.ByteCode, stack *V
 		mir.genStackDepth = stack.size()
 		return pc + 1, nil
 	case op >= compiler.DUP1 && op <= compiler.DUP16:
+		// DUPn requires at least n items on the stack.
+		// If the builder observes an underflow, it means the current stack model doesn't have
+		// enough live-ins for this block (common with dynamic control-flow / partial builds).
+		// Silently treating DUP as a no-op corrupts operand mapping (e.g. wrong constant JUMP dest),
+		// so during runtime rebuilds we must request a rebuild with a larger entry stack height.
+		// For non-runtime builds (Parse-time), we can pad the *bottom* with Unknown live-ins as a
+		// conservative approximation.
+		n := int(op-compiler.DUP1) + 1
+		if stack.size() < n {
+			if c != nil && c.runtimeEpoch != 0 {
+				return pc, &errNeedEntryHeight{pc: pc, op: op, need: n, have: stack.size()}
+			}
+			stack.padBottomTo(n)
+		}
 		mirOp = MirDUP1 + MirOperation(op-compiler.DUP1)
 	case op >= compiler.SWAP1 && op <= compiler.SWAP16:
+		// SWAPn requires at least n+1 items on the stack.
+		n := int(op-compiler.SWAP1) + 1
+		if stack.size() < n+1 {
+			if c != nil && c.runtimeEpoch != 0 {
+				return pc, &errNeedEntryHeight{pc: pc, op: op, need: n + 1, have: stack.size()}
+			}
+			stack.padBottomTo(n + 1)
+		}
 		mirOp = MirSWAP1 + MirOperation(op-compiler.SWAP1)
 	}
 

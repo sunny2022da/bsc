@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"strings"
 	"sync/atomic"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -30,6 +31,13 @@ type ExecResult struct {
 
 // Shared immutable zero value to avoid allocations in hot paths.
 var u256Zero = new(uint256.Int)
+
+// Common small constants (immutable). These are safe to share because MIRInterpreter never mutates
+// the operand values passed into gas/memory helpers.
+var (
+	u256One = uint256.NewInt(1)
+	u256U32 = uint256.NewInt(32)
+)
 
 // entryStack mismatch counters: helpful signal for invalid bytecode or CFG/snapshot bugs.
 // Throttled to avoid log spam during fullnode sync.
@@ -210,6 +218,179 @@ type MIRInterpreter struct {
 	// When MIR runs as a vm runner inside geth, the outer EVM already snapshots/reverts around
 	// contract execution, so doing it again here is redundant and expensive.
 	manageStateSnapshots bool
+}
+
+// ContractAddress returns the current contract address being executed by this interpreter.
+// This is intended for diagnostics/tools.
+func (it *MIRInterpreter) ContractAddress() common.Address {
+	if it == nil {
+		return common.Address{}
+	}
+	return it.contractAddr
+}
+
+// DebugDumpEvmPCRange returns a MIR dump for the interpreter's current CFG for [start,end].
+// Intended for debugging/tools only.
+func (it *MIRInterpreter) DebugDumpEvmPCRange(start, end uint) string {
+	if it == nil {
+		return "<nil interpreter>\n"
+	}
+	return DebugDumpMIRForEvmPCRange(it.cfg, start, end)
+}
+
+// DebugDumpCodeHexRange dumps raw EVM bytecode bytes for [start,end] (inclusive start, exclusive end).
+// Intended for debugging/tools only.
+func (it *MIRInterpreter) DebugDumpCodeHexRange(start, end uint) string {
+	if it == nil || it.cfg == nil {
+		return "<nil interpreter/cfg>\n"
+	}
+	code := it.cfg.rawCode
+	if code == nil {
+		return "<nil code>\n"
+	}
+	if start > uint(len(code)) {
+		start = uint(len(code))
+	}
+	if end > uint(len(code)) {
+		end = uint(len(code))
+	}
+	if end < start {
+		end = start
+	}
+	if start == end {
+		return fmt.Sprintf("code[%d:%d]=<empty>\n", start, end)
+	}
+	// Print a compact single-line dump to keep replay output manageable.
+	return fmt.Sprintf("code[%d:%d]=%x\n", start, end, code[start:end])
+}
+
+// DebugDumpIncomingStacksForPC dumps the recorded incoming stack snapshots for the basic block at `pc`.
+// This is intended for debugging tools only.
+func (it *MIRInterpreter) DebugDumpIncomingStacksForPC(pc uint, topK int) string {
+	if it == nil || it.cfg == nil {
+		return "<nil interpreter/cfg>\n"
+	}
+	b := it.cfg.pcToBlock[pc]
+	if b == nil {
+		return fmt.Sprintf("no block at pc=%d\n", pc)
+	}
+	if topK <= 0 {
+		topK = 8
+	}
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Incoming stacks for block pc=0x%x parents=%d unresolvedJump=%v entryGen=%d\n",
+		b.firstPC, len(b.parents), b.unresolvedJump, b.EntryStackGen()))
+	if es := b.EntryStack(); es != nil {
+		sb.WriteString(fmt.Sprintf("  entryStackLen=%d\n", len(es)))
+	} else {
+		sb.WriteString("  entryStackLen=<nil>\n")
+	}
+	if xs := b.ExitStack(); xs != nil {
+		sb.WriteString(fmt.Sprintf("  exitStackLen=%d\n", len(xs)))
+	} else {
+		sb.WriteString("  exitStackLen=<nil>\n")
+	}
+	if b.incomingStacks == nil || len(b.incomingStacks) == 0 {
+		sb.WriteString("  <no incomingStacks>\n")
+		return sb.String()
+	}
+	for _, p := range b.parents {
+		if p == nil {
+			continue
+		}
+		s := b.incomingStacks[p]
+		g := uint64(0)
+		if b.incomingStacksGen != nil {
+			g = b.incomingStacksGen[p]
+		}
+		sb.WriteString(fmt.Sprintf("  from=0x%x gen=%d len=%d | top%d: ", p.firstPC, g, len(s), topK))
+		if len(s) == 0 {
+			sb.WriteString("<empty>\n")
+			continue
+		}
+		start := len(s) - topK
+		if start < 0 {
+			start = 0
+		}
+		for i := len(s) - 1; i >= start; i-- {
+			v := s[i]
+			u, err := it.evalValue(&v)
+			if err == nil && u != nil {
+				sb.WriteString("0x")
+				sb.WriteString(u.Hex())
+			} else {
+				switch v.kind {
+				case Konst:
+					if v.u != nil {
+						sb.WriteString("K(" + v.u.Hex() + ")")
+					} else {
+						sb.WriteString("K(?)")
+					}
+				case Variable:
+					if v.def != nil {
+						sb.WriteString(fmt.Sprintf("V(defPC=%d defOp=%s)", v.def.evmPC, v.def.op.String()))
+					} else {
+						sb.WriteString("V(<nil def>)")
+					}
+				default:
+					sb.WriteString(fmt.Sprintf("kind=%d", int(v.kind)))
+				}
+			}
+			if i != start {
+				sb.WriteString(", ")
+			}
+		}
+		sb.WriteString("\n")
+	}
+	return sb.String()
+}
+
+// DebugDumpEntryExitStacksForPC dumps the cached entry/exit stacks (static shape) for the block at `pc`.
+// This is intended for debugging tools only.
+func (it *MIRInterpreter) DebugDumpEntryExitStacksForPC(pc uint, topK int) string {
+	if it == nil || it.cfg == nil {
+		return "<nil interpreter/cfg>\n"
+	}
+	b := it.cfg.pcToBlock[pc]
+	if b == nil {
+		return fmt.Sprintf("no block at pc=%d\n", pc)
+	}
+	if topK <= 0 {
+		topK = 8
+	}
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Entry/Exit stacks for block pc=0x%x unresolvedJump=%v entryGen=%d\n", b.firstPC, b.unresolvedJump, b.EntryStackGen()))
+	dump := func(name string, s []Value) {
+		if s == nil {
+			sb.WriteString(fmt.Sprintf("  %s: <nil>\n", name))
+			return
+		}
+		sb.WriteString(fmt.Sprintf("  %s len=%d top%d: ", name, len(s), topK))
+		start := len(s) - topK
+		if start < 0 {
+			start = 0
+		}
+		for i := len(s) - 1; i >= start; i-- {
+			v := s[i]
+			if v.kind == Konst && v.u != nil {
+				sb.WriteString("0x" + v.u.Hex())
+			} else if v.kind == Konst {
+				u := uint256.NewInt(0).SetBytes(v.payload)
+				sb.WriteString("0x" + u.Hex())
+			} else if v.kind == Variable && v.def != nil {
+				sb.WriteString(fmt.Sprintf("V(defPC=%d defOp=%s)", v.def.evmPC, v.def.op.String()))
+			} else {
+				sb.WriteString(fmt.Sprintf("kind=%d", int(v.kind)))
+			}
+			if i != start {
+				sb.WriteString(", ")
+			}
+		}
+		sb.WriteString("\n")
+	}
+	dump("entryStack", b.EntryStack())
+	dump("exitStack", b.ExitStack())
+	return sb.String()
 }
 
 func snapshotHasDefsFromBlock(snap []Value, blockNum uint) bool {
@@ -475,6 +656,12 @@ func (it *MIRInterpreter) invalidateBlockResults(b *MIRBasicBlock) {
 		if m == nil {
 			continue
 		}
+		// Do not invalidate PHI results: they can be legally used as loop-carried live-ins across
+		// rebuilds, and clearing them can produce spurious "missing result for def MirPHI" in
+		// dynamic CFG regions where blocks are invalidated/rebuilt between iterations.
+		if m.op == MirPHI {
+			continue
+		}
 		if m.resIdx > 0 && m.resIdx < len(it.resultsGen) {
 			it.resultsGen[m.resIdx] = 0
 		}
@@ -512,6 +699,30 @@ func (it *MIRInterpreter) resultSlot(def *MIR) *uint256.Int {
 	it.ensureResultsCapacity(idx)
 	it.resultsGen[idx] = it.gen
 	return &it.results[idx]
+}
+
+// tagIncomingEpoch marks (from -> to) as observed in the current runtimeEpoch.
+// This is crucial for cached CFG execution: entry-stack rebuild logic prefers current-epoch
+// incoming stacks, and some contracts legitimately have different stack heights per predecessor.
+// Without this tagging on *static* edges, the epoch filter can drop the actually-taken edge and
+// the block can rebuild using the wrong predecessor's stack height/values (leading to
+// "missing result for def" and control-flow divergence).
+func (it *MIRInterpreter) tagIncomingEpoch(from, to *MIRBasicBlock) {
+	if it == nil || it.cfg == nil || it.cfg.runtimeEpoch == 0 || from == nil || to == nil {
+		return
+	}
+	if to.incomingStacks == nil {
+		return
+	}
+	s, ok := to.incomingStacks[from]
+	if !ok {
+		return
+	}
+	if to.incomingStacksGen == nil {
+		to.incomingStacksGen = make(map[*MIRBasicBlock]uint64, 8)
+	}
+	to.incomingStacksGen[from] = it.cfg.runtimeEpoch
+	to.preferredEntryHeight = len(s)
 }
 
 // SetGasLimit enables out-of-gas checking. If limit==0, gas is tracked but never errors.
@@ -626,123 +837,214 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 
 	var prev *MIRBasicBlock
 	for {
+		// Cached-CFG correctness: if runtime has recorded any current-epoch incoming snapshots for
+		// this block, do not keep using a parse-time (gen=0) entry stack. Parse-time entry stacks
+		// can be over-specialized (or built from a different predecessor-height heuristic) and may
+		// embed def references that are not valid on the actually-taken edge, leading to
+		// "missing result for def" later.
+		if it.cfg != nil && it.cfg.runtimeEpoch != 0 && cur != nil && cur.EntryStackGen() == 0 && cur.incomingStacksGen != nil && cur.EntryStack() != nil {
+			for _, p := range cur.parents {
+				if p == nil {
+					continue
+				}
+				if g, ok := cur.incomingStacksGen[p]; ok && g == it.cfg.runtimeEpoch {
+					// Force rebuild from current-epoch incomings.
+					cur.SetEntryStack(nil)
+					if len(cur.instructions) > 0 {
+						it.invalidateBlockResults(cur)
+						cur.ResetForRebuild(false)
+					}
+					cur.built = false
+					break
+				}
+			}
+		}
 		// Always reset the per-block instruction cursor on entry.
 		// Basic blocks can be re-entered multiple times due to loops/jump-tables; if we don't reset
 		// `pos`, the block will appear "already executed" and control-flow will silently diverge.
 		if cur != nil {
 			cur.pos = 0
 		}
-		// If we reach the same basic block with different stack heights across predecessors
-		// (common with dynamic jumps / jump tables), we must rebuild the block with an entry
-		// stack shape that matches this specific edge. Otherwise we can bake in wrong constants
-		// (e.g. wrong jump target) and diverge.
-		if prev != nil && cur != nil && cur.incomingStacks != nil {
-			if in, ok := cur.incomingStacks[prev]; ok && in != nil {
-				// Ignore stale runtime snapshots from previous executions when CFG is cached.
-				if it.cfg != nil && it.cfg.runtimeEpoch != 0 && cur.incomingStacksGen != nil {
-					if g, okg := cur.incomingStacksGen[prev]; okg && g != 0 && g != it.cfg.runtimeEpoch {
-						in = nil
-					}
-				}
-				if in == nil {
-					goto skipSeed
-				}
-				es := cur.EntryStack()
-				// If the block's entry stack height differs from the concrete incoming snapshot height
-				// for this predecessor edge, we must rebuild with the correct shape.
-				//
-				// IMPORTANT:
-				// - entryStack==nil is often used as an invalidation marker when CFG edges/snapshots change.
-				//   In that common case, if all incoming stacks have the same height, we want
-				//   buildBasicBlock -> getEntryStackForBlock to recompute from *all* incomings and
-				//   (re)introduce PHIs as needed (instead of specializing to a single predecessor).
-				// - however, when incoming stack *heights vary* (dynamic CFG backfill / invalid bytecode),
-				//   we must specialize the entry stack to this predecessor edge, otherwise the mode-height
-				//   filter may discard the current edge and we won't rebuild to the needed shape.
-				needSeed := false
-				if es != nil {
-					needSeed = len(es) != len(in)
-				} else {
-					// entryStack is nil.
+		// Dynamic repair / runtime snapshot seeding.
+		// Needed not only for unresolved-jump CFGs, but also for CFGs that have merge points
+		// with differing incoming stack heights (requires runtime-epoch tagging).
+		if it.cfg != nil && it.cfg.needsRuntimeEpoch() {
+			// If we reach the same basic block with different stack heights across predecessors
+			// (common with dynamic jumps / jump tables), we must rebuild the block with an entry
+			// stack shape that matches this specific edge. Otherwise we can bake in wrong constants
+			// (e.g. wrong jump target) and diverge.
+			if prev != nil && cur != nil && cur.incomingStacks != nil {
+				if in, ok := cur.incomingStacks[prev]; ok && in != nil {
+					// Dynamic CFG correctness: even if stack *heights* match, stack *values* feeding into
+					// dispatcher blocks (SWAP/POP-heavy jump tables) can be calldata-/path-dependent.
 					//
-					// In dynamic-jump regions, prefer specializing to the concrete incoming snapshot for
-					// this edge. This avoids selecting an infeasible mode-height from partially-discovered
-					// dynamic CFG edges (which can otherwise corrupt control flow and gas accounting).
-					if cur.unresolvedJump || prev.unresolvedJump {
-						needSeed = true
-						goto decideSeed
-					}
-					// Otherwise, only seed if incoming stack heights vary and this edge's height
-					// is not the mode height.
-					modeLen := -1
-					modeCnt := -1
-					counts := make(map[int]int, 4)
-					for _, s := range cur.incomingStacks {
-						counts[len(s)]++
-					}
-					for l, c := range counts {
-						if c > modeCnt || (c == modeCnt && (modeLen < 0 || l < modeLen)) {
-							modeLen, modeCnt = l, c
+					// MIR does not execute EVM stack ops at runtime; it relies on the CFG builder's entry
+					// stack snapshot. If we reuse a stale incoming snapshot from an earlier execution,
+					// the builder can bake in wrong constants (e.g. wrong JUMP destination) and diverge.
+					//
+					// To prevent this, refresh the (prev->cur) incoming snapshot from the predecessor's
+					// *runtime* values when this CFG requires runtime-epoch tagging.
+					//
+					// IMPORTANT: this is needed even for CFGs without unresolved jumps. Some contracts have
+					// valid control flow that can reach the same JUMPDEST with different stack heights;
+					// in those cases, relying on parse-time snapshots can bake in stale/path-dependent
+					// constants and flip branch conditions.
+					// Only do the expensive runtime snapshot refresh when we have evidence that
+					// parse-time snapshots/entry stacks might be stale for this edge.
+					//
+					// This keeps hot-path perf for common/static contracts while still repairing
+					// tricky merge/loop cases (e.g. entryStack invalidation / preferredEntryHeight).
+					if it.cfg != nil && it.cfg.runtimeEpoch != 0 &&
+						(it.cfg.runtimeBecameDynamic || prev.unresolvedJump || cur.unresolvedJump || cur.preferredEntryHeight != 0 || cur.EntryStack() == nil) {
+						// Refresh using the per-edge exit snapshot (not prev.ExitStack), otherwise we can
+						// materialize the wrong permutation/values when duplicate constants or PHIs exist.
+						ex := it.computeExitSnapshotForEdgeTo(nil, prev, cur)
+						if ex != nil {
+							k := 64
+							if len(ex) < k {
+								k = len(ex)
+							}
+							fresh := it.materializeSnapshotTopK(ex, k)
+							// Avoid unnecessary edge updates: only connect if the snapshot is stale for this epoch
+							// or the values differ.
+							staleEpoch := false
+							if cur.incomingStacksGen != nil {
+								if g, okg := cur.incomingStacksGen[prev]; !okg || g != it.cfg.runtimeEpoch {
+									staleEpoch = true
+								}
+							}
+							if staleEpoch || !stacksEqual(in, fresh) {
+								it.cfg.connectEdge(prev, cur, fresh)
+								if in2, ok2 := cur.incomingStacks[prev]; ok2 && in2 != nil {
+									in = in2
+								}
+							}
+						}
+						// If this is a dynamic/unresolved block and the cached entry stack no longer matches
+						// the concrete incoming snapshot (even at the same height), rebuild the block so we
+						// don't bake stale/path-dependent constants into downstream stack-op-heavy regions.
+						if cur != nil && cur.unresolvedJump {
+							es2 := cur.EntryStack()
+							if es2 != nil && len(es2) == len(in) && !stacksEqual(es2, in) {
+								cur.preferredEntryHeight = len(in)
+								cur.SetEntryStack(nil)
+								if len(cur.instructions) > 0 {
+									it.invalidateBlockResults(cur)
+									cur.ResetForRebuild(false)
+								}
+								cur.built = false
+							}
 						}
 					}
-					if len(counts) > 1 && modeLen >= 0 && len(in) != modeLen {
-						needSeed = true
-					}
-				}
-			decideSeed:
-				if needSeed {
-					// This should be rare for valid bytecode: feasible paths reaching the same JUMPDEST
-					// should have the same stack height. When it happens, it often indicates either:
-					// - incomplete/unstable dynamic CFG discovery (transient), or
-					// - a CFG/snapshot bookkeeping bug.
-					//
-					// Log (throttled) so we can notice it during long sync runs.
-					maybeLogEntryStackMismatch(it, cur, prev, func() int {
-						if es == nil {
-							return -1
+					// Ignore stale runtime snapshots from previous executions when CFG is cached.
+					if it.cfg != nil && it.cfg.runtimeEpoch != 0 && cur.incomingStacksGen != nil {
+						if g, okg := cur.incomingStacksGen[prev]; okg && g != 0 && g != it.cfg.runtimeEpoch {
+							in = nil
 						}
-						return len(es)
-					}(), len(in))
-					// If we have a CFG and a predecessor, refresh this edge snapshot using the
-					// concrete runtime exit stack of the predecessor. This repairs cases where
-					// build-time snapshots (or stale cached ones) have the wrong height/values.
-					if it.cfg != nil && prev != nil && cur != nil {
-						if ex := prev.ExitStack(); ex != nil {
-							it.cfg.connectEdge(prev, cur, it.materializeSnapshot(ex))
+					}
+					if in == nil {
+						goto skipSeed
+					}
+					es := cur.EntryStack()
+					// Discard runtime-specialized entry stacks from previous executions.
+					// They can leak path-dependent shape/value assumptions across different calldata
+					// and cause consensus divergence.
+					if es != nil && it.cfg != nil {
+						if g := cur.EntryStackGen(); g != 0 && g != it.cfg.runtimeEpoch {
+							cur.SetEntryStack(nil)
+							es = nil
+						}
+					}
+					// If the block's entry stack height differs from the concrete incoming snapshot height
+					// for this predecessor edge, we must rebuild with the correct shape.
+					//
+					// IMPORTANT:
+					// - entryStack==nil is often used as an invalidation marker when CFG edges/snapshots change.
+					//   In that common case, if all incoming stacks have the same height, we want
+					//   buildBasicBlock -> getEntryStackForBlock to recompute from *all* incomings and
+					//   (re)introduce PHIs as needed (instead of specializing to a single predecessor).
+					// - however, when incoming stack *heights vary* (dynamic CFG backfill / invalid bytecode),
+					//   we must specialize the entry stack to this predecessor edge, otherwise the mode-height
+					//   filter may discard the current edge and we won't rebuild to the needed shape.
+					needSeed := false
+					if es != nil {
+						// If the CFG became dynamic at runtime (new blocks discovered / jump-table backfill),
+						// a parse-time (gen=0) entry stack can be overly specialized (baked constants) and cause
+						// wrong control flow even when stack heights match. In that case, force a rebuild seeded
+						// from the concrete incoming snapshot for this edge.
+						if it.cfg != nil && it.cfg.runtimeEpoch != 0 && it.cfg.runtimeBecameDynamic && cur.EntryStackGen() == 0 {
+							needSeed = true
+						}
+						needSeed = needSeed || (len(es) != len(in))
+					} else {
+						// entryStack is nil.
+						//
+						// Only seed if incoming stack heights vary and this edge's height
+						// is not the mode height.
+						modeLen := -1
+						modeCnt := -1
+						counts := make(map[int]int, 4)
+						for _, s := range cur.incomingStacks {
+							counts[len(s)]++
+						}
+						for l, c := range counts {
+							if c > modeCnt || (c == modeCnt && (modeLen < 0 || l < modeLen)) {
+								modeLen, modeCnt = l, c
+							}
+						}
+						// In dynamic-jump regions, DO NOT unconditionally specialize to a single predecessor
+						// when heights are consistent. Doing so can bake path-dependent constants into the
+						// entry stack and remove required PHIs, which can flip branch conditions and diverge.
+						if len(counts) > 1 && modeLen >= 0 && len(in) != modeLen {
+							needSeed = true
+						}
+					}
+					if needSeed {
+						// This should be rare for valid bytecode: feasible paths reaching the same JUMPDEST
+						// should have the same stack height. When it happens, it often indicates either:
+						// - incomplete/unstable dynamic CFG discovery (transient), or
+						// - a CFG/snapshot bookkeeping bug.
+						//
+						// Log (throttled) so we can notice it during long sync runs.
+						maybeLogEntryStackMismatch(it, cur, prev, func() int {
+							if es == nil {
+								return -1
+							}
+							return len(es)
+						}(), len(in))
+						// If we have a CFG and a predecessor, refresh this edge snapshot using the
+						// concrete runtime exit stack of the predecessor. This repairs cases where
+						// build-time snapshots (or stale cached ones) have the wrong height/values.
+						if it.cfg != nil && prev != nil && cur != nil {
+							// IMPORTANT: use computeExitSnapshotForEdgeTo so loop/backedge hardening runs.
+							// In particular, this avoids storing "future defs" (values defined in `cur`) as
+							// symbolic live-ins, which would cause getEntryStackForBlock to drop the backedge
+							// snapshot entirely and can freeze loop-carried values (e.g. loop index).
+							snap := it.computeExitSnapshotForEdgeTo(nil, prev, cur)
+							it.cfg.connectEdge(prev, cur, snap)
 							if in2, ok2 := cur.incomingStacks[prev]; ok2 && in2 != nil {
 								in = in2
 							}
 						}
-					}
-					// Prefer seeding entryStack from the concrete incoming snapshot for this predecessor
-					// edge (fast + stabilizes joins). However, if the snapshot contains a non-PHI def
-					// belonging to this target block, it's a loop-carried "future def" and must not be
-					// embedded as a symbolic live-in. In that case, rebuild using all incomings of this
-					// edge's height and let PHI generation reconcile values.
-					badSeed := false
-					for i := range in {
-						v := in[i]
-						if v.kind == Variable && v.def != nil && v.def.defBlockNum == cur.blockNum && v.def.op != MirPHI {
-							badSeed = true
-							break
-						}
-					}
-					if badSeed {
+						// IMPORTANT: do NOT seed the entry stack values from a single predecessor edge.
+						// That can bake per-path constants (e.g. return addresses, dispatcher indices) into
+						// the block and eliminate required PHIs, which is a common cause of divergent loops
+						// and invalid jumpdest 0x0.
+						//
+						// Instead, force a rebuild using *all* incoming stacks of this edge's height and let
+						// getEntryStackForBlock generate PHIs to reconcile differing values.
+						// When incoming stack heights vary, we must rebuild to the *current edge's* height.
+						// Otherwise (e.g. picking the mode/max height), we can drop the current edge's return
+						// address / deep operands and bake the wrong control-flow (common in internal-call
+						// trampolines).
 						cur.preferredEntryHeight = len(in)
 						cur.SetEntryStack(nil)
-					} else {
-						seed := make([]Value, len(in))
-						copy(seed, in)
-						for i := range seed {
-							seed[i].liveIn = true
+						if len(cur.instructions) > 0 {
+							it.invalidateBlockResults(cur)
+							cur.ResetForRebuild(false)
 						}
-						cur.SetEntryStack(seed)
+						cur.built = false
 					}
-					if len(cur.instructions) > 0 {
-						it.invalidateBlockResults(cur)
-						cur.ResetForRebuild(true)
-					}
-					cur.built = false
 				}
 			}
 		}
@@ -753,14 +1055,16 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 		if cur != nil && !cur.built {
 			if len(cur.instructions) > 0 {
 				it.invalidateBlockResults(cur)
-				cur.ResetForRebuild(true)
+				// Clear entryStack on runtime rebuild: preserving it can retain stale def pointers
+				// (especially PHIs) after CFG edge updates, leading to "missing result for def" later.
+				cur.ResetForRebuild(false)
 			}
 			if err := it.cfg.buildBasicBlock(cur, it.validJumpDests); err != nil {
 				return it.finishResult(ExecResult{Err: err})
 			}
 		}
 
-		// Reset instruction cursor for this block execution
+		// Reset instruction cursor for this block execution.
 		cur.pos = 0
 		it.curEvmOpIndex = -1
 		it.curBlockConstPrefix = it.ensureBlockConstPrefix(cur)
@@ -798,8 +1102,19 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 				// rely on build-time snapshots unless we detect a mismatch and explicitly repair it.
 				if it.cfg != nil && cur != nil && children[0] != nil {
 					to := children[0]
-					if cur.unresolvedJump || to.unresolvedJump {
-						it.cfg.connectEdge(cur, to, it.computeExitSnapshotForEdgeTo(prev, cur, to))
+					if cur.unresolvedJump || to.unresolvedJump || to.firstPC <= cur.firstPC {
+						// Avoid allocation-heavy snapshot computation on stable edges:
+						// only refresh if this edge hasn't been recorded yet or the target entry stack
+						// is currently invalidated (nil) and may need PHI rebuild.
+						need := true
+						if to.incomingStacks != nil {
+							if _, ok := to.incomingStacks[cur]; ok && to.entryStack != nil {
+								need = false
+							}
+						}
+						if need {
+							it.cfg.connectEdge(cur, to, it.computeExitSnapshotForEdgeTo(prev, cur, to))
+						}
 					}
 				}
 				prev, cur = cur, children[0]
@@ -840,6 +1155,13 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 					a, b, err := it.evalBinary(m)
 					if err == nil && a != nil && b != nil {
 						it.debugOperandHook(m.evmPC, m.evmOp, m.op, *a, *b)
+					}
+				case MirCALLDATACOPY, MirRETURNDATACOPY:
+					// For copy ops capture: a=dest, b=size.
+					dest, err1 := it.evalOperand(m, 0)
+					sz, err2 := it.evalOperand(m, 2)
+					if err1 == nil && err2 == nil && dest != nil && sz != nil {
+						it.debugOperandHook(m.evmPC, m.evmOp, m.op, *dest, *sz)
 					}
 				case MirSLOAD:
 					k, err := it.evalOperand(m, 0)
@@ -892,6 +1214,21 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 						}
 						it.debugOperandHookEx(m.evmPC, m.evmOp, m.op, *a, *b, aDefPC, bDefPC, aDefOp, bDefOp)
 					}
+				case MirLT:
+					a, b, err := it.evalBinary(m)
+					if err == nil && a != nil && b != nil {
+						var aDefPC, bDefPC uint
+						var aDefOp, bDefOp MirOperation
+						if len(m.operands) >= 2 {
+							if v := m.operands[0]; v != nil && v.def != nil {
+								aDefPC, aDefOp = v.def.evmPC, v.def.op
+							}
+							if v := m.operands[1]; v != nil && v.def != nil {
+								bDefPC, bDefOp = v.def.evmPC, v.def.op
+							}
+						}
+						it.debugOperandHookEx(m.evmPC, m.evmOp, m.op, *a, *b, aDefPC, bDefPC, aDefOp, bDefOp)
+					}
 				case MirSLOAD:
 					k, err := it.evalOperand(m, 0)
 					if err == nil && k != nil {
@@ -915,14 +1252,15 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 							}
 						}
 						// Best-effort: compute the word that MLOAD will read from memory.
+						//
+						// IMPORTANT: This must be side-effect free (no gas charging / no memory expansion),
+						// otherwise enabling debug hooks changes execution semantics.
 						var loaded uint256.Int
 						loaded.Clear()
-						var u32 uint256.Int
-						u32.SetUint64(32)
-						if err2 := it.chargeMemoryExpansion(off, &u32); err2 == nil {
-							o := int(off.Uint64())
-							if o >= 0 {
-								it.ensureMem(o + 32)
+						o64, ov := off.Uint64WithOverflow()
+						if !ov {
+							o := int(o64)
+							if o >= 0 && o+32 <= len(it.mem) {
 								loaded.SetBytes(it.mem[o : o+32])
 							}
 						}
@@ -991,6 +1329,23 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 							}
 						}
 						it.debugOperandHookEx(m.evmPC, m.evmOp, m.op, *a, *b, aDefPC, bDefPC, aDefOp, bDefOp)
+					}
+				case MirCALLDATACOPY, MirRETURNDATACOPY:
+					// For copy ops capture: a=dest, b=size.
+					dest, err1 := it.evalOperand(m, 0)
+					sz, err2 := it.evalOperand(m, 2)
+					if err1 == nil && err2 == nil && dest != nil && sz != nil {
+						var aDefPC, bDefPC uint
+						var aDefOp, bDefOp MirOperation
+						if len(m.operands) >= 3 {
+							if v := m.operands[0]; v != nil && v.def != nil {
+								aDefPC, aDefOp = v.def.evmPC, v.def.op
+							}
+							if v := m.operands[2]; v != nil && v.def != nil {
+								bDefPC, bDefOp = v.def.evmPC, v.def.op
+							}
+						}
+						it.debugOperandHookEx(m.evmPC, m.evmOp, m.op, *dest, *sz, aDefPC, bDefPC, aDefOp, bDefOp)
 					}
 				case MirSSTORE:
 					k, err1 := it.evalOperand(m, 0)
@@ -1081,6 +1436,10 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 			case MirPOP:
 				// effect already modeled by IR; no runtime action needed here
 
+			case MirNOP:
+				// No-op instruction used for bookkeeping (e.g. constant-folded EVM op alignment/gas).
+				// Constant gas for its originating EVM opcode is still charged via the const-delta path.
+
 			case MirADD, MirMUL, MirSUB, MirDIV, MirSDIV, MirMOD, MirSMOD, MirEXP, MirSIGNEXT,
 				MirAND, MirOR, MirXOR, MirBYTE, MirSHL, MirSHR, MirSAR,
 				MirLT, MirGT, MirSLT, MirSGT, MirEQ:
@@ -1131,11 +1490,26 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 						out.SetUint64(uint64(b32[n]))
 					}
 				case MirSHL:
-					out.Lsh(b, uint(a.Uint64()))
+					shift, ov := a.Uint64WithOverflow()
+					if ov || shift >= 256 {
+						out.Clear()
+					} else {
+						out.Lsh(b, uint(shift))
+					}
 				case MirSHR:
-					out.Rsh(b, uint(a.Uint64()))
+					shift, ov := a.Uint64WithOverflow()
+					if ov || shift >= 256 {
+						out.Clear()
+					} else {
+						out.Rsh(b, uint(shift))
+					}
 				case MirSAR:
-					out.SRsh(b, uint(a.Uint64()))
+					shift, ov := a.Uint64WithOverflow()
+					if ov || shift >= 256 {
+						out.SRsh(b, 255)
+					} else {
+						out.SRsh(b, uint(shift))
+					}
 				case MirLT:
 					if a.Lt(b) {
 						out.SetOne()
@@ -1213,9 +1587,7 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 				if err != nil {
 					return it.finishResult(ExecResult{Err: err})
 				}
-				var u32 uint256.Int
-				u32.SetUint64(32)
-				if err := it.chargeMemoryExpansion(off, &u32); err != nil {
+				if err := it.chargeMemoryExpansion(off, u256U32); err != nil {
 					return it.finishResult(ExecResult{Err: err})
 				}
 				o := int(off.Uint64())
@@ -1232,9 +1604,7 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 				if err != nil {
 					return it.finishResult(ExecResult{Err: err})
 				}
-				var u32 uint256.Int
-				u32.SetUint64(32)
-				if err := it.chargeMemoryExpansion(off, &u32); err != nil {
+				if err := it.chargeMemoryExpansion(off, u256U32); err != nil {
 					return it.finishResult(ExecResult{Err: err})
 				}
 				o := int(off.Uint64())
@@ -1251,9 +1621,7 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 				if err != nil {
 					return it.finishResult(ExecResult{Err: err})
 				}
-				var u1 uint256.Int
-				u1.SetUint64(1)
-				if err := it.chargeMemoryExpansion(off, &u1); err != nil {
+				if err := it.chargeMemoryExpansion(off, u256One); err != nil {
 					return it.finishResult(ExecResult{Err: err})
 				}
 				o := int(off.Uint64())
@@ -1800,9 +2168,51 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 				if cur != nil {
 					for _, ch := range cur.Children() {
 						if ch != nil && ch.firstPC == target {
-							if it.cfg != nil && (cur.unresolvedJump || ch.unresolvedJump) {
-								it.cfg.connectEdge(cur, ch, it.computeExitSnapshotForEdgeTo(prev, cur, ch))
+							// Even for forward static edges, if the target entry stack is currently invalidated,
+							// refresh the edge snapshot so PHI resolution has a concrete predecessor shape.
+							if it.cfg != nil && (it.cfg.runtimeBecameDynamic || cur.unresolvedJump || ch.unresolvedJump || ch.firstPC <= cur.firstPC || ch.entryStack == nil) {
+								need := true
+								oldSnap, hadOld := []Value(nil), false
+								if ch.incomingStacks != nil {
+									if s, ok := ch.incomingStacks[cur]; ok {
+										oldSnap, hadOld = s, true
+										if ch.entryStack != nil {
+											need = false
+										}
+									}
+								}
+								// In runtime-discovered dynamic CFGs, the same edge can be traversed with different
+								// calldata-dependent values. Keep (a small top-K) incoming snapshot fresh so stack-
+								// sensitive control-flow (jump tables) is compiled correctly.
+								var snap []Value
+								if it.cfg.runtimeEpoch != 0 && it.cfg.runtimeBecameDynamic {
+									snap = it.computeExitSnapshotForEdgeTo(prev, cur, ch)
+									snap = it.materializeSnapshotTopK(snap, 16)
+									if hadOld && stacksEqual(oldSnap, snap) {
+										need = false
+									} else {
+										need = true
+									}
+								}
+								if !need && it.cfg != nil && it.cfg.runtimeEpoch != 0 {
+									// Keep incomingStacksGen aligned with the current epoch even when the snapshot
+									// itself hasn't changed; entry-stack rebuild logic uses this to prefer current
+									// run inputs and avoid stack-height underflows for SWAP/DUP-heavy blocks.
+									if ch.incomingStacksGen == nil {
+										ch.incomingStacksGen = make(map[*MIRBasicBlock]uint64, 8)
+									}
+									ch.incomingStacksGen[cur] = it.cfg.runtimeEpoch
+								}
+								if need {
+									if snap == nil {
+										snap = it.computeExitSnapshotForEdgeTo(prev, cur, ch)
+									}
+									it.cfg.connectEdge(cur, ch, snap)
+								}
 							}
+							// Even when we skip connectEdge on static forward edges (perf), we must still
+							// tag the actually-taken predecessor edge for this runtime epoch.
+							it.tagIncomingEpoch(cur, ch)
 							prev, cur = cur, ch
 							break execBlock
 						}
@@ -1830,9 +2240,43 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 					if cur != nil {
 						for _, ch := range cur.Children() {
 							if ch != nil && ch.firstPC == target {
-								if it.cfg != nil && (cur.unresolvedJump || ch.unresolvedJump) {
-									it.cfg.connectEdge(cur, ch, it.computeExitSnapshotForEdgeTo(prev, cur, ch))
+								// Even for forward static edges, if the target entry stack is currently invalidated,
+								// refresh the edge snapshot so PHI resolution has a concrete predecessor shape.
+								if it.cfg != nil && (it.cfg.runtimeBecameDynamic || cur.unresolvedJump || ch.unresolvedJump || ch.firstPC <= cur.firstPC || ch.entryStack == nil) {
+									need := true
+									oldSnap, hadOld := []Value(nil), false
+									if ch.incomingStacks != nil {
+										if s, ok := ch.incomingStacks[cur]; ok {
+											oldSnap, hadOld = s, true
+											if ch.entryStack != nil {
+												need = false
+											}
+										}
+									}
+									var snap []Value
+									if it.cfg.runtimeEpoch != 0 && it.cfg.runtimeBecameDynamic {
+										snap = it.computeExitSnapshotForEdgeTo(prev, cur, ch)
+										snap = it.materializeSnapshotTopK(snap, 16)
+										if hadOld && stacksEqual(oldSnap, snap) {
+											need = false
+										} else {
+											need = true
+										}
+									}
+									if !need && it.cfg != nil && it.cfg.runtimeEpoch != 0 {
+										if ch.incomingStacksGen == nil {
+											ch.incomingStacksGen = make(map[*MIRBasicBlock]uint64, 8)
+										}
+										ch.incomingStacksGen[cur] = it.cfg.runtimeEpoch
+									}
+									if need {
+										if snap == nil {
+											snap = it.computeExitSnapshotForEdgeTo(prev, cur, ch)
+										}
+										it.cfg.connectEdge(cur, ch, snap)
+									}
 								}
+								it.tagIncomingEpoch(cur, ch)
 								prev, cur = cur, ch
 								break execBlock
 							}
@@ -1874,9 +2318,26 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 				}
 				// Performance: avoid snapshotting fallthrough edges unless we are in an unresolved
 				// jump region. Static CFG fallthrough edges already have build-time snapshots.
-				if cur != nil && ft != nil && it.cfg != nil && (cur.unresolvedJump || ft.unresolvedJump) {
-					it.cfg.connectEdge(cur, ft, it.computeExitSnapshotForEdgeTo(prev, cur, ft))
+				// However, if the fallthrough target entry stack is invalidated, refresh this edge snapshot
+				// even for forward static edges.
+				if cur != nil && ft != nil && it.cfg != nil && (cur.unresolvedJump || ft.unresolvedJump || ft.firstPC <= cur.firstPC || ft.entryStack == nil) {
+					need := true
+					if ft.incomingStacks != nil {
+						if _, ok := ft.incomingStacks[cur]; ok && ft.entryStack != nil {
+							need = false
+						}
+					}
+					if !need && it.cfg != nil && it.cfg.runtimeEpoch != 0 {
+						if ft.incomingStacksGen == nil {
+							ft.incomingStacksGen = make(map[*MIRBasicBlock]uint64, 8)
+						}
+						ft.incomingStacksGen[cur] = it.cfg.runtimeEpoch
+					}
+					if need {
+						it.cfg.connectEdge(cur, ft, it.computeExitSnapshotForEdgeTo(prev, cur, ft))
+					}
 				}
+				it.tagIncomingEpoch(cur, ft)
 				prev, cur = cur, ft
 				break execBlock
 
@@ -1940,12 +2401,6 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 					it.state.RevertToSnapshot(snap)
 				}
 				return it.finishResult(ExecResult{Err: fmt.Errorf("unimplemented MIR op: %s", m.op.String())})
-			}
-
-			// If we performed a control transfer (JUMP/JUMPI), restart loop with new block.
-			if cur != nil && cur.pos == 0 && prev != nil && prev != cur {
-				// We jumped and reset cur.pos above at top of outer loop.
-				break
 			}
 		}
 	}
@@ -2015,31 +2470,24 @@ func (it *MIRInterpreter) computeExitSnapshotForEdge(prev, from *MIRBasicBlock) 
 	// jump-destination value into storage).
 	if entry != nil && len(entry) == len(entryStatic) {
 		out := make([]Value, len(exitStatic))
-		for i := range exitStatic {
+		for i := len(exitStatic) - 1; i >= 0; i-- {
 			ev := exitStatic[i]
 			if !ev.liveIn {
 				// Produced within this block; keep as-is (it refers to MIR defs in this block).
 				out[i] = ev
 				continue
 			}
-			// Find the corresponding entry slot in the static entry snapshot.
-			// For non-const, Value.Equal compares def pointers; for const, compares payload bytes.
-			mapped := -1
-			for j := range entryStatic {
-				// Use rebuild-stable equality: def pointers can change across rebuilds.
-				if equalValueForFlow(&entryStatic[j], &ev) {
-					mapped = j
-					break
-				}
-			}
-			if mapped >= 0 {
-				rv := entry[mapped]
+			// Stable remap by original entry-stack slot position when available.
+			// This avoids ambiguity when the same constant appears multiple times.
+			if ev.liveInPos >= 0 && ev.liveInPos < len(entry) {
+				rv := entry[ev.liveInPos]
 				rv.liveIn = true
+				rv.liveInPos = ev.liveInPos
 				out[i] = rv
-			} else {
-				// Shouldn't happen; fall back to the static value.
-				out[i] = ev
+				continue
 			}
+			// No position metadata: fall back to static value.
+			out[i] = ev
 		}
 		return out
 	}
@@ -2065,6 +2513,9 @@ func (it *MIRInterpreter) computeExitSnapshotForEdge(prev, from *MIRBasicBlock) 
 // into the next iteration (they become "future" defs). In these cases we materialize the snapshot
 // into constants based on the current runtime values.
 func (it *MIRInterpreter) computeExitSnapshotForEdgeTo(prev, from, to *MIRBasicBlock) []Value {
+	// Use the runtime entry snapshot (when available) to substitute live-ins into the exit-stack
+	// shape. This is required for correctness when the entry stack contains runtime-dependent
+	// values (not just constants), even on fully static CFG edges.
 	snap := it.computeExitSnapshotForEdge(prev, from)
 	if snap == nil || to == nil || from == nil {
 		return snap
@@ -2073,6 +2524,13 @@ func (it *MIRInterpreter) computeExitSnapshotForEdgeTo(prev, from, to *MIRBasicB
 	// "future defs" when carried into the next iteration. Materialize only produced values
 	// (non-liveIns) into constants to preserve semantics while keeping cost bounded.
 	if to.firstPC <= from.firstPC {
+		// IMPORTANT: in dynamic CFG regions (unresolved jumps / runtime backfill), this "backedge"
+		// often represents a dispatcher jump (not a loop). Materializing produced values here can
+		// freeze a path-dependent value and bake it into earlier blocks (e.g. SSTORE operands),
+		// causing consensus divergence.
+		if it != nil && it.cfg != nil && it.cfg.runtimeEpoch != 0 && (from.unresolvedJump || to.unresolvedJump || it.cfg.runtimeBecameDynamic) {
+			return snap
+		}
 		return it.materializeSnapshotProducedOnly(snap)
 	}
 	// Correctness: loops may cross blocks without the lexical "backedge" appearing on this edge
@@ -2116,6 +2574,7 @@ func (it *MIRInterpreter) materializeSnapshotProducedOnly(in []Value) []Value {
 		}
 		cv := newConstValueFromU(u)
 		cv.liveIn = true
+		cv.liveInPos = -1
 		out[i] = *cv
 	}
 	return out
@@ -2142,6 +2601,7 @@ func (it *MIRInterpreter) materializeSnapshotSelfDefsOnly(in []Value, toBlockNum
 			}
 			cv := newConstValueFromU(u)
 			cv.liveIn = true
+			cv.liveInPos = -1
 			out[i] = *cv
 		}
 	}
@@ -2163,6 +2623,12 @@ func (it *MIRInterpreter) resolveBB(prev, from *MIRBasicBlock, targetPC uint) (*
 	if nb == nil {
 		nb = it.cfg.getOrCreateBlock(targetPC)
 	}
+	// If we discover a new basic block target at runtime, treat this CFG as dynamic/mutable.
+	// This is a correctness signal for caching layers: path-dependent runtime expansion and
+	// incoming snapshots must not be shared globally across unrelated executions.
+	if it.cfg != nil && (!existed || (from != nil && from.unresolvedJump)) {
+		it.cfg.runtimeBecameDynamic = true
+	}
 	if it.resolveHook != nil {
 		fromPC := uint(0)
 		if from != nil {
@@ -2172,10 +2638,73 @@ func (it *MIRInterpreter) resolveBB(prev, from *MIRBasicBlock, targetPC uint) (*
 	}
 	// Record incoming stack snapshot for PHI evaluation.
 	if from != nil {
-		snap := it.computeExitSnapshotForEdgeTo(prev, from, nb)
-		it.cfg.connectEdge(from, nb, snap)
+		// Avoid repeated allocation-heavy snapshotting for already-recorded stable edges.
+		need := true
+		if existed && nb != nil && nb.incomingStacks != nil {
+			if _, ok := nb.incomingStacks[from]; ok && nb.entryStack != nil {
+				need = false
+			}
+		}
+		if need {
+			snap := it.computeExitSnapshotForEdgeTo(prev, from, nb)
+			// For dynamic control-flow edges, prefer a concrete runtime snapshot (materialized) to avoid
+			// leaking symbolic/stale defs across rebuilds. Materialize enough of the stack to cover
+			// common ABI/dispatcher patterns (often > 16 deep) without always paying full cost.
+			if it.cfg != nil && it.cfg.runtimeEpoch != 0 && (from.unresolvedJump || nb.unresolvedJump || it.cfg.runtimeBecameDynamic) && snap != nil {
+				// Heuristic: for backward jumps into earlier dispatchers, avoid materializing.
+				// Materialization can freeze path-dependent values into constants and later get baked
+				// into storage/memory ops in the dispatcher region.
+				if nb.firstPC > from.firstPC {
+					k := 64
+					if len(snap) < k {
+						k = len(snap)
+					}
+					snap = it.materializeSnapshotTopK(snap, k)
+				}
+			}
+			it.cfg.connectEdge(from, nb, snap)
+		}
 	}
 	return nb, nil
+}
+
+// materializeSnapshotTopK materializes only the top K stack elements (top-of-stack is at the end
+// of the slice). This is a correctness/perf compromise for dynamic CFG backfill: it makes control-
+// flow sensitive values concrete (jump tables / dispatch) without paying to materialize the entire
+// stack snapshot.
+func (it *MIRInterpreter) materializeSnapshotTopK(in []Value, k int) []Value {
+	if it == nil || len(in) == 0 || k <= 0 {
+		return in
+	}
+	out := make([]Value, len(in))
+	copy(out, in)
+	start := len(out) - k
+	if start < 0 {
+		start = 0
+	}
+	for i := start; i < len(out); i++ {
+		v := out[i]
+		if v.kind == Konst {
+			continue
+		}
+		// Avoid materializing PHIs into constants: PHI selection is edge-dependent and forcing a
+		// concrete value here can bake the wrong path's value into downstream blocks.
+		// Keeping the PHI symbolic lets evalOperand fetch the correct runtime result.
+		if v.kind == Variable && v.def != nil && v.def.op == MirPHI {
+			continue
+		}
+		u, err := it.evalValue(&v)
+		if err != nil || u == nil {
+			v.liveIn = true
+			out[i] = v
+			continue
+		}
+		cv := newConstValueFromU(u)
+		cv.liveIn = true
+		cv.liveInPos = -1
+		out[i] = *cv
+	}
+	return out
 }
 
 // materializeSnapshot converts a symbolic stack snapshot into a constant snapshot by evaluating
@@ -2388,10 +2917,46 @@ func (it *MIRInterpreter) chargeMemoryExpansion(offset, size *uint256.Int) error
 	if offset == nil || size == nil {
 		return nil
 	}
-	off, offOverflow := offset.Uint64WithOverflow()
-	sz, szOverflow := size.Uint64WithOverflow()
-	if offOverflow || szOverflow {
-		return errors.New("memory offset/size overflow")
+	// Fast no-expansion path: if the accessed range is already within current memory size,
+	// we can return without any word-size rounding or quadratic fee math.
+	//
+	// This is extremely common for small view calls which touch the same small memory window
+	// repeatedly (e.g. ABI encoding of return values).
+	memLen := uint64(len(it.mem))
+	if memLen != 0 && offset.BitLen() <= 64 && size.BitLen() <= 64 {
+		off := offset.Uint64()
+		sz := size.Uint64()
+		if sz == 0 {
+			return nil
+		}
+		end := off + sz
+		if end < off {
+			return errors.New("memory expansion overflow")
+		}
+		if end <= memLen {
+			return nil
+		}
+	}
+
+	// Hot path: most memory accesses are well within uint64. Avoid the slower Uint64WithOverflow.
+	var off, sz uint64
+	if offset.BitLen() <= 64 {
+		off = offset.Uint64()
+	} else {
+		var offOverflow bool
+		off, offOverflow = offset.Uint64WithOverflow()
+		if offOverflow {
+			return errors.New("memory offset overflow")
+		}
+	}
+	if size.BitLen() <= 64 {
+		sz = size.Uint64()
+	} else {
+		var szOverflow bool
+		sz, szOverflow = size.Uint64WithOverflow()
+		if szOverflow {
+			return errors.New("memory size overflow")
+		}
 	}
 	// Zero-size access does not expand memory.
 	if sz == 0 {
@@ -2427,9 +2992,15 @@ func (it *MIRInterpreter) chargeKeccakDynamicGas(offset, size *uint256.Int) erro
 	if size == nil {
 		return nil
 	}
-	sz, overflow := size.Uint64WithOverflow()
-	if overflow {
-		return errors.New("keccak size overflow")
+	var sz uint64
+	if size.BitLen() <= 64 {
+		sz = size.Uint64()
+	} else {
+		var overflow bool
+		sz, overflow = size.Uint64WithOverflow()
+		if overflow {
+			return errors.New("keccak size overflow")
+		}
 	}
 	words := toWordSize(sz)
 	wordGas := words * params.Keccak256WordGas
@@ -2484,9 +3055,15 @@ func (it *MIRInterpreter) chargeCopyGas(size *uint256.Int) error {
 	if size == nil {
 		return nil
 	}
-	sz, overflow := size.Uint64WithOverflow()
-	if overflow {
-		return errors.New("copy size overflow")
+	var sz uint64
+	if size.BitLen() <= 64 {
+		sz = size.Uint64()
+	} else {
+		var overflow bool
+		sz, overflow = size.Uint64WithOverflow()
+		if overflow {
+			return errors.New("copy size overflow")
+		}
 	}
 	words := toWordSize(sz)
 	wordGas := words * params.CopyGas
@@ -3361,8 +3938,23 @@ func (it *MIRInterpreter) evalPhi(cur, prev *MIRBasicBlock, phi *MIR) (*uint256.
 			}
 			foundPrev = true
 			if opIdx >= 0 && opIdx < len(phi.operands) && phi.operands[opIdx] != nil {
+				// Guard: the operand must not be a PHI defined in this same join block.
+				// That would be a "future def" at block entry (usually caused by a stale/incorrect
+				// incoming snapshot being specialized into the entry stack).
+				if ov := phi.operands[opIdx]; ov != nil && ov.kind == Variable && ov.def != nil &&
+					ov.def.op == MirPHI && ov.def.defBlockNum == cur.blockNum {
+					// fall back to snapshot indexing below
+					break
+				}
 				val, err := it.evalValue(phi.operands[opIdx])
-				if err == nil && it.debugPhiHook != nil && val != nil {
+				if err != nil {
+					// Operand-based PHI selection can become temporarily stale across rebuilds when
+					// parents/incoming snapshots change shape. If the selected operand refers to a def
+					// that wasn't executed on this edge ("missing result for def"), fall back to the
+					// runtime incoming snapshot for this predecessor.
+					break
+				}
+				if it.debugPhiHook != nil && val != nil {
 					inLen := 0
 					inIdx := -1
 					if cur != nil && cur.incomingStacks != nil {
@@ -3370,7 +3962,7 @@ func (it *MIRInterpreter) evalPhi(cur, prev *MIRBasicBlock, phi *MIR) (*uint256.
 					}
 					it.debugPhiHook(cur.FirstPC(), prev.FirstPC(), phi.evmPC, phi.phiStackIndex, inLen, inIdx, *val)
 				}
-				return val, err
+				return val, nil
 			}
 			break
 		}
@@ -3398,10 +3990,16 @@ func (it *MIRInterpreter) evalPhi(cur, prev *MIRBasicBlock, phi *MIR) (*uint256.
 				v := in[idx]
 				if v.kind != Unknown {
 					// If the incoming snapshot points at a PHI defined in this join block, it's a
-					// "future def"/self-reference at block entry. Ignore rather than corrupt control flow.
+					// loop-carried self-reference. If we have already executed this PHI earlier in the
+					// current run (previous loop iteration), use the cached result as the live-in value.
 					if v.kind == Variable && v.def != nil && v.def.op == MirPHI && v.def.defBlockNum == cur.blockNum {
-						return nil, fmt.Errorf("phi self-reference in incoming snapshot (curFirstPC=%d prevFirstPC=%d phiPC=%d phiIdx=%d)",
-							cur.FirstPC(), prev.FirstPC(), phi.evmPC, phi.phiStackIndex)
+						if r, ok := it.getResult(v.def); ok && r != nil {
+							return r, nil
+						}
+						// Defensive semantics: if we don't have a previous iteration value, treat as 0.
+						// This matches EVM's "missing stack slot => 0" behavior in our interpreter and
+						// prevents spurious aborts on transient CFG/snapshot inconsistencies.
+						return u256Zero, nil
 					}
 					v.liveIn = true
 					return it.evalValue(&v)

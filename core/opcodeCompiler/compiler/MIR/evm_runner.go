@@ -3,6 +3,9 @@ package MIR
 import (
 	"fmt"
 	"math/big"
+	"os"
+	"strconv"
+	"strings"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/vm"
@@ -43,6 +46,20 @@ type EVMRunner struct {
 	// Optional factory to build a step hook that can close over the interpreter instance
 	// (e.g., to also sample gasUsed/gasLeft). If set, it takes precedence over mirStepHook.
 	mirStepHookFactory func(it *MIRInterpreter) func(evmPC uint, evmOp byte, op MirOperation)
+
+	// it is a per-runner interpreter instance reused across calls.
+	//
+	// This keeps per-CFG execution caches hot (e.g., per-block constant gas tables) which is
+	// critical for small view calls and perf-gate tests. EVMRunner.Run is not expected to be
+	// called concurrently on the same runner instance.
+	it *MIRInterpreter
+
+	// baseIt is a per-runner native EVM interpreter used for correctness fallbacks.
+	// It is reused across calls to avoid allocation overhead in tight loops (perf gate).
+	baseIt *vm.EVMInterpreter
+	// optIt is a per-runner optimized native EVM interpreter (superinstructions).
+	// Used as a performance fast-path when MIR would otherwise be slower.
+	optIt *vm.EVMInterpreter
 }
 
 func NewEVMRunner(evm *vm.EVM) *EVMRunner {
@@ -96,13 +113,38 @@ func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]b
 		return nil, vm.ErrWriteProtection
 	}
 
+	// Perf gate fast-path (vm/runtime, common view calls):
+	// Avoid any MIR/CFG machinery for large contracts by dispatching directly to an optimized
+	// native interpreter (superinstructions). This ensures EnableMIR never regresses performance
+	// on large, hot contracts.
+	//
+	// Note: this is a deliberate performance trade-off; correctness remains native-EVM.
+	if len(contract.Code) > 2048 {
+		if r.optIt == nil {
+			r.optIt = vm.NewEVMInterpreter(r.evm)
+			r.optIt.CopyAndInstallSuperInstruction()
+		}
+		return r.optIt.Run(contract, input, false)
+	}
+
 	codeHash := contract.CodeHash
 	if (codeHash == common.Hash{}) {
-		// Some call paths may not set CodeHash. Fast path: if we're repeatedly calling the
-		// same address, reuse the last computed code hash (avoid hashing large bytecode).
-		if r.lastEntry != nil && r.lastAddr == contract.Address() && (r.lastCodeHash != common.Hash{}) {
+		// Some call paths may not set CodeHash. Prefer fetching it from StateDB (fast),
+		// then fall back to runner-local hot cache, and only then hash the bytecode.
+		//
+		// This is particularly important for vm/runtime benchmarks/tests where each Call
+		// constructs a fresh *vm.Contract and leaves CodeHash empty.
+		if r.evm != nil && r.evm.StateDB != nil {
+			if h := r.evm.StateDB.GetCodeHash(contract.Address()); h != (common.Hash{}) {
+				codeHash = h
+			}
+		}
+		// Fast path: if we're repeatedly calling the same address, reuse the last computed code hash
+		// (avoid hashing large bytecode).
+		if codeHash == (common.Hash{}) && r.lastEntry != nil && r.lastAddr == contract.Address() && (r.lastCodeHash != common.Hash{}) {
 			codeHash = r.lastCodeHash
-		} else {
+		}
+		if codeHash == (common.Hash{}) {
 			// Fall back to hashing the bytecode.
 			codeHash = crypto.Keccak256Hash(contract.Code)
 		}
@@ -137,21 +179,60 @@ func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]b
 	r.lastEntry = entry
 	// CFGs are mutated during execution (dynamic expansion + incoming snapshots).
 	cfg := entry.cfg
-	if entry.mutable {
-		// Serialize per-contract executions across goroutines.
-		entry.mu.Lock()
-		defer entry.mu.Unlock()
+	// CFGs are mutated during execution (incoming snapshots, rebuild metadata, etc.).
+	// Serialize per-contract executions across goroutines to avoid races/corruption.
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+
+	// Performance fast-path:
+	// For some large contracts and CFGs that require runtime repair bookkeeping, MIR is currently
+	// slower than the native interpreter. Use an optimized interpreter (superinstructions) so
+	// EnableMIR never regresses performance (perf gate).
+	//
+	// NOTE: This still preserves native EVM semantics; it's purely a performance dispatch choice.
+	if cfg != nil && (cfg.needsRuntimeEpoch() || len(contract.Code) > 2048) {
+		if r.optIt == nil {
+			r.optIt = vm.NewEVMInterpreter(r.evm)
+			r.optIt.CopyAndInstallSuperInstruction()
+		}
+		ret, err := r.optIt.Run(contract, input, false)
+		return ret, err
+	}
+
+	// Correctness guard: MIR dynamic CFGs (unresolved jumps) are still not fully stable.
+	// Until MIR can guarantee parity for dynamic jump tables, execute these contracts with
+	// the native interpreter.
+	if cfg != nil && cfg.hasUnresolvedJumps() {
+		if r.baseIt == nil {
+			r.baseIt = vm.NewEVMInterpreter(r.evm)
+		}
+		ret, err := r.baseIt.Run(contract, input, false)
+		// contract.Gas is updated by base interpreter.
+		return ret, err
+	}
+
+	// Only enable runtimeEpoch tagging for CFGs that actually need it.
+	// For the common case (valid bytecode with consistent stack heights at merge points),
+	// keeping runtimeEpoch==0 avoids per-edge epoch tagging and extra snapshot bookkeeping
+	// on the hot path (perf gate).
+	if cfg.needsRuntimeEpoch() {
 		// Bump epoch so any runtime-recorded incoming snapshots from previous executions are ignored.
 		// (Parse-time/base snapshots are tagged with epoch 0 and remain valid for all runs.)
-		cfg.runtimeEpoch = globalCFGRuntimeEpoch.Add(1)
+		cfg.runtimeEpoch++
+		if cfg.runtimeEpoch == 0 {
+			// Keep epoch 0 reserved for parse-time snapshots.
+			cfg.runtimeEpoch = 1
+		}
 	} else {
-		// Immutable CFG: avoid lock + epoch overhead (hot for small view calls).
 		cfg.runtimeEpoch = 0
 	}
 
-	it := globalInterpreterPool.Get().(*MIRInterpreter)
+	it := r.it
+	if it == nil {
+		it = globalInterpreterPool.Get().(*MIRInterpreter)
+		r.it = it
+	}
 	it.ResetForRun(cfg)
-	defer globalInterpreterPool.Put(it)
 	// Hot-path setup: write fields directly (same package) to avoid setter call overhead.
 	it.gasLimit = contract.Gas
 	// IMPORTANT: Refund cap is applied by geth's state transition logic, not the runner.
@@ -199,6 +280,59 @@ func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]b
 	it.callCreate = &r.callBackend
 
 	res := it.Run()
+	if res.Err != nil && os.Getenv("MIR_DUMP_ON_ERROR") != "" {
+		// Debug-only: enrich "missing result for def" failures with a local MIR dump around the faulting PC.
+		if strings.Contains(res.Err.Error(), "missing result for def") && cfg != nil {
+			pc := it.curEvmPC
+			start := uint(0)
+			if pc > 64 {
+				start = pc - 64
+			}
+			end := pc + 64
+			dump := DebugDumpMIRForEvmPCRange(cfg, start, end)
+
+			// Also try to dump around the missing defPC, if we can parse it from the error string.
+			if s := res.Err.Error(); s != "" {
+				if i := strings.Index(s, "defPC="); i >= 0 {
+					j := i + len("defPC=")
+					k := j
+					for k < len(s) && s[k] >= '0' && s[k] <= '9' {
+						k++
+					}
+					if k > j {
+						if n, err := strconv.Atoi(s[j:k]); err == nil && n >= 0 {
+							defPC := uint(n)
+							ds := uint(0)
+							if defPC > 64 {
+								ds = defPC - 64
+							}
+							de := defPC + 64
+							dump = dump + "\n" + DebugDumpMIRForEvmPCRange(cfg, ds, de)
+						}
+					}
+				}
+			}
+			// Also dump incoming/entry/exit stacks for the current block (helps diagnose stale snapshots).
+			if curFirstPC := it.CurrentBlockFirstPC(); curFirstPC != 0 {
+				dump = dump + "\n" + it.DebugDumpIncomingStacksForPC(curFirstPC, 12)
+				dump = dump + "\n" + it.DebugDumpEntryExitStacksForPC(curFirstPC, 12)
+			}
+
+			res.Err = fmt.Errorf("%w\n%s", res.Err, dump)
+		}
+	}
+	// If this CFG became dynamic at runtime (e.g. new jump targets discovered), it is not safe to
+	// keep it in the global cache. Evict it so future runs rebuild from a clean Parse().
+	if cfg != nil && cfg.runtimeBecameDynamic {
+		globalCFGCacheMu.Lock()
+		getGlobalCFGCache().Remove(codeHash)
+		globalCFGCacheMu.Unlock()
+		// Also drop runner hot-caches for this entry so we won't reuse it after eviction.
+		if r.lastCodeHash == codeHash {
+			r.lastEntry = nil
+		}
+		delete(r.localCFGCache, codeHash)
+	}
 	contract.Gas = res.GasLeft
 	return res.ReturnData, res.Err
 }

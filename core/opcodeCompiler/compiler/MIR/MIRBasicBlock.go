@@ -124,11 +124,29 @@ func tryConstFoldBinary(op MirOperation, aVal, bVal *Value) (*Value, bool) {
 			out.SetUint64(uint64(b32[n]))
 		}
 	case MirSHL:
-		out.Lsh(b, uint(a.Uint64()))
+		// EVM: SHL(shift=a, value=b); if shift >= 256 => 0.
+		shift, ov := a.Uint64WithOverflow()
+		if ov || shift >= 256 {
+			out.Clear()
+		} else {
+			out.Lsh(b, uint(shift))
+		}
 	case MirSHR:
-		out.Rsh(b, uint(a.Uint64()))
+		// EVM: SHR(shift=a, value=b); if shift >= 256 => 0.
+		shift, ov := a.Uint64WithOverflow()
+		if ov || shift >= 256 {
+			out.Clear()
+		} else {
+			out.Rsh(b, uint(shift))
+		}
 	case MirSAR:
-		out.SRsh(b, uint(a.Uint64()))
+		// EVM: SAR(shift=a, value=b); if shift >= 256 => sign extension (equivalent to shift=255).
+		shift, ov := a.Uint64WithOverflow()
+		if ov || shift >= 256 {
+			out.SRsh(b, 255)
+		} else {
+			out.SRsh(b, uint(shift))
+		}
 	default:
 		return nil, false
 	}
@@ -221,9 +239,16 @@ type MIRBasicBlock struct {
 	evmOps         []evmOpAtPC
 	evmPCToOpIndex map[uint]int
 	// SSA-like stack modeling
-	entryStack     []Value
-	exitStack      []Value
-	incomingStacks map[*MIRBasicBlock][]Value
+	entryStack []Value
+	// entryStackGen tags runtime-specialized entry stacks by CFG runtimeEpoch.
+	// 0 means "build-time / stable" and is safe to reuse across runs.
+	entryStackGen uint64
+	// fixedEntryHeight remembers the parse-time entry stack height (when known).
+	// Used to prevent runtime rebuilds from choosing an infeasible height (which can
+	// make SWAP/DUP become no-ops and corrupt semantics).
+	fixedEntryHeight int
+	exitStack        []Value
+	incomingStacks   map[*MIRBasicBlock][]Value
 	// incomingStacksGen tags runtime-recorded incoming snapshots by CFG runtimeEpoch so cached CFGs
 	// can ignore stale snapshots from previous executions (different calldata).
 	incomingStacksGen map[*MIRBasicBlock]uint64
@@ -437,7 +462,13 @@ func (b *MIRBasicBlock) CreateUnaryOpMIR(op MirOperation, stack *ValueStack) (mi
 	case MirNOT, MirISZERO:
 		if folded, ok := tryConstFoldUnary(op, &opnd1); ok {
 			stack.push(folded)
-			return nil
+			// Emit a MirNOP tagged with this EVM opcode so constant gas can't be skipped.
+			nop := newVoidMIR(MirNOP)
+			nop = b.appendMIR(nop)
+			if nop != nil {
+				nop.genStackDepth = stack.size()
+			}
+			return nop
 		}
 	}
 
@@ -470,7 +501,15 @@ func (b *MIRBasicBlock) CreateBinOpMIR(op MirOperation, stack *ValueStack) (mir 
 	// by per-block EVM opcode stream aggregation.
 	if folded, ok := tryConstFoldBinary(op, &opnd1, &opnd2); ok {
 		stack.push(folded)
-		return nil
+		// IMPORTANT: Even when constant-folding, emit a MirNOP tagged with the originating EVM opcode
+		// so constant-gas accounting cannot "skip" folded-away opcodes in edge cases.
+		// This MirNOP has no runtime effect besides participating in const-gas deltas.
+		nop := newVoidMIR(MirNOP)
+		nop = b.appendMIR(nop)
+		if nop != nil {
+			nop.genStackDepth = stack.size()
+		}
+		return nop
 	}
 	mir = newBinaryOpMIR(op, &opnd1, &opnd2, stack)
 
@@ -501,7 +540,13 @@ func (b *MIRBasicBlock) CreateTernaryOpMIR(op MirOperation, stack *ValueStack) (
 	// by per-block EVM opcode stream aggregation.
 	if folded, ok := tryConstFoldTernary(op, &opndA, &opndB, &opndC); ok {
 		stack.push(folded)
-		return nil
+		// Emit a MirNOP tagged with this EVM opcode so constant gas can't be skipped.
+		nop := newVoidMIR(MirNOP)
+		nop = b.appendMIR(nop)
+		if nop != nil {
+			nop.genStackDepth = stack.size()
+		}
+		return nop
 	}
 
 	// Try peephole optimization for 3-operand operations  // todo clyde add peephole optimization later
@@ -551,6 +596,7 @@ func NewMIRBasicBlock(blockNum, pc uint) *MIRBasicBlock {
 	bb.evmOps = make([]evmOpAtPC, 0, 256)
 	bb.evmPCToOpIndex = make(map[uint]int, 256)
 	bb.entryStack = nil
+	bb.fixedEntryHeight = -1
 	bb.exitStack = nil
 	bb.incomingStacks = make(map[*MIRBasicBlock][]Value)
 	bb.incomingStacksGen = make(map[*MIRBasicBlock]uint64)
@@ -632,7 +678,7 @@ func (b *MIRBasicBlock) CreateDupMIR(n int, stack *ValueStack) *MIR {
 	duplicatedValue := *dupValue // Copy the value
 	stack.push(&duplicatedValue)
 
-	// No runtime MIR for DUP; gas handled via per-block opcode counts
+	// No runtime MIR for DUP; gas is accounted via block-level constant gas charging.
 	return nil
 }
 
@@ -663,8 +709,7 @@ func (b *MIRBasicBlock) CreateSwapMIR(n int, stack *ValueStack) *MIR {
 	// For non-constant values, perform the actual swap on the stack
 	stack.swap(0, n)
 
-	// Diagnostics: after swap snapshot removed
-	// No runtime MIR for SWAP; gas handled via per-block opcode counts
+	// No runtime MIR for SWAP; gas is accounted via block-level constant gas charging.
 	return nil
 }
 
@@ -728,17 +773,33 @@ func (b *MIRBasicBlock) ExitStack() []Value { return b.exitStack }
 
 // SetEntryStack sets the precomputed entry stack snapshot.
 func (b *MIRBasicBlock) SetEntryStack(values []Value) {
+	b.SetEntryStackWithGen(values, 0)
+}
+
+// SetEntryStackWithGen sets the precomputed entry stack snapshot and tags it with a generation.
+// gen==0 means "stable/build-time". Non-zero gens are treated as runtime-specialized and should
+// be discarded when executing under a different CFG runtimeEpoch.
+func (b *MIRBasicBlock) SetEntryStackWithGen(values []Value, gen uint64) {
 	if values == nil {
 		b.entryStack = nil
+		b.entryStackGen = 0
 		return
 	}
 	copied := make([]Value, len(values))
 	copy(copied, values)
 	b.entryStack = copied
+	b.entryStackGen = gen
+	// Record the stable (parse-time) entry stack height once it is known.
+	if gen == 0 && b.fixedEntryHeight < 0 {
+		b.fixedEntryHeight = len(values)
+	}
 }
 
 // EntryStack returns the block's entry stack snapshot.
 func (b *MIRBasicBlock) EntryStack() []Value { return b.entryStack }
+
+// EntryStackGen returns the generation tag for the current entry stack snapshot.
+func (b *MIRBasicBlock) EntryStackGen() uint64 { return b.entryStackGen }
 
 // LiveOutDefs returns the MIR definitions that are live at block exit.
 func (b *MIRBasicBlock) LiveOutDefs() []*MIR { return b.liveOutDefs }

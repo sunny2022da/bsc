@@ -19,11 +19,14 @@ import (
 	"github.com/ethereum/go-ethereum/core/tracing"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/ethdb/pebble"
 	ethlog "github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
+	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/triedb"
+	"github.com/ethereum/go-ethereum/triedb/pathdb"
 	"github.com/holiman/uint256"
 )
 
@@ -58,6 +61,21 @@ func openChainDB(chaindata string, readonly bool) (ethdb.Database, func(), error
 		_ = db.Close()
 	}
 	return db, cleanup, nil
+}
+
+func openTrieDB(disk ethdb.Database, readonly bool) *triedb.Database {
+	// triedb.NewDatabase defaults PathDB.Config.ReadOnly=false even if the underlying kv is read-only.
+	// For tooling that opens a live datadir with --readonlydb, propagate it down so pathdb/history
+	// won't attempt to truncate/repair the freezer.
+	if disk == nil {
+		return triedb.NewDatabase(disk, nil)
+	}
+	if rawdb.ReadStateScheme(disk) != rawdb.PathScheme {
+		return triedb.NewDatabase(disk, nil)
+	}
+	cfg := *pathdb.Defaults
+	cfg.ReadOnly = readonly
+	return triedb.NewDatabase(disk, &triedb.Config{PathDB: &cfg})
 }
 
 type replayEnv struct {
@@ -124,7 +142,7 @@ func newReplayEnv(db ethdb.Database, cfg *params.ChainConfig, genesisHash common
 // newReplayEnvAtBlockState initializes statedb directly from the on-disk state root of block `n`.
 // This is much faster for investigating a specific block range, but requires the datadir to have
 // the necessary trie nodes for that state root.
-func newReplayEnvAtBlockState(db ethdb.Database, cfg *params.ChainConfig, genesisHash common.Hash, n uint64) (*replayEnv, error) {
+func newReplayEnvAtBlockState(db ethdb.Database, cfg *params.ChainConfig, genesisHash common.Hash, n uint64, readonly bool) (*replayEnv, error) {
 	h := rawdb.ReadCanonicalHash(db, n)
 	if h == (common.Hash{}) {
 		return nil, fmt.Errorf("missing canonical hash for block %d", n)
@@ -134,7 +152,7 @@ func newReplayEnvAtBlockState(db ethdb.Database, cfg *params.ChainConfig, genesi
 		return nil, fmt.Errorf("missing header for block %d (%s)", n, h)
 	}
 	// Auto-detect hash/path scheme based on db metadata.
-	tdb := triedb.NewDatabase(db, nil)
+	tdb := openTrieDB(db, readonly)
 	statedb, err := state.New(header.Root, state.NewDatabase(tdb, nil))
 	if err != nil {
 		return nil, fmt.Errorf("state.New(root @%d %s): %w", n, header.Root, err)
@@ -284,25 +302,20 @@ func trimHex(b []byte, max int) string {
 	return s
 }
 
-func applyTxWithResult(evm *vm.EVM, statedb *state.StateDB, header *types.Header, tx *types.Transaction, idx int, usedGas *uint64, gp *core.GasPool) (*types.Receipt, *core.ExecutionResult, error) {
+func applyTxWithResult(evm *vm.EVM, statedb *state.StateDB, header *types.Header, blockHash common.Hash, tx *types.Transaction, idx int, usedGas *uint64, gp *core.GasPool) (*types.Receipt, *core.ExecutionResult, error) {
+	// IMPORTANT: use the same path as real block processing (ApplyTransactionWithEVM),
+	// not just ApplyMessage. This includes intrinsic gas, nonce checks, gas buy, etc.
 	msg, err := core.TransactionToMessage(tx, types.MakeSigner(evm.ChainConfig(), header.Number, header.Time), header.BaseFee)
 	if err != nil {
 		return nil, nil, err
 	}
 	statedb.SetTxContext(tx.Hash(), idx)
-	res, err := core.ApplyMessage(evm, msg, gp)
+	receipt, err := core.ApplyTransactionWithEVM(msg, gp, statedb, header.Number, blockHash, header.Time, tx, usedGas, evm)
 	if err != nil {
-		return nil, res, err
+		return receipt, nil, err
 	}
-	var root []byte
-	if evm.ChainConfig().IsByzantium(header.Number) {
-		evm.StateDB.Finalise(true)
-	} else {
-		root = statedb.IntermediateRoot(evm.ChainConfig().IsEIP158(header.Number)).Bytes()
-	}
-	*usedGas += res.UsedGas
-	receipt := core.MakeReceipt(evm, res, statedb, header.Number, header.Hash(), header.Time, tx, *usedGas, root)
-	return receipt, res, nil
+	// ApplyTransactionWithEVM doesn't return core.ExecutionResult. Tracers still capture opcode-level detail.
+	return receipt, nil, nil
 }
 
 func debugOneTx(engine consensus.Engine, chain *core.HeaderChain, cfg *params.ChainConfig, preState *state.StateDB, blk *types.Block, txIndex int) string {
@@ -329,6 +342,16 @@ func debugOneTx(engine consensus.Engine, chain *core.HeaderChain, cfg *params.Ch
 	// Prepare base (native) EVM run with tracer ring buffer.
 	baseState := preState.Copy()
 	systemcontracts.TryUpdateBuildInSystemContract(cfg, blk.Number(), lastBlock.Time, blk.Time(), baseState, true)
+	// Block 7753 focus: snapshot a couple of committed/current storage slots to ensure base vs MIR prestate matches.
+	if tx != nil && tx.To() != nil && preState != nil {
+		slotB := common.BigToHash(big.NewInt(0xb))
+		slotC := common.BigToHash(big.NewInt(0xc))
+		sb.WriteString(fmt.Sprintf("PRESTATE: to=%s base(committed[0xb]=%s cur[0xb]=%s committed[0xc]=%s cur[0xc]=%s)\n",
+			tx.To().Hex(),
+			baseState.GetCommittedState(*tx.To(), slotB), baseState.GetState(*tx.To(), slotB),
+			baseState.GetCommittedState(*tx.To(), slotC), baseState.GetState(*tx.To(), slotC),
+		))
+	}
 	baseTrace := make([]evmStep, 0, 64)
 	baseCalls := make([]string, 0, 32)
 	baseOperands := make([]string, 0, 64)
@@ -338,7 +361,7 @@ func debugOneTx(engine consensus.Engine, chain *core.HeaderChain, cfg *params.Ch
 	baseLoopJumps := make([]string, 0, 32)
 	baseWin280 := make([]string, 0, 128)
 	baseStateChg := make([]string, 0, 128)
-	baseLogs := make([]string, 0, 64)
+	baseLogs := make([]string, 0, 256)
 	baseOps := make([]pcOp, 0, 4096)
 	var lastBasePC uint64
 	var lastBaseOp byte
@@ -435,6 +458,101 @@ func debugOneTx(engine consensus.Engine, chain *core.HeaderChain, cfg *params.Ch
 					baseOperands = append(baseOperands, fmt.Sprintf("JUMPI pc=%d <empty stack>", pc))
 				}
 			}
+		}
+		// Record SSTORE gas/cost at top-level for quick base vs MIR gas delta debugging.
+		if depth == 1 && scope != nil && op == 0x55 {
+			st := scope.StackData()
+			k := "<empty>"
+			v := "<empty>"
+			if len(st) > 0 {
+				k = st[len(st)-1].Hex()
+			}
+			if len(st) > 1 {
+				v = st[len(st)-2].Hex()
+			}
+			pushBaseLog(fmt.Sprintf("BASE_SSTORE pc=%d gas=%d cost=%d key=%s val=%s", pc, gas, cost, k, v))
+		}
+		// Bad block 7753 focus: capture base gas/cost + top stack around key sites:
+		// - pc~2932: early SSTORE
+		// - pc~6630-6655: block that contains the problematic SSTORE@6645
+		// - pc~9350: later SSTORE where MIR OOGs after overcharging earlier
+		if depth == 1 && scope != nil && ((pc >= 2918 && pc <= 2940) || (pc >= 6580 && pc <= 6660) || (pc >= 9330 && pc <= 9360)) {
+			st := scope.StackData()
+			// Dump up to top12 stack items for easier comparison with MIR incoming snapshots.
+			topN := func(n int) string {
+				if n <= 0 {
+					return ""
+				}
+				if len(st) == 0 {
+					return "<empty>"
+				}
+				if n > len(st) {
+					n = len(st)
+				}
+				var parts []string
+				for i := 0; i < n; i++ {
+					parts = append(parts, "0x"+st[len(st)-1-i].Hex())
+				}
+				return strings.Join(parts, ",")
+			}
+			pushBaseLog(fmt.Sprintf("WATCH_BASE_7753 pc=%d op=0x%02x gas=%d cost=%d stackLen=%d top12=%s",
+				pc, op, gas, cost, len(st), topN(12)))
+		}
+		// Extra watchpoint for bad block 37894 debugging: log stack top around the divergent dispatcher
+		// sequence in the top-level contract (depth==1).
+		if depth == 1 && scope != nil && pc >= 10664 && pc <= 10676 {
+			st := scope.StackData()
+			// Keep a small ring
+			if len(baseOperands) == cap(baseOperands) {
+				copy(baseOperands, baseOperands[1:])
+				baseOperands = baseOperands[:cap(baseOperands)-1]
+			}
+			top := "<empty>"
+			top2 := "<empty>"
+			if len(st) > 0 {
+				top = st[len(st)-1].Hex()
+			}
+			if len(st) > 1 {
+				top2 = st[len(st)-2].Hex()
+			}
+			baseOperands = append(baseOperands, fmt.Sprintf("WATCH_BASE pc=%d op=0x%02x top=%s top2=%s stackLen=%d", pc, op, top, top2, len(st)))
+		}
+		// Bad block 139161 focus: dump stack top2 around the divergent LT/ISZERO/JUMPI region.
+		// pc=16398 is LT, pc=16399 is ISZERO, pc=16403 is JUMPI.
+		if depth == 1 && scope != nil && pc >= 16395 && pc <= 16405 {
+			st := scope.StackData()
+			// Keep a small ring
+			if len(baseOperands) == cap(baseOperands) {
+				copy(baseOperands, baseOperands[1:])
+				baseOperands = baseOperands[:cap(baseOperands)-1]
+			}
+			top := "<empty>"
+			top2 := "<empty>"
+			if len(st) > 0 {
+				top = st[len(st)-1].Hex()
+			}
+			if len(st) > 1 {
+				top2 = st[len(st)-2].Hex()
+			}
+			baseOperands = append(baseOperands, fmt.Sprintf("WATCH_BASE_139161 pc=%d op=0x%02x top=%s top2=%s stackLen=%d", pc, op, top, top2, len(st)))
+		}
+		// Bad block 139161 focus: the failing MIR path hits an invalid jumpdest 0x0 at pc=10284.
+		// Capture the base stack top around this site to see the expected jump destination.
+		if depth == 1 && scope != nil && pc >= 10280 && pc <= 10284 {
+			st := scope.StackData()
+			if len(baseOperands) == cap(baseOperands) {
+				copy(baseOperands, baseOperands[1:])
+				baseOperands = baseOperands[:cap(baseOperands)-1]
+			}
+			top := "<empty>"
+			top2 := "<empty>"
+			if len(st) > 0 {
+				top = st[len(st)-1].Hex()
+			}
+			if len(st) > 1 {
+				top2 = st[len(st)-2].Hex()
+			}
+			baseOperands = append(baseOperands, fmt.Sprintf("WATCH_BASE_139161 pc=%d op=0x%02x top=%s top2=%s stackLen=%d", pc, op, top, top2, len(st)))
 		}
 		// Capture arithmetic operands (tail) to help diagnose stack-math divergences.
 		if depth == 1 && scope != nil && op == 0x03 { // SUB
@@ -561,7 +679,7 @@ func debugOneTx(engine consensus.Engine, chain *core.HeaderChain, cfg *params.Ch
 			if isSystemTx(engine, ptx, header) {
 				continue
 			}
-			_, _, _ = applyTxWithResult(prefixEVM, baseState, header, ptx, i, &prefixUsed, prefixGP)
+			_, _, _ = applyTxWithResult(prefixEVM, baseState, header, blockHash, ptx, i, &prefixUsed, prefixGP)
 		}
 	}
 	// Wrap statedb to receive state-change callbacks (balance/storage/nonce/code).
@@ -569,7 +687,7 @@ func debugOneTx(engine consensus.Engine, chain *core.HeaderChain, cfg *params.Ch
 	baseEVM := vm.NewEVM(core.NewEVMBlockContext(header, chain, nil), baseHooked, cfg, vm.Config{EnableMIR: false, Tracer: baseTracer})
 	baseGP := new(core.GasPool).AddGas(blk.GasLimit())
 	baseUsed := uint64(0)
-	baseReceipt, baseRes, baseErr := applyTxWithResult(baseEVM, baseState, header, tx, txIndex, &baseUsed, baseGP)
+	baseReceipt, baseRes, baseErr := applyTxWithResult(baseEVM, baseState, header, blockHash, tx, txIndex, &baseUsed, baseGP)
 	sb.WriteString(fmt.Sprintf("BASE: err=%v res.Err=%v usedGas=%d maxUsedGas=%d receipt={%s} revert=%s\n", baseErr, func() any {
 		if baseRes == nil {
 			return nil
@@ -595,16 +713,26 @@ func debugOneTx(engine consensus.Engine, chain *core.HeaderChain, cfg *params.Ch
 	// Prepare MIR run with step hook ring buffer.
 	mirState := preState.Copy()
 	systemcontracts.TryUpdateBuildInSystemContract(cfg, blk.Number(), lastBlock.Time, blk.Time(), mirState, true)
+	// Block 7753 focus: snapshot a couple of committed/current storage slots for MIR prestate too.
+	if tx != nil && tx.To() != nil && preState != nil {
+		slotB := common.BigToHash(big.NewInt(0xb))
+		slotC := common.BigToHash(big.NewInt(0xc))
+		sb.WriteString(fmt.Sprintf("PRESTATE: to=%s mir (committed[0xb]=%s cur[0xb]=%s committed[0xc]=%s cur[0xc]=%s)\n",
+			tx.To().Hex(),
+			mirState.GetCommittedState(*tx.To(), slotB), mirState.GetState(*tx.To(), slotB),
+			mirState.GetCommittedState(*tx.To(), slotC), mirState.GetState(*tx.To(), slotC),
+		))
+	}
 	mirTrace := make([]mirStep, 0, 256)
 	mirCalls := make([]string, 0, 32)
-	mirOperands := make([]string, 0, 64)
+	mirOperands := make([]string, 0, 256)
 	mirCallArgs := make([]string, 0, 16)
 	mirMstore40 := make([]string, 0, 8)
 	mirAdd3393 := make([]string, 0, 8)
 	mirLoopJumps := make([]string, 0, 32)
 	mirPhi := make([]string, 0, 64)
 	mirStateChg := make([]string, 0, 128)
-	mirLogs := make([]string, 0, 64)
+	mirLogs := make([]string, 0, 256)
 	// If MIR internally falls back into the native interpreter (e.g. due to an error + retry),
 	// these opcodes will show up here. Pure MIR execution should NOT produce OnOpcode events.
 	mirFallbackOps := make([]evmStep, 0, 64)
@@ -686,17 +814,57 @@ func debugOneTx(engine consensus.Engine, chain *core.HeaderChain, cfg *params.Ch
 			if isSystemTx(engine, ptx, header) {
 				continue
 			}
-			_, _, _ = applyTxWithResult(prefixEVM, mirState, header, ptx, i, &prefixUsed, prefixGP)
+			_, _, _ = applyTxWithResult(prefixEVM, mirState, header, blockHash, ptx, i, &prefixUsed, prefixGP)
 		}
 	}
 
 	mirHooked := state.NewHookedState(mirState, mirTracer)
 	mirEVM := vm.NewEVM(core.NewEVMBlockContext(header, chain, nil), mirHooked, cfg, vm.Config{EnableMIR: true, Tracer: mirTracer})
 	runner := mir.NewEVMRunner(mirEVM)
+
+	// Dump MIR for the top-level callee around the common free-memory-pointer update region.
+	// This helps diagnose stack-model bugs that manifest as wrong return sizes or copy lengths.
+	if tx != nil && tx.To() != nil && preState != nil {
+		code := preState.GetCode(*tx.To())
+		if len(code) > 0 {
+			codeHash := crypto.Keccak256Hash(code)
+			tmp := mir.NewCFG(codeHash, code)
+			if err := tmp.Parse(); err == nil {
+				mirLogs = append(mirLogs, strings.TrimRight(mir.DebugDumpMIRForEvmPCRange(tmp, 180, 260), "\n"))
+				// Bad block 7753 focus: dump the region around the problematic SSTORE sequence.
+				if blk != nil && blk.NumberU64() == 7753 && len(code) > 6665 {
+					mirLogs = append(mirLogs, strings.TrimRight(mir.DebugDumpMIRForEvmPCRange(tmp, 6620, 6665), "\n"))
+				}
+			}
+		}
+	}
+
+	// Track which contract addresses we've already emitted a runtime CFG dump for.
+	var mirDumped map[string]bool
+
 	runner.SetMIRStepHookFactory(func(it *mir.MIRInterpreter) func(evmPC uint, evmOp byte, op mir.MirOperation) {
 		// Capture key control-flow operands (JUMP/JUMPI dest + cond) with def provenance.
 		// This is critical for debugging bad blocks caused by invalid jumpdest/CFG issues.
 		if it != nil {
+			// Dump the *actual runtime CFG* once per contract, to diagnose rebuild/caching issues.
+			// (This can differ from a fresh Parse() due to runtime rebuilds.)
+			//
+			// Note: The dump is appended to mirLogs to keep it in the report.
+			// We keep a small set to avoid repeated dumps.
+			//
+			// This closure is invoked once per interpreter instance.
+			{
+				// lazy init the set the first time we enter
+				if mirDumped == nil {
+					mirDumped = make(map[string]bool, 8)
+				}
+				addr := it.ContractAddress().Hex()
+				if !mirDumped[addr] {
+					mirDumped[addr] = true
+					mirLogs = append(mirLogs, strings.TrimRight(it.DebugDumpEvmPCRange(180, 260), "\n"))
+				}
+			}
+
 			it.SetDebugPhiHook(func(curFirstPC uint, prevFirstPC uint, phiPC uint, phiStackIndex int, incomingLen int, incomingIdx int, val uint256.Int) {
 				// Keep a small ring buffer.
 				if len(mirPhi) == cap(mirPhi) {
@@ -706,32 +874,53 @@ func debugOneTx(engine consensus.Engine, chain *core.HeaderChain, cfg *params.Ch
 				// Focus: PHI near the failing region, but keep generic formatting.
 				mirPhi = append(mirPhi, fmt.Sprintf("PHI phiPC=%d curBB=%d prevBB=%d phiIdx=%d inLen=%d inIdx=%d val=0x%s", phiPC, curFirstPC, prevFirstPC, phiStackIndex, incomingLen, incomingIdx, val.Hex()))
 			})
+			it.SetDebugOperandHook(func(evmPC uint, evmOp byte, op mir.MirOperation, a uint256.Int, b uint256.Int) {
+				// Keep a small ring buffer.
+				if len(mirOperands) == cap(mirOperands) {
+					copy(mirOperands, mirOperands[1:])
+					mirOperands = mirOperands[:cap(mirOperands)-1]
+				}
+				addr := "<nil>"
+				if it != nil {
+					addr = it.ContractAddress().Hex()
+				}
+				// Bad block 139161: capture LT operands feeding the loop condition.
+				if op == mir.MirLT && evmPC == 16398 {
+					mirOperands = append(mirOperands, fmt.Sprintf("LT    addr=%s evmPC=16398 a=0x%s b=0x%s", addr, a.Hex(), b.Hex()))
+				}
+			})
 			it.SetDebugOperandHookEx(func(evmPC uint, evmOp byte, op mir.MirOperation, a uint256.Int, b uint256.Int, aDefPC uint, bDefPC uint, aDefOp mir.MirOperation, bDefOp mir.MirOperation) {
 				// Keep a small ring buffer.
 				if len(mirOperands) == cap(mirOperands) {
 					copy(mirOperands, mirOperands[1:])
 					mirOperands = mirOperands[:cap(mirOperands)-1]
 				}
+				addr := "<nil>"
+				if it != nil {
+					addr = it.ContractAddress().Hex()
+				}
 				switch op {
+				case mir.MirLT:
+					mirOperands = append(mirOperands, fmt.Sprintf("LT    addr=%s evmPC=%d a=0x%s b=0x%s aDefPC=%d aDefOp=%s bDefPC=%d bDefOp=%s", addr, evmPC, a.Hex(), b.Hex(), aDefPC, aDefOp.String(), bDefPC, bDefOp.String()))
 				case mir.MirAND:
-					mirOperands = append(mirOperands, fmt.Sprintf("AND   evmPC=%d a=0x%s b=0x%s aDefPC=%d aDefOp=%s bDefPC=%d bDefOp=%s", evmPC, a.Hex(), b.Hex(), aDefPC, aDefOp.String(), bDefPC, bDefOp.String()))
+					mirOperands = append(mirOperands, fmt.Sprintf("AND   addr=%s evmPC=%d a=0x%s b=0x%s aDefPC=%d aDefOp=%s bDefPC=%d bDefOp=%s", addr, evmPC, a.Hex(), b.Hex(), aDefPC, aDefOp.String(), bDefPC, bDefOp.String()))
 				case mir.MirSLOAD:
-					mirOperands = append(mirOperands, fmt.Sprintf("SLOAD evmPC=%d k=0x%s kDefPC=%d kDefOp=%s", evmPC, a.Hex(), aDefPC, aDefOp.String()))
+					mirOperands = append(mirOperands, fmt.Sprintf("SLOAD addr=%s evmPC=%d k=0x%s kDefPC=%d kDefOp=%s", addr, evmPC, a.Hex(), aDefPC, aDefOp.String()))
 				case mir.MirMLOAD:
 					// For MLOAD we encode: a=offset, b=loadedWord (best-effort).
-					mirOperands = append(mirOperands, fmt.Sprintf("MLOAD evmPC=%d off=0x%s loaded=0x%s offDefPC=%d offDefOp=%s", evmPC, a.Hex(), b.Hex(), aDefPC, aDefOp.String()))
+					mirOperands = append(mirOperands, fmt.Sprintf("MLOAD addr=%s evmPC=%d off=0x%s loaded=0x%s offDefPC=%d offDefOp=%s", addr, evmPC, a.Hex(), b.Hex(), aDefPC, aDefOp.String()))
 				case mir.MirMSTORE:
-					mirOperands = append(mirOperands, fmt.Sprintf("MSTORE evmPC=%d off=0x%s val=0x%s offDefPC=%d offDefOp=%s valDefPC=%d valDefOp=%s",
-						evmPC, a.Hex(), b.Hex(), aDefPC, aDefOp.String(), bDefPC, bDefOp.String()))
+					mirOperands = append(mirOperands, fmt.Sprintf("MSTORE addr=%s evmPC=%d off=0x%s val=0x%s offDefPC=%d offDefOp=%s valDefPC=%d valDefOp=%s",
+						addr, evmPC, a.Hex(), b.Hex(), aDefPC, aDefOp.String(), bDefPC, bDefOp.String()))
 					if a.IsUint64() && a.Uint64() == 0x40 {
 						if len(mirMstore40) == cap(mirMstore40) {
 							copy(mirMstore40, mirMstore40[1:])
 							mirMstore40 = mirMstore40[:cap(mirMstore40)-1]
 						}
-						mirMstore40 = append(mirMstore40, fmt.Sprintf("MSTORE evmPC=%d off=0x40 val=0x%s valDefPC=%d valDefOp=%s", evmPC, b.Hex(), bDefPC, bDefOp.String()))
+						mirMstore40 = append(mirMstore40, fmt.Sprintf("MSTORE addr=%s evmPC=%d off=0x40 val=0x%s valDefPC=%d valDefOp=%s", addr, evmPC, b.Hex(), bDefPC, bDefOp.String()))
 					}
 				case mir.MirADD:
-					mirOperands = append(mirOperands, fmt.Sprintf("ADD   evmPC=%d a=0x%s b=0x%s aDefPC=%d aDefOp=%s bDefPC=%d bDefOp=%s", evmPC, a.Hex(), b.Hex(), aDefPC, aDefOp.String(), bDefPC, bDefOp.String()))
+					mirOperands = append(mirOperands, fmt.Sprintf("ADD   addr=%s evmPC=%d a=0x%s b=0x%s aDefPC=%d aDefOp=%s bDefPC=%d bDefOp=%s", addr, evmPC, a.Hex(), b.Hex(), aDefPC, aDefOp.String(), bDefPC, bDefOp.String()))
 					if evmPC == 3393 {
 						if len(mirAdd3393) == cap(mirAdd3393) {
 							copy(mirAdd3393, mirAdd3393[1:])
@@ -739,35 +928,154 @@ func debugOneTx(engine consensus.Engine, chain *core.HeaderChain, cfg *params.Ch
 						}
 						var sum uint256.Int
 						sum.Add(&a, &b)
-						mirAdd3393 = append(mirAdd3393, fmt.Sprintf("ADD evmPC=3393 a=0x%s b=0x%s sum=0x%s aDefPC=%d aDefOp=%s bDefPC=%d bDefOp=%s",
+						mirAdd3393 = append(mirAdd3393, fmt.Sprintf("ADD addr=%s evmPC=3393 a=0x%s b=0x%s sum=0x%s aDefPC=%d aDefOp=%s bDefPC=%d bDefOp=%s",
+							addr,
 							a.Hex(), b.Hex(), sum.Hex(), aDefPC, aDefOp.String(), bDefPC, bDefOp.String()))
 					}
 				case mir.MirSTATICCALL:
-					mirOperands = append(mirOperands, fmt.Sprintf("STATICCALL evmPC=%d a=0x%s b=0x%s aDefPC=%d aDefOp=%s bDefPC=%d bDefOp=%s",
+					mirOperands = append(mirOperands, fmt.Sprintf("STATICCALL addr=%s evmPC=%d a=0x%s b=0x%s aDefPC=%d aDefOp=%s bDefPC=%d bDefOp=%s",
+						addr,
 						evmPC, a.Hex(), b.Hex(), aDefPC, aDefOp.String(), bDefPC, bDefOp.String()))
 				case mir.MirSUB:
-					mirOperands = append(mirOperands, fmt.Sprintf("SUB   evmPC=%d a=0x%s b=0x%s aDefPC=%d aDefOp=%s bDefPC=%d bDefOp=%s", evmPC, a.Hex(), b.Hex(), aDefPC, aDefOp.String(), bDefPC, bDefOp.String()))
+					mirOperands = append(mirOperands, fmt.Sprintf("SUB   addr=%s evmPC=%d a=0x%s b=0x%s aDefPC=%d aDefOp=%s bDefPC=%d bDefOp=%s", addr, evmPC, a.Hex(), b.Hex(), aDefPC, aDefOp.String(), bDefPC, bDefOp.String()))
+				case mir.MirCALLDATACOPY:
+					// We encode: a=dest, b=size
+					mirOperands = append(mirOperands, fmt.Sprintf("CALLDATACOPY addr=%s evmPC=%d dest=0x%s size=0x%s destDefPC=%d destDefOp=%s sizeDefPC=%d sizeDefOp=%s", addr, evmPC, a.Hex(), b.Hex(), aDefPC, aDefOp.String(), bDefPC, bDefOp.String()))
+				case mir.MirRETURNDATACOPY:
+					// We encode: a=dest, b=size
+					mirOperands = append(mirOperands, fmt.Sprintf("RETURNDATACOPY addr=%s evmPC=%d dest=0x%s size=0x%s destDefPC=%d destDefOp=%s sizeDefPC=%d sizeDefOp=%s", addr, evmPC, a.Hex(), b.Hex(), aDefPC, aDefOp.String(), bDefPC, bDefOp.String()))
 				case mir.MirOR:
-					mirOperands = append(mirOperands, fmt.Sprintf("OR    evmPC=%d a=0x%s b=0x%s aDefPC=%d aDefOp=%s bDefPC=%d bDefOp=%s", evmPC, a.Hex(), b.Hex(), aDefPC, aDefOp.String(), bDefPC, bDefOp.String()))
+					mirOperands = append(mirOperands, fmt.Sprintf("OR    addr=%s evmPC=%d a=0x%s b=0x%s aDefPC=%d aDefOp=%s bDefPC=%d bDefOp=%s", addr, evmPC, a.Hex(), b.Hex(), aDefPC, aDefOp.String(), bDefPC, bDefOp.String()))
 				case mir.MirSSTORE:
-					mirOperands = append(mirOperands, fmt.Sprintf("SSTORE evmPC=%d k=0x%s v=0x%s kDefPC=%d kDefOp=%s vDefPC=%d vDefOp=%s", evmPC, a.Hex(), b.Hex(), aDefPC, aDefOp.String(), bDefPC, bDefOp.String()))
+					mirOperands = append(mirOperands, fmt.Sprintf("SSTORE addr=%s evmPC=%d k=0x%s v=0x%s kDefPC=%d kDefOp=%s vDefPC=%d vDefOp=%s", addr, evmPC, a.Hex(), b.Hex(), aDefPC, aDefOp.String(), bDefPC, bDefOp.String()))
+					if evmPC == 6645 || evmPC == 6650 {
+						mirLogs = append(mirLogs, fmt.Sprintf("WATCH_MIR_SSTORE_7753 addr=%s evmPC=%d k=0x%s v=0x%s kDefPC=%d kDefOp=%s vDefPC=%d vDefOp=%s", addr, evmPC, a.Hex(), b.Hex(), aDefPC, aDefOp.String(), bDefPC, bDefOp.String()))
+						if evmPC == 6645 {
+							// Dump local MIR and incoming stacks for the block containing this SSTORE.
+							if mirDumped == nil {
+								mirDumped = make(map[string]bool, 16)
+							}
+							k := addr + ":evmPC6620_6665"
+							if !mirDumped[k] {
+								mirDumped[k] = true
+								mirLogs = append(mirLogs, strings.TrimRight(it.DebugDumpEvmPCRange(6620, 6665), "\n"))
+								mirLogs = append(mirLogs, strings.TrimRight(it.DebugDumpCodeHexRange(6620, 6665), "\n"))
+								// Dump the predecessor region leading into the JUMPDEST at 6630 (0x19e6).
+								mirLogs = append(mirLogs, strings.TrimRight(it.DebugDumpEvmPCRange(6590, 6635), "\n"))
+								mirLogs = append(mirLogs, strings.TrimRight(it.DebugDumpCodeHexRange(6590, 6635), "\n"))
+								// pcToBlock is keyed by basic-block firstPC (JUMPDEST). For this snippet the JUMPDEST
+								// is at 6620+10 = 6630.
+								mirLogs = append(mirLogs, strings.TrimRight(it.DebugDumpIncomingStacksForPC(6630, 12), "\n"))
+								// Also dump the predecessor's incoming stacks; computeExitSnapshotForEdge depends on them.
+								mirLogs = append(mirLogs, strings.TrimRight(it.DebugDumpIncomingStacksForPC(0x19ce, 12), "\n"))
+								mirLogs = append(mirLogs, strings.TrimRight(it.DebugDumpIncomingStacksForPC(0x19bb, 12), "\n"))
+								mirLogs = append(mirLogs, strings.TrimRight(it.DebugDumpIncomingStacksForPC(0x2faf, 12), "\n"))
+								// Dump cached static entry/exit stacks for predecessor and target blocks.
+								mirLogs = append(mirLogs, strings.TrimRight(it.DebugDumpEntryExitStacksForPC(0x19ce, 12), "\n"))
+								mirLogs = append(mirLogs, strings.TrimRight(it.DebugDumpEntryExitStacksForPC(0x19e6, 12), "\n"))
+								mirLogs = append(mirLogs, strings.TrimRight(it.DebugDumpEntryExitStacksForPC(0x19bb, 12), "\n"))
+								mirLogs = append(mirLogs, strings.TrimRight(it.DebugDumpEntryExitStacksForPC(0x2faf, 12), "\n"))
+							}
+						}
+					}
 				case mir.MirJUMP:
-					mirOperands = append(mirOperands, fmt.Sprintf("JUMP  evmPC=%d a(dest)=0x%s aDefPC=%d aDefOp=%s", evmPC, a.Hex(), aDefPC, aDefOp.String()))
+					mirOperands = append(mirOperands, fmt.Sprintf("JUMP  addr=%s evmPC=%d a(dest)=0x%s aDefPC=%d aDefOp=%s", addr, evmPC, a.Hex(), aDefPC, aDefOp.String()))
+					// Hot watchpoint for bad block debugging (37894): capture the computed destination at a
+					// known divergent JUMP site.
+					if evmPC == 10676 {
+						mirLogs = append(mirLogs, fmt.Sprintf("WATCH: MIR JUMP addr=%s evmPC=10676 dest=%s aDefPC=%d aDefOp=%s", addr, a.Hex(), aDefPC, aDefOp.String()))
+						// Also dump a focused window around the divergent JUMP once per contract to see whether
+						// the destination is constant (K) or computed (V) in the runtime MIR.
+						if mirDumped == nil {
+							mirDumped = make(map[string]bool, 8)
+						}
+						k := addr + ":evmPC10650_10710"
+						if !mirDumped[k] {
+							mirDumped[k] = true
+							mirLogs = append(mirLogs, strings.TrimRight(it.DebugDumpEvmPCRange(10650, 10710), "\n"))
+							mirLogs = append(mirLogs, strings.TrimRight(it.DebugDumpCodeHexRange(10650, 10710), "\n"))
+						}
+					}
+					// Bad block 139161: runtime invalid jumpdest seems to come from JUMP at evmPC=10284.
+					// Dump a focused window around it to understand why the destination becomes 0.
+					if evmPC == 10284 {
+						mirLogs = append(mirLogs, fmt.Sprintf("WATCH: MIR JUMP addr=%s evmPC=10284 dest=%s aDefPC=%d aDefOp=%s", addr, a.Hex(), aDefPC, aDefOp.String()))
+						if mirDumped == nil {
+							mirDumped = make(map[string]bool, 8)
+						}
+						k := addr + ":evmPC10260_10310"
+						if !mirDumped[k] {
+							mirDumped[k] = true
+							mirLogs = append(mirLogs, strings.TrimRight(it.DebugDumpEvmPCRange(10260, 10310), "\n"))
+							mirLogs = append(mirLogs, strings.TrimRight(it.DebugDumpCodeHexRange(10260, 10310), "\n"))
+						}
+					}
+					// Block 2143 focus: internal-call trampoline return address issue around JUMP@2991 -> 0x100e
+					// and return JUMP@4117 which should go back to 2992.
+					if evmPC == 2991 || evmPC == 4117 {
+						mirLogs = append(mirLogs, fmt.Sprintf("WATCH: MIR JUMP addr=%s evmPC=%d dest=%s aDefPC=%d aDefOp=%s", addr, evmPC, a.Hex(), aDefPC, aDefOp.String()))
+						if mirDumped == nil {
+							mirDumped = make(map[string]bool, 16)
+						}
+						k := fmt.Sprintf("%s:evmPC%d_win", addr, evmPC)
+						if !mirDumped[k] {
+							mirDumped[k] = true
+							start := uint(0)
+							end := uint(0)
+							if evmPC == 2991 {
+								start, end = 2975, 3035
+							} else {
+								start, end = 4105, 4125
+							}
+							mirLogs = append(mirLogs, strings.TrimRight(it.DebugDumpEvmPCRange(start, end), "\n"))
+							mirLogs = append(mirLogs, strings.TrimRight(it.DebugDumpCodeHexRange(start, end), "\n"))
+							// Dump the incoming stack snapshots for the internal-call trampoline block.
+							// This is where the return-address PHI should be created.
+							mirLogs = append(mirLogs, strings.TrimRight(it.DebugDumpIncomingStacksForPC(0x100e, 8), "\n"))
+						}
+					}
+					// Block 7753 focus: log MIR gas accounting around the final SSTORE site (pc~9350).
+					if evmPC >= 9330 && evmPC <= 9360 {
+						gUsed := uint64(0)
+						gLim := uint64(0)
+						if it != nil {
+							gUsed = it.GasUsed()
+							gLim = it.GasLimit()
+						}
+						gLeft := uint64(0)
+						if gLim == 0 || gUsed > gLim {
+							gLeft = 0
+						} else {
+							gLeft = gLim - gUsed
+						}
+						mirLogs = append(mirLogs, fmt.Sprintf("WATCH_MIR_7753 evmPC=%d evmOp=0x%02x mirOp=%s gasUsed=%d gasLeft=%d", evmPC, evmOp, op.String(), gUsed, gLeft))
+					}
 					if evmPC >= 3300 && evmPC <= 3500 {
 						if len(mirLoopJumps) == cap(mirLoopJumps) {
 							copy(mirLoopJumps, mirLoopJumps[1:])
 							mirLoopJumps = mirLoopJumps[:cap(mirLoopJumps)-1]
 						}
-						mirLoopJumps = append(mirLoopJumps, fmt.Sprintf("JUMP  evmPC=%d dest=0x%s aDefPC=%d aDefOp=%s", evmPC, a.Hex(), aDefPC, aDefOp.String()))
+						mirLoopJumps = append(mirLoopJumps, fmt.Sprintf("JUMP  addr=%s evmPC=%d dest=0x%s aDefPC=%d aDefOp=%s", addr, evmPC, a.Hex(), aDefPC, aDefOp.String()))
 					}
 				case mir.MirJUMPI:
-					mirOperands = append(mirOperands, fmt.Sprintf("JUMPI evmPC=%d a(dest)=0x%s b(cond)=0x%s aDefPC=%d aDefOp=%s bDefPC=%d bDefOp=%s", evmPC, a.Hex(), b.Hex(), aDefPC, aDefOp.String(), bDefPC, bDefOp.String()))
+					mirOperands = append(mirOperands, fmt.Sprintf("JUMPI addr=%s evmPC=%d a(dest)=0x%s b(cond)=0x%s aDefPC=%d aDefOp=%s bDefPC=%d bDefOp=%s", addr, evmPC, a.Hex(), b.Hex(), aDefPC, aDefOp.String(), bDefPC, bDefOp.String()))
+					if evmPC == 16403 {
+						mirLogs = append(mirLogs, fmt.Sprintf("WATCH: MIR JUMPI addr=%s evmPC=16403 dest=%s cond=%s bDefPC=%d bDefOp=%s", addr, a.Hex(), b.Hex(), bDefPC, bDefOp.String()))
+						if mirDumped == nil {
+							mirDumped = make(map[string]bool, 8)
+						}
+						k := addr + ":evmPC16390_16450"
+						if !mirDumped[k] {
+							mirDumped[k] = true
+							mirLogs = append(mirLogs, strings.TrimRight(it.DebugDumpEvmPCRange(16390, 16450), "\n"))
+						}
+					}
 					if evmPC >= 3300 && evmPC <= 3500 {
 						if len(mirLoopJumps) == cap(mirLoopJumps) {
 							copy(mirLoopJumps, mirLoopJumps[1:])
 							mirLoopJumps = mirLoopJumps[:cap(mirLoopJumps)-1]
 						}
-						mirLoopJumps = append(mirLoopJumps, fmt.Sprintf("JUMPI evmPC=%d dest=0x%s cond=0x%s aDefPC=%d aDefOp=%s bDefPC=%d bDefOp=%s", evmPC, a.Hex(), b.Hex(), aDefPC, aDefOp.String(), bDefPC, bDefOp.String()))
+						mirLoopJumps = append(mirLoopJumps, fmt.Sprintf("JUMPI addr=%s evmPC=%d dest=0x%s cond=0x%s aDefPC=%d aDefOp=%s bDefPC=%d bDefOp=%s", addr, evmPC, a.Hex(), b.Hex(), aDefPC, aDefOp.String(), bDefPC, bDefOp.String()))
 					}
 				default:
 					// Other ops are ignored for now.
@@ -813,12 +1121,20 @@ func debugOneTx(engine consensus.Engine, chain *core.HeaderChain, cfg *params.Ch
 				}
 			}
 			mirTrace = append(mirTrace, mirStep{evmPC: evmPC, evmOp: evmOp, op: op, gasLeft: gasLeft})
+
+			// Bad block 7753 focus: log MIR gasLeft around key sites.
+			if (evmPC >= 2918 && evmPC <= 2940) || (evmPC >= 6628 && evmPC <= 6660) || (evmPC >= 9330 && evmPC <= 9360) {
+				pushMirLog(fmt.Sprintf("WATCH_MIR_7753 evmPC=%d evmOp=0x%02x mirOp=%s gasLeft=%d", evmPC, evmOp, op.String(), gasLeft))
+			}
+			if evmOp == 0x55 {
+				pushMirLog(fmt.Sprintf("MIR_SSTORE evmPC=%d mirOp=%s gasLeft=%d", evmPC, op.String(), gasLeft))
+			}
 		}
 	})
 	mirEVM.SetMIRRunner(runner)
 	mirGP := new(core.GasPool).AddGas(blk.GasLimit())
 	mirUsed := uint64(0)
-	mirReceipt, mirRes, mirErr := applyTxWithResult(mirEVM, mirState, header, tx, txIndex, &mirUsed, mirGP)
+	mirReceipt, mirRes, mirErr := applyTxWithResult(mirEVM, mirState, header, blockHash, tx, txIndex, &mirUsed, mirGP)
 	sb.WriteString(fmt.Sprintf("MIR : err=%v res.Err=%v usedGas=%d maxUsedGas=%d receipt={%s} revert=%s\n", mirErr, func() any {
 		if mirRes == nil {
 			return nil
@@ -1025,16 +1341,9 @@ func debugOneTx(engine consensus.Engine, chain *core.HeaderChain, cfg *params.Ch
 	return sb.String()
 }
 
-func diffBlockCommonTxs(db ethdb.Database, cfg *params.ChainConfig, genesisHash common.Hash, target uint64, doFullBlock bool) error {
-	env, err := newReplayEnv(db, cfg, genesisHash)
-	if err != nil {
-		return err
-	}
+func diffBlockCommonTxs(db ethdb.Database, cfg *params.ChainConfig, genesisHash common.Hash, target uint64, doFullBlock bool, warmup bool, readonly bool) error {
 	if target == 0 {
 		return fmt.Errorf("target must be > 0")
-	}
-	if err := env.runUpTo(target-1, false, true); err != nil {
-		return fmt.Errorf("prep state through block %d: %w", target-1, err)
 	}
 
 	h := rawdb.ReadCanonicalHash(db, target)
@@ -1045,6 +1354,79 @@ func diffBlockCommonTxs(db ethdb.Database, cfg *params.ChainConfig, genesisHash 
 	if blk == nil {
 		return fmt.Errorf("missing block %d (%s)", target, h)
 	}
+	return diffBlockCommonTxsWithBlock(db, cfg, genesisHash, blk, doFullBlock, true, warmup, readonly)
+}
+
+func cloneBlockForFullProcessing(blk *types.Block) (*types.Block, error) {
+	if blk == nil {
+		return nil, fmt.Errorf("nil block")
+	}
+	// Use RLP roundtrip to avoid accidental sharing/mutation between base and MIR runs.
+	blob, err := rlp.EncodeToBytes(blk)
+	if err != nil {
+		return nil, err
+	}
+	var out types.Block
+	if err := rlp.DecodeBytes(blob, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// diffBlockCommonTxsWithBlock compares MIR-off vs MIR-on execution for a specific block object.
+// If prepProgress is true and we must replay from genesis, prints progress markers.
+func diffBlockCommonTxsWithBlock(db ethdb.Database, cfg *params.ChainConfig, genesisHash common.Hash, blk *types.Block, doFullBlock bool, prepProgress bool, warmup bool, readonly bool) error {
+	if blk == nil || blk.Header() == nil {
+		return fmt.Errorf("nil block/header")
+	}
+	target := blk.NumberU64()
+
+	// Prefer initializing pre-state directly from the on-disk parent state root (fast path).
+	// This is especially important when the target block is a "bad block" and/or not on the
+	// canonical chain (fork). In that case, canonical (N-1) is the wrong pre-state.
+	var env *replayEnv
+	var err error
+	isCanonParent := false
+	if target > 0 {
+		if target == 1 {
+			env, err = newReplayEnv(db, cfg, genesisHash)
+		} else {
+			// Check whether the block's parent hash matches the canonical hash at N-1.
+			canonParent := rawdb.ReadCanonicalHash(db, target-1)
+			if canonParent == blk.ParentHash() && canonParent != (common.Hash{}) {
+				// Canonical parent: use the fast canonical state-root path.
+				isCanonParent = true
+				env, err = newReplayEnvAtBlockState(db, cfg, genesisHash, target-1, readonly)
+			} else {
+				// Non-canonical parent: initialize state from the parent header referenced by this block.
+				parentHeader := rawdb.ReadHeader(db, blk.ParentHash(), target-1)
+				if parentHeader == nil {
+					return fmt.Errorf("missing parent header for non-canonical block parent=%s number=%d", blk.ParentHash().Hex(), target-1)
+				}
+				tdb := openTrieDB(db, readonly)
+				statedb, err2 := state.New(parentHeader.Root, state.NewDatabase(tdb, nil))
+				if err2 != nil {
+					return fmt.Errorf("state.New(parentRoot @%d %s): %w", target-1, parentHeader.Root, err2)
+				}
+				env, err = newReplayEnvWithState(db, cfg, genesisHash, statedb)
+			}
+			if err != nil && prepProgress {
+				// Fallback: reconstruct state by replaying from genesis (canonical chain only).
+				env, err = newReplayEnv(db, cfg, genesisHash)
+				if err == nil {
+					if err2 := env.runUpTo(target-1, false, true); err2 != nil {
+						return fmt.Errorf("prep state through block %d: %w", target-1, err2)
+					}
+				}
+			}
+		}
+	} else {
+		return fmt.Errorf("target must be > 0")
+	}
+	if err != nil {
+		return err
+	}
+
 	if blk.Header() != nil {
 		bf := "<nil>"
 		if blk.Header().BaseFee != nil {
@@ -1070,14 +1452,150 @@ func diffBlockCommonTxs(db ethdb.Database, cfg *params.ChainConfig, genesisHash 
 		}
 	}
 
+	// If warmup is requested and this block builds on the canonical chain, also warm up the
+	// *state* for both base and MIR by replaying blocks [1..target-1] in each mode. This more
+	// closely matches a fullnode where MIR has been active for prior blocks.
+	if warmup && target > 1 && isCanonParent {
+		baseEnv, err := newReplayEnv(db, cfg, genesisHash)
+		if err != nil {
+			return fmt.Errorf("base warm env: %w", err)
+		}
+		if err := baseEnv.runUpTo(target-1, false, false); err != nil {
+			return fmt.Errorf("base warm prep through block %d: %w", target-1, err)
+		}
+		mirEnv, err := newReplayEnv(db, cfg, genesisHash)
+		if err != nil {
+			return fmt.Errorf("mir warm env: %w", err)
+		}
+		if err := mirEnv.runUpTo(target-1, true, false); err != nil {
+			return fmt.Errorf("mir warm prep through block %d: %w", target-1, err)
+		}
+		// Use the warmed base environment as the canonical pre-state provider for this diff.
+		env = baseEnv
+		baseState := baseEnv.statedb.Copy()
+		mirState := mirEnv.statedb.Copy()
+
+		baseRun, err := processCommonTxsOnly(env.engine, env.chain, cfg, baseState, blk, false)
+		if err != nil {
+			return fmt.Errorf("base common-tx run failed: %w", err)
+		}
+		mirRun, err := processCommonTxsOnly(env.engine, env.chain, cfg, mirState, blk, true)
+		if err != nil {
+			return fmt.Errorf("mir common-tx run failed: %w", err)
+		}
+
+		signer := types.MakeSigner(cfg, blk.Number(), blk.Time())
+		for i, tx := range blk.Transactions() {
+			if isSystemTx(env.engine, tx, blk.Header()) {
+				continue
+			}
+			br := baseRun.receiptsByIndex[i]
+			mr := mirRun.receiptsByIndex[i]
+			if br == nil || mr == nil {
+				return fmt.Errorf("missing receipt at idx=%d baseNil=%v mirNil=%v", i, br == nil, mr == nil)
+			}
+			if br.Status != mr.Status || br.GasUsed != mr.GasUsed || br.CumulativeGasUsed != mr.CumulativeGasUsed || len(br.Logs) != len(mr.Logs) {
+				from, _ := types.Sender(signer, tx)
+				to := "<create>"
+				if tx.To() != nil {
+					to = tx.To().Hex()
+				}
+				fmt.Print(debugOneTx(env.engine, env.chain, cfg, env.statedb, blk, i))
+				return fmt.Errorf("tx receipt mismatch idx=%d hash=%s from=%s to=%s nonce=%d gas=%d gasPrice=%s value=%s\n  base: %s root=%s cumGas=%d\n  mir : %s root=%s cumGas=%d",
+					i, tx.Hash(), from, to, tx.Nonce(), tx.Gas(), tx.GasPrice(), tx.Value(),
+					fmtReceipt(br), baseRun.rootByIndex[i], baseRun.cumGasByIndex[i],
+					fmtReceipt(mr), mirRun.rootByIndex[i], mirRun.cumGasByIndex[i],
+				)
+			}
+			if baseRun.rootByIndex[i] != mirRun.rootByIndex[i] {
+				fmt.Print(debugOneTx(env.engine, env.chain, cfg, env.statedb, blk, i))
+				return fmt.Errorf("state root mismatch after tx idx=%d hash=%s\n  base root=%s\n  mir  root=%s", i, tx.Hash(), baseRun.rootByIndex[i], mirRun.rootByIndex[i])
+			}
+		}
+		if baseRun.finalRoot != mirRun.finalRoot {
+			return fmt.Errorf("post-common-txs state root mismatch\n  base=%s\n  mir=%s", baseRun.finalRoot, mirRun.finalRoot)
+		}
+		if baseRun.totalGasUsed != mirRun.totalGasUsed {
+			return fmt.Errorf("post-common-txs gasUsed mismatch base=%d mir=%d", baseRun.totalGasUsed, mirRun.totalGasUsed)
+		}
+
+		if doFullBlock {
+			preStateForDebug := env.statedb.Copy()
+			baseState2 := env.statedb.Copy()
+			mirState2 := env.statedb.Copy()
+			blkBase, err := cloneBlockForFullProcessing(blk)
+			if err != nil {
+				return fmt.Errorf("clone block for base: %w", err)
+			}
+			blkMir, err := cloneBlockForFullProcessing(blk)
+			if err != nil {
+				return fmt.Errorf("clone block for mir: %w", err)
+			}
+			baseRes, baseErr := env.processor.Process(blkBase, baseState2, vm.Config{EnableOpcodeOptimizations: false, EnableMIR: false})
+			mirRes, mirErr := env.processor.Process(blkMir, mirState2, vm.Config{EnableOpcodeOptimizations: false, EnableMIR: true})
+			if (baseErr == nil) != (mirErr == nil) {
+				if len(blk.Transactions()) > 0 {
+					fmt.Print(debugOneTx(env.engine, env.chain, cfg, preStateForDebug, blk, 0))
+				}
+				return fmt.Errorf("full block Process error mismatch: baseErr=%v mirErr=%v", baseErr, mirErr)
+			}
+			if baseErr != nil {
+				if baseErr.Error() != mirErr.Error() {
+					return fmt.Errorf("full block Process error msg mismatch: baseErr=%v mirErr=%v", baseErr, mirErr)
+				}
+				return fmt.Errorf("full block Process failed (both): %v", baseErr)
+			}
+			if baseRes == nil || mirRes == nil {
+				return fmt.Errorf("full block Process returned nil result baseNil=%v mirNil=%v", baseRes == nil, mirRes == nil)
+			}
+			// Receipt-by-receipt compare
+			if len(baseRes.Receipts) != len(mirRes.Receipts) {
+				return fmt.Errorf("full receipts length mismatch base=%d mir=%d", len(baseRes.Receipts), len(mirRes.Receipts))
+			}
+			for i := range baseRes.Receipts {
+				br := baseRes.Receipts[i]
+				mr := mirRes.Receipts[i]
+				if br == nil || mr == nil {
+					return fmt.Errorf("full receipt nil mismatch idx=%d baseNil=%v mirNil=%v", i, br == nil, mr == nil)
+				}
+				if br.Status != mr.Status || br.GasUsed != mr.GasUsed || br.CumulativeGasUsed != mr.CumulativeGasUsed || len(br.Logs) != len(mr.Logs) {
+					kind := "common"
+					if isSystemTx(env.engine, blk.Transactions()[i], blk.Header()) {
+						kind = "system"
+					}
+					return fmt.Errorf("full receipt mismatch txIdx=%d kind=%s\n  base: %s\n  mir : %s", i, kind, fmtReceipt(br), fmtReceipt(mr))
+				}
+			}
+			baseRoot := baseState2.IntermediateRoot(cfg.IsEIP158(blk.Number()))
+			mirRoot := mirState2.IntermediateRoot(cfg.IsEIP158(blk.Number()))
+			if baseRoot != mirRoot {
+				return fmt.Errorf("full post-state root mismatch\n  base=%s\n  mir =%s", baseRoot, mirRoot)
+			}
+		}
+		return nil
+	}
+
+	// Default (non-warmup or fork-parent) path: diff from the same pre-state snapshot.
 	baseState := env.statedb.Copy()
 	mirState := env.statedb.Copy()
 
-	baseRun, err := processCommonTxsOnly(env.engine, env.chain, cfg, baseState, blk, false)
+	// IMPORTANT: deep-clone the block for base vs MIR runs.
+	// Some execution paths cache sender/signature data or otherwise mutate transaction objects,
+	// and sharing the same *types.Block between the two runs can create cache-dependent divergences.
+	blkBase, err := cloneBlockForFullProcessing(blk)
+	if err != nil {
+		return fmt.Errorf("clone block for base: %w", err)
+	}
+	blkMir, err := cloneBlockForFullProcessing(blk)
+	if err != nil {
+		return fmt.Errorf("clone block for mir: %w", err)
+	}
+
+	baseRun, err := processCommonTxsOnly(env.engine, env.chain, cfg, baseState, blkBase, false)
 	if err != nil {
 		return fmt.Errorf("base common-tx run failed: %w", err)
 	}
-	mirRun, err := processCommonTxsOnly(env.engine, env.chain, cfg, mirState, blk, true)
+	mirRun, err := processCommonTxsOnly(env.engine, env.chain, cfg, mirState, blkMir, true)
 	if err != nil {
 		return fmt.Errorf("mir common-tx run failed: %w", err)
 	}
@@ -1131,10 +1649,13 @@ func diffBlockCommonTxs(db ethdb.Database, cfg *params.ChainConfig, genesisHash 
 		mirState2 := env.statedb.Copy()
 		// IMPORTANT: some consensus/processor paths may mutate the in-memory block/tx list while processing
 		// (e.g. system-tx verification helpers). Always give base and MIR their own block objects.
-		blkBase := rawdb.ReadBlock(db, blk.Hash(), target)
-		blkMir := rawdb.ReadBlock(db, blk.Hash(), target)
-		if blkBase == nil || blkMir == nil {
-			return fmt.Errorf("missing block %d (%s) for full processing clone baseNil=%v mirNil=%v", target, blk.Hash(), blkBase == nil, blkMir == nil)
+		blkBase, err := cloneBlockForFullProcessing(blk)
+		if err != nil {
+			return fmt.Errorf("clone block for base: %w", err)
+		}
+		blkMir, err := cloneBlockForFullProcessing(blk)
+		if err != nil {
+			return fmt.Errorf("clone block for mir: %w", err)
 		}
 		baseRes, baseErr := env.processor.Process(blkBase, baseState2, vm.Config{EnableOpcodeOptimizations: false, EnableMIR: false})
 		mirRes, mirErr := env.processor.Process(blkMir, mirState2, vm.Config{EnableOpcodeOptimizations: false, EnableMIR: true})
@@ -1188,7 +1709,7 @@ func diffBlockCommonTxs(db ethdb.Database, cfg *params.ChainConfig, genesisHash 
 
 // scanRange runs an O(N) scan by reusing a single replay environment and advancing state incrementally.
 // This avoids the O(N^2) behavior of rebuilding genesis and replaying 0..(n-1) for each block n.
-func scanRange(db ethdb.Database, cfg *params.ChainConfig, genesisHash common.Hash, from, to uint64, doFullBlock bool, fastState bool) error {
+func scanRange(db ethdb.Database, cfg *params.ChainConfig, genesisHash common.Hash, from, to uint64, doFullBlock bool, fastState bool, readonly bool) error {
 	if from == 0 {
 		// Block 0 is genesis and contains no transactions to compare.
 		from = 1
@@ -1204,7 +1725,7 @@ func scanRange(db ethdb.Database, cfg *params.ChainConfig, genesisHash common.Ha
 		if from == 0 {
 			return fmt.Errorf("--faststate requires --from > 0")
 		}
-		env, err = newReplayEnvAtBlockState(db, cfg, genesisHash, from-1)
+		env, err = newReplayEnvAtBlockState(db, cfg, genesisHash, from-1, readonly)
 	} else {
 		env, err = newReplayEnv(db, cfg, genesisHash)
 	}
@@ -1337,6 +1858,108 @@ func scanRange(db ethdb.Database, cfg *params.ChainConfig, genesisHash common.Ha
 	return nil
 }
 
+// findFirstDivergence executes canonical blocks [1..to] in lockstep (base vs MIR) using two
+// independent replay environments. It stops at the first mismatch and returns a descriptive error.
+func findFirstDivergence(db ethdb.Database, cfg *params.ChainConfig, genesisHash common.Hash, to uint64) error {
+	if to == 0 {
+		return fmt.Errorf("to must be > 0")
+	}
+	baseEnv, err := newReplayEnv(db, cfg, genesisHash)
+	if err != nil {
+		return err
+	}
+	mirEnv, err := newReplayEnv(db, cfg, genesisHash)
+	if err != nil {
+		return err
+	}
+	baseCfg := vm.Config{EnableOpcodeOptimizations: false, EnableMIR: false}
+	mirCfg := vm.Config{EnableOpcodeOptimizations: false, EnableMIR: true}
+
+	for n := uint64(1); n <= to; n++ {
+		h := rawdb.ReadCanonicalHash(db, n)
+		if h == (common.Hash{}) {
+			return fmt.Errorf("missing canonical hash for block %d", n)
+		}
+		blk := rawdb.ReadBlock(db, h, n)
+		if blk == nil {
+			return fmt.Errorf("missing block %d (%s)", n, h)
+		}
+		// Work on independent StateDB copies so we can preserve clean pre-state for debugging
+		// if this block is the first divergence.
+		preBase := baseEnv.statedb
+		preMir := mirEnv.statedb
+		if preBase == nil || preMir == nil {
+			return fmt.Errorf("nil pre-state at block %d", n)
+		}
+		baseWork := preBase.Copy()
+		mirWork := preMir.Copy()
+
+		blkBase, err := cloneBlockForFullProcessing(blk)
+		if err != nil {
+			return fmt.Errorf("clone block %d for base: %w", n, err)
+		}
+		blkMir, err := cloneBlockForFullProcessing(blk)
+		if err != nil {
+			return fmt.Errorf("clone block %d for mir: %w", n, err)
+		}
+
+		_, baseErr := baseEnv.processor.Process(blkBase, baseWork, baseCfg)
+		_, mirErr := mirEnv.processor.Process(blkMir, mirWork, mirCfg)
+		if (baseErr == nil) != (mirErr == nil) {
+			// Try to localize the mismatch inside common txs (often leads to system-tx mismatch later).
+			baseRun, berr := processCommonTxsOnly(baseEnv.engine, baseEnv.chain, cfg, preBase.Copy(), blk, false)
+			mirRun, merr := processCommonTxsOnly(mirEnv.engine, mirEnv.chain, cfg, preMir.Copy(), blk, true)
+			if berr == nil && merr == nil {
+				signer := types.MakeSigner(cfg, blk.Number(), blk.Time())
+				for i, tx := range blk.Transactions() {
+					if isSystemTx(baseEnv.engine, tx, blk.Header()) {
+						continue
+					}
+					br := baseRun.receiptsByIndex[i]
+					mr := mirRun.receiptsByIndex[i]
+					if br == nil || mr == nil {
+						return fmt.Errorf("block %d missing receipt at idx=%d baseNil=%v mirNil=%v (baseErr=%v mirErr=%v)", n, i, br == nil, mr == nil, baseErr, mirErr)
+					}
+					if br.Status != mr.Status || br.GasUsed != mr.GasUsed || br.CumulativeGasUsed != mr.CumulativeGasUsed || len(br.Logs) != len(mr.Logs) || baseRun.rootByIndex[i] != mirRun.rootByIndex[i] {
+						fromAddr, _ := types.Sender(signer, tx)
+						toAddr := "<create>"
+						if tx.To() != nil {
+							toAddr = tx.To().Hex()
+						}
+						fmt.Print(debugOneTx(baseEnv.engine, baseEnv.chain, cfg, preBase.Copy(), blk, i))
+						return fmt.Errorf("block %d tx mismatch idx=%d hash=%s from=%s to=%s nonce=%d gas=%d gasPrice=%s value=%s\n  base: %s root=%s\n  mir : %s root=%s\n  full: baseErr=%v mirErr=%v",
+							n, i, tx.Hash(), fromAddr, toAddr, tx.Nonce(), tx.Gas(), tx.GasPrice(), tx.Value(),
+							fmtReceipt(br), baseRun.rootByIndex[i],
+							fmtReceipt(mr), mirRun.rootByIndex[i],
+							baseErr, mirErr,
+						)
+					}
+				}
+			}
+			return fmt.Errorf("block %d Process error mismatch: baseErr=%v mirErr=%v", n, baseErr, mirErr)
+		}
+		if baseErr != nil {
+			if baseErr.Error() != mirErr.Error() {
+				return fmt.Errorf("block %d Process error msg mismatch: baseErr=%v mirErr=%v", n, baseErr, mirErr)
+			}
+			return fmt.Errorf("block %d Process failed (both): %v", n, baseErr)
+		}
+
+		baseRoot := baseWork.IntermediateRoot(cfg.IsEIP158(blk.Number()))
+		mirRoot := mirWork.IntermediateRoot(cfg.IsEIP158(blk.Number()))
+		if baseRoot != mirRoot {
+			return fmt.Errorf("block %d post-state root mismatch: base=%s mir=%s", n, baseRoot, mirRoot)
+		}
+		// Advance environments to the post-state for the next block.
+		baseEnv.statedb = baseWork
+		mirEnv.statedb = mirWork
+		if n == 1 || n == to || n%1000 == 0 {
+			fmt.Printf("ok: processed %d\n", n)
+		}
+	}
+	return nil
+}
+
 func runUpTo(db ethdb.Database, cfg *params.ChainConfig, genesisHash common.Hash, target uint64, enableMIR bool) error {
 	genHeader := rawdb.ReadHeader(db, genesisHash, 0)
 	if genHeader == nil {
@@ -1433,12 +2056,20 @@ func flushAllocForReplay(ga *types.GenesisAlloc, tdb *triedb.Database) (common.H
 
 func main() {
 	var (
-		datadir = flag.String("datadir", "", "Geth datadir (e.g. /path/to/node_nomir)")
-		blockN  = flag.Uint64("block", 90, "Block number to replay (single-block mode)")
-		fromN   = flag.Uint64("from", 0, "Start block number to scan (inclusive). If set, scan mode is enabled.")
-		toN     = flag.Uint64("to", 0, "End block number to scan (inclusive). If set with --from, scan mode is enabled.")
-		full    = flag.Bool("full", false, "In scan mode, also run full block processing (system txs + Finalize).")
-		fast    = flag.Bool("faststate", false, "In scan mode, initialize pre-state from the on-disk parent state root (from-1) instead of replaying from genesis. Requires the datadir to contain trie nodes for that root.")
+		datadir      = flag.String("datadir", "", "Geth datadir (e.g. /path/to/node_nomir)")
+		blockN       = flag.Uint64("block", 90, "Block number to replay (single-block mode)")
+		hashS        = flag.String("blockhash", "", "Optional block hash (0x...) to replay. If the block is not canonical, this will try the bad-blocks store.")
+		roDB         = flag.Bool("readonlydb", true, "Open the chain database in read-only mode (useful when the node is running and holds the DB lock).")
+		clearBB      = flag.Bool("clearbadblocks", false, "Delete the persisted bad-block cache (rawdb InvalidBlock key) in this datadir and exit.")
+		listBB       = flag.Bool("listbadblocks", false, "List persisted bad blocks (number/hash) stored under rawdb InvalidBlock key and exit.")
+		warmup       = flag.Bool("warmup", false, "Warm up both base and MIR by replaying blocks [1..target-1] in each mode before diffing the target block (helps catch cache-dependent divergences seen in fullnodes).")
+		mirUpTo      = flag.Uint64("mirupto", 0, "Execute canonical blocks [1..N] using MIR only and exit (useful to find the first MIR-only failure).")
+		baseUpTo     = flag.Uint64("baseupto", 0, "Execute canonical blocks [1..N] using base EVM only and exit (sanity check).")
+		firstDiverge = flag.Uint64("firstdiverge", 0, "Execute canonical blocks [1..N] in lockstep (base vs MIR) and exit at the first divergence (error, receipt, or post-state root).")
+		fromN        = flag.Uint64("from", 0, "Start block number to scan (inclusive). If set, scan mode is enabled.")
+		toN          = flag.Uint64("to", 0, "End block number to scan (inclusive). If set with --from, scan mode is enabled.")
+		full         = flag.Bool("full", false, "In scan mode, also run full block processing (system txs + Finalize).")
+		fast         = flag.Bool("faststate", false, "In scan mode, initialize pre-state from the on-disk parent state root (from-1) instead of replaying from genesis. Requires the datadir to contain trie nodes for that root.")
 	)
 	flag.Parse()
 	if *datadir == "" {
@@ -1452,7 +2083,19 @@ func main() {
 
 	// NOTE: must open read-write because triedb/pathdb may attempt to maintain
 	// state-history metadata at startup (even for historical reads).
-	db, closeDB, err := openChainDB(chaindata, false)
+	//
+	// In practice this prevents opening the DB while a fullnode is running. For debug tooling,
+	// allow a read-only mode that is safe to run alongside a node.
+	readonly := *roDB
+	if *clearBB {
+		// Clearing bad-block cache requires write access.
+		readonly = false
+	}
+	if *listBB {
+		// Listing can be read-only.
+		readonly = true
+	}
+	db, closeDB, err := openChainDB(chaindata, readonly)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "open db %s: %v\n", chaindata, err)
 		os.Exit(1)
@@ -1467,6 +2110,58 @@ func main() {
 		os.Exit(1)
 	}
 	fmt.Printf("ChainID=%v genesis=%s\n", cfg.ChainID, genesisHash)
+
+	if *listBB {
+		bads := rawdb.ReadAllBadBlocks(db)
+		if len(bads) == 0 {
+			fmt.Printf("Bad blocks: none\n")
+			return
+		}
+		fmt.Printf("Bad blocks (%d):\n", len(bads))
+		for _, b := range bads {
+			if b == nil || b.Header() == nil {
+				continue
+			}
+			fmt.Printf("  number=%d hash=%s\n", b.NumberU64(), b.Hash())
+		}
+		return
+	}
+	if *clearBB {
+		// Delete persisted bad blocks so a restarted fullnode will retry importing them.
+		prev := rawdb.ReadAllBadBlocks(db)
+		rawdb.DeleteBadBlocks(db)
+		fmt.Printf("Cleared bad blocks: removed %d entries\n", len(prev))
+		return
+	}
+
+	if *baseUpTo != 0 || *mirUpTo != 0 {
+		n := *baseUpTo
+		enableMIR := false
+		label := "base"
+		if *mirUpTo != 0 {
+			n = *mirUpTo
+			enableMIR = true
+			label = "MIR"
+		}
+		fmt.Printf("Running %s up to block %d...\n", label, n)
+		if err := runUpTo(db, cfg, genesisHash, n, enableMIR); err != nil {
+			fmt.Fprintf(os.Stderr, "%s upTo(%d) FAILED: %v\n", label, n, err)
+			os.Exit(1)
+		}
+		fmt.Printf("OK: %s up to block %d\n", label, n)
+		return
+	}
+
+	if *firstDiverge != 0 {
+		n := *firstDiverge
+		fmt.Printf("Searching first divergence in [1..%d]...\n", n)
+		if err := findFirstDivergence(db, cfg, genesisHash, n); err != nil {
+			fmt.Fprintf(os.Stderr, "first divergence: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("OK: no divergence in [1..%d]\n", n)
+		return
+	}
 
 	// Scan mode: --from/--to set.
 	if *fromN != 0 || *toN != 0 {
@@ -1483,7 +2178,7 @@ func main() {
 			os.Exit(2)
 		}
 		fmt.Printf("Scanning blocks [%d..%d] (MIR off/on)...\n", start, end)
-		if err := scanRange(db, cfg, genesisHash, start, end, *full, *fast); err != nil {
+		if err := scanRange(db, cfg, genesisHash, start, end, *full, *fast, readonly); err != nil {
 			fmt.Fprintf(os.Stderr, "DIFF in scan %d..%d: %v\n", start, end, err)
 			os.Exit(1)
 		}
@@ -1491,10 +2186,34 @@ func main() {
 		return
 	}
 
+	// Hash mode: --blockhash set.
+	if strings.TrimSpace(*hashS) != "" {
+		hh := common.HexToHash(strings.TrimSpace(*hashS))
+		if hh == (common.Hash{}) {
+			fmt.Fprintf(os.Stderr, "bad --blockhash: %q\n", *hashS)
+			os.Exit(2)
+		}
+		blk := rawdb.ReadBlock(db, hh, 0)
+		if blk == nil {
+			blk = rawdb.ReadBadBlock(db, hh)
+		}
+		if blk == nil || blk.Header() == nil {
+			fmt.Fprintf(os.Stderr, "missing block for hash %s (not canonical and not found in bad blocks)\n", hh.Hex())
+			os.Exit(1)
+		}
+		fmt.Printf("Diffing block by hash %s number=%d common txs (MIR off/on)...\n", hh.Hex(), blk.NumberU64())
+		if err := diffBlockCommonTxsWithBlock(db, cfg, genesisHash, blk, true, true, *warmup, readonly); err != nil {
+			fmt.Fprintf(os.Stderr, "DIFF: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("OK: full block %d matches (including system txs + Finalize)\n", blk.NumberU64())
+		return
+	}
+
 	// Single-block mode
 	fmt.Printf("Diffing block %d common txs (MIR off/on)...\n", *blockN)
 	// In single-block mode, run full block processing too.
-	if err := diffBlockCommonTxs(db, cfg, genesisHash, *blockN, true); err != nil {
+	if err := diffBlockCommonTxs(db, cfg, genesisHash, *blockN, true, *warmup, readonly); err != nil {
 		fmt.Fprintf(os.Stderr, "DIFF: %v\n", err)
 		os.Exit(1)
 	}

@@ -1,6 +1,8 @@
 package MIR
 
 import (
+	"sync"
+
 	"github.com/holiman/uint256"
 )
 
@@ -102,6 +104,15 @@ var currentEVMBuildOp byte
 // NOTE: CFG building already relies on package-level globals for EVM mapping, so this
 // is not concurrency-safe by design.
 var currentCFGBuild *CFG
+
+// mirBuildMu serializes all CFG building/rebuilding across goroutines.
+//
+// Fullnodes can execute multiple EVMs concurrently (sync, RPC). MIR’s CFG builder uses
+// package-level globals (currentCFGBuild/currentEVMBuildPC/currentEVMBuildOp). Without
+// serialization, concurrent builds can corrupt those globals and produce incorrect MIR
+// metadata (resIdx/opKinds/evmPC mapping), which can lead to rare consensus divergence
+// (e.g. Parlia system-tx mismatch) even if deterministic replay looks fine.
+var mirBuildMu sync.Mutex
 
 func newUnaryOpMIR(operation MirOperation, opnd *Value, stack *ValueStack) *MIR {
 	// todo clyde add peephole optimization later

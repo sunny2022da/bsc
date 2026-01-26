@@ -280,6 +280,11 @@ func (db *Database) repairHistory() error {
 	}
 	// Truncate the extra state histories above in freezer in case it's not
 	// aligned with the disk layer. It might happen after a unclean shutdown.
+	if db.readOnly {
+		// In read-only mode (e.g. debugging tools opening a live datadir), we must not attempt
+		// to mutate the freezer. Skipping truncation is safe for read-only access patterns.
+		return nil
+	}
 	pruned, err := truncateFromHead(db.stateFreezer, typeStateHistory, id)
 	if err != nil {
 		log.Crit("Failed to truncate extra state histories", "err", err)

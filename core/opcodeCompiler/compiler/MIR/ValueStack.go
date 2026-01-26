@@ -24,6 +24,12 @@ type Value struct {
 	// liveIn marks that this Value originated from a parent basic block and
 	// is considered a cross-BB live-in for the current block during CFG build.
 	liveIn bool
+	// liveInPos records the stack slot index (0=bottom) within the *entry stack* of the basic
+	// block that introduced this live-in. This is used to stably remap live-ins when computing
+	// runtime edge snapshots, even when the same constant appears multiple times.
+	//
+	// Only meaningful when liveIn==true; -1 means "unknown/unset".
+	liveInPos int
 }
 
 type ValueStack struct {
@@ -40,7 +46,7 @@ func (s *ValueStack) push(ptr *Value) {
 func (s *ValueStack) pop() (value Value) {
 	if len(s.data) == 0 {
 		// Return a default value if stack is empty
-		return Value{kind: Unknown}
+		return Value{kind: Unknown, liveInPos: -1}
 	}
 	val := s.data[len(s.data)-1]
 	s.data = s.data[:len(s.data)-1]
@@ -81,6 +87,7 @@ func newValue(kind ValueKind, def *MIR, use *MIR, payload []byte) *Value {
 		value.use = []*MIR{use}
 	}
 	value.payload = payload
+	value.liveInPos = -1
 	if kind == Konst {
 		// Pre-decode constant to avoid per-op decoding and cache lookups
 		if len(payload) == 0 {
@@ -112,6 +119,24 @@ func (s *ValueStack) resetTo(snapshot []Value) {
 	}
 	s.data = make([]Value, len(snapshot))
 	copy(s.data, snapshot)
+}
+
+// padBottomTo ensures the stack has at least n items by prepending Unknown live-in values
+// to the *bottom* of the stack. This keeps the current top-of-stack values in place while
+// satisfying deep stack operations (e.g. SWAP/DUP) during runtime rebuilds.
+func (s *ValueStack) padBottomTo(n int) {
+	if s == nil {
+		return
+	}
+	if n <= len(s.data) {
+		return
+	}
+	missing := n - len(s.data)
+	pad := make([]Value, missing)
+	for i := range pad {
+		pad[i] = Value{kind: Unknown, liveIn: true}
+	}
+	s.data = append(pad, s.data...)
 }
 
 // markAllLiveIn marks all current values on the stack as live-ins.

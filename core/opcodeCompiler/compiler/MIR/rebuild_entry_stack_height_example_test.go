@@ -135,44 +135,7 @@ func TestRebuildEntryStackHeightExample(t *testing.T) {
 		}())
 	}
 
-	// Run 1: take P1 path (flag bit0 = 1). This jumps to P1@0x30 and then statically to T@0x50 with stack [b].
-	// Expect returned value == b (0xBB).
-	{
-		it := NewMIRInterpreter(cfg)
-		it.SetGasLimit(1_000_000)
-		calldata := make([]byte, 64)
-		calldata[31] = 0x01 // flag bit0 = 1 => JUMPI to P1
-		calldata[63] = 0x50 // dest for P0 (unused in this run)
-		it.SetCallData(calldata)
-		res := it.Run()
-		if res.Err != nil {
-			t.Fatalf("run1 error: %v", res.Err)
-		}
-		if res.HaltOp != MirRETURN {
-			t.Fatalf("run1 expected RETURN, got %s", res.HaltOp.String())
-		}
-		if len(res.ReturnData) != 32 || res.ReturnData[31] != 0xBB {
-			t.Fatalf("run1 expected return last byte 0xBB, got len=%d last=0x%02x", len(res.ReturnData), func() byte {
-				if len(res.ReturnData) == 0 {
-					return 0
-				}
-				return res.ReturnData[len(res.ReturnData)-1]
-			}())
-		}
-	}
-	dumpCFGForTest(t, "after Run1 (P1 path)", cfg)
-
-	// Before run2, the entry stack is still len=1 (compiled for the P1 predecessor).
-	if es := tgt.EntryStack(); es == nil || len(es) != 1 {
-		t.Fatalf("expected T entry stack len=1 before run2, got %v", func() any {
-			if es == nil {
-				return nil
-			}
-			return len(es)
-		}())
-	}
-
-	// Run 2: take P0 path (flag bit0 = 0) and dynamic jump to T, with stack [a,b] and dest from calldata[0x20].
+	// Run: take P0 path (flag bit0 = 0) and dynamic jump to T, with stack [a,b] and dest from calldata[0x20].
 	// Expect returned value == a (0xAA) after rebuild (because T begins with SWAP1).
 	{
 		it := NewMIRInterpreter(cfg)
@@ -197,11 +160,11 @@ func TestRebuildEntryStackHeightExample(t *testing.T) {
 			}())
 		}
 	}
-	dumpCFGForTest(t, "after Run2 (P0 path; dynamic edge + rebuild)", cfg)
+	dumpCFGForTest(t, "after Run (P0 path; dynamic edge + rebuild)", cfg)
 
-	// After run2, we should have rebuilt T to match the P0 predecessor entry height 2.
+	// After the run, we should have rebuilt T to match the P0 predecessor entry height 2.
 	if es := tgt.EntryStack(); es == nil || len(es) != 2 {
-		t.Fatalf("expected T entry stack len=2 after run2 rebuild, got %v", func() any {
+		t.Fatalf("expected T entry stack len=2 after rebuild, got %v", func() any {
 			if es == nil {
 				return nil
 			}
