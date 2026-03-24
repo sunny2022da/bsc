@@ -91,8 +91,8 @@ func TestWBNB_Transfer_EVMvsMIR_Debug(t *testing.T) {
 	evmM := runtime.NewEnv(mir)
 	evmB.StateDB.CreateAccount(address)
 	evmM.StateDB.CreateAccount(address)
-	evmB.StateDB.SetCode(address, runtimeCode)
-	evmM.StateDB.SetCode(address, runtimeCode)
+	evmB.StateDB.SetCode(address, runtimeCode, tracing.CodeChangeUnspecified)
+	evmM.StateDB.SetCode(address, runtimeCode, tracing.CodeChangeUnspecified)
 	senderB := base.Origin
 	senderM := mir.Origin
 
@@ -212,8 +212,8 @@ func TestWBNB_View_Name_EVMvsMIR_Success(t *testing.T) {
 	evmM := runtime.NewEnv(mir)
 	evmB.StateDB.CreateAccount(address)
 	evmM.StateDB.CreateAccount(address)
-	evmB.StateDB.SetCode(address, runtimeCode)
-	evmM.StateDB.SetCode(address, runtimeCode)
+	evmB.StateDB.SetCode(address, runtimeCode, tracing.CodeChangeUnspecified)
+	evmM.StateDB.SetCode(address, runtimeCode, tracing.CodeChangeUnspecified)
 	senderB := base.Origin
 	senderM := mir.Origin
 
@@ -299,8 +299,8 @@ func TestWBNB_Deposit_Then_Transfer_EVMvsMIR_Success(t *testing.T) {
 	evmM := runtime.NewEnv(mir)
 	evmB.StateDB.CreateAccount(address)
 	evmM.StateDB.CreateAccount(address)
-	evmB.StateDB.SetCode(address, runtimeCode)
-	evmM.StateDB.SetCode(address, runtimeCode)
+	evmB.StateDB.SetCode(address, runtimeCode, tracing.CodeChangeUnspecified)
+	evmM.StateDB.SetCode(address, runtimeCode, tracing.CodeChangeUnspecified)
 	// fund sender native coins for deposit value
 	fund := new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil) // 1 ether
 	evmB.StateDB.AddBalance(base.Origin, uint256.MustFromBig(fund), tracing.BalanceIncreaseGenesisBalance)
@@ -390,7 +390,7 @@ func BenchmarkWBNB_View_Name(b *testing.B) {
 		}
 		env := runtime.NewEnv(cfg)
 		env.StateDB.CreateAccount(address)
-		env.StateDB.SetCode(address, runtimeCode)
+		env.StateDB.SetCode(address, runtimeCode, tracing.CodeChangeUnspecified)
 		sender := cfg.Origin
 		b.ReportAllocs()
 		b.ResetTimer()
@@ -416,7 +416,7 @@ func BenchmarkWBNB_View_Name(b *testing.B) {
 		}
 		env := runtime.NewEnv(cfg)
 		env.StateDB.CreateAccount(address)
-		env.StateDB.SetCode(address, runtimeCode)
+		env.StateDB.SetCode(address, runtimeCode, tracing.CodeChangeUnspecified)
 		sender := cfg.Origin
 		b.ReportAllocs()
 		b.ResetTimer()
@@ -496,8 +496,8 @@ func TestWBNB_Deposit_EVMvsMIR_Parity(t *testing.T) {
 	evmM := runtime.NewEnv(mir)
 	evmB.StateDB.CreateAccount(address)
 	evmM.StateDB.CreateAccount(address)
-	evmB.StateDB.SetCode(address, runtimeCode)
-	evmM.StateDB.SetCode(address, runtimeCode)
+	evmB.StateDB.SetCode(address, runtimeCode, tracing.CodeChangeUnspecified)
+	evmM.StateDB.SetCode(address, runtimeCode, tracing.CodeChangeUnspecified)
 	// fund sender
 	fund := new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil) // 1 ether
 	evmB.StateDB.AddBalance(base.Origin, uint256.MustFromBig(fund), tracing.BalanceIncreaseGenesisBalance)
@@ -577,8 +577,8 @@ func TestWBNB_Deposit_EVMvsMIR_Success(t *testing.T) {
 	evmM := runtime.NewEnv(mir)
 	evmB.StateDB.CreateAccount(address)
 	evmM.StateDB.CreateAccount(address)
-	evmB.StateDB.SetCode(address, runtimeCode)
-	evmM.StateDB.SetCode(address, runtimeCode)
+	evmB.StateDB.SetCode(address, runtimeCode, tracing.CodeChangeUnspecified)
+	evmM.StateDB.SetCode(address, runtimeCode, tracing.CodeChangeUnspecified)
 	// fund sender native coins for deposit value
 	fund := new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil) // 1 ether
 	evmB.StateDB.AddBalance(base.Origin, uint256.MustFromBig(fund), tracing.BalanceIncreaseGenesisBalance)

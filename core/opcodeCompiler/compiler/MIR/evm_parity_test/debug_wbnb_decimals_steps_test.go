@@ -52,7 +52,7 @@ func TestDebug_WBNB_Decimals_OpcodeCounts(t *testing.T) {
 	baseCfg.State, _ = state.New(types.EmptyRootHash, state.NewDatabaseForTesting())
 	baseEnv := runtime.NewEnv(baseCfg)
 	baseEnv.StateDB.CreateAccount(addr)
-	baseEnv.StateDB.SetCode(addr, code)
+	baseEnv.StateDB.SetCode(addr, code, tracing.CodeChangeUnspecified)
 	_, baseLeft, baseErr := baseEnv.Call(baseCfg.Origin, addr, input, baseCfg.GasLimit, uint256.NewInt(0))
 	if baseErr != nil {
 		t.Fatalf("base err: %v", baseErr)
@@ -129,7 +129,7 @@ func TestDebug_WBNB_Deposit_SloadCount(t *testing.T) {
 	baseCfg.State, _ = state.New(types.EmptyRootHash, state.NewDatabaseForTesting())
 	baseEnv := runtime.NewEnv(baseCfg)
 	baseEnv.StateDB.CreateAccount(addr)
-	baseEnv.StateDB.SetCode(addr, code)
+	baseEnv.StateDB.SetCode(addr, code, tracing.CodeChangeUnspecified)
 	baseEnv.StateDB.AddBalance(baseCfg.Origin, uint256.MustFromBig(val), tracing.BalanceIncreaseGenesisBalance)
 	_, baseLeft, baseErr := baseEnv.Call(baseCfg.Origin, addr, depositSel, baseCfg.GasLimit, uint256.MustFromBig(val))
 	if baseErr != nil {

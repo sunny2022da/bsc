@@ -13,6 +13,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/core/tracing"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/core/vm/runtime"
 	"github.com/ethereum/go-ethereum/params"
@@ -342,9 +343,9 @@ func runGasComparison(t *testing.T, name string, code, input []byte, strictGas b
 
 	// Set up contract code
 	baseCfg.State.CreateAccount(contractAddr)
-	baseCfg.State.SetCode(contractAddr, code)
+	baseCfg.State.SetCode(contractAddr, code, tracing.CodeChangeUnspecified)
 	mirCfg.State.CreateAccount(contractAddr)
-	mirCfg.State.SetCode(contractAddr, code)
+	mirCfg.State.SetCode(contractAddr, code, tracing.CodeChangeUnspecified)
 
 	evmBase := runtime.NewEnv(baseCfg)
 	evmMIR := runtime.NewEnv(mirCfg)
@@ -426,11 +427,11 @@ func runGasComparisonWithBalance(t *testing.T, name string, code, input []byte, 
 
 	// Give contract some balance for value transfers
 	baseCfg.State.CreateAccount(contractAddr)
-	baseCfg.State.SetCode(contractAddr, code)
+	baseCfg.State.SetCode(contractAddr, code, tracing.CodeChangeUnspecified)
 	baseCfg.State.SetBalance(contractAddr, uint256.NewInt(1_000_000_000), 0)
 
 	mirCfg.State.CreateAccount(contractAddr)
-	mirCfg.State.SetCode(contractAddr, code)
+	mirCfg.State.SetCode(contractAddr, code, tracing.CodeChangeUnspecified)
 	mirCfg.State.SetBalance(contractAddr, uint256.NewInt(1_000_000_000), 0)
 
 	evmBase := runtime.NewEnv(baseCfg)
@@ -506,9 +507,9 @@ func runGasComparisonWithExactGas(t *testing.T, name string, code, input []byte,
 	mirCfg.State, _ = state.New(types.EmptyRootHash, state.NewDatabaseForTesting())
 
 	baseCfg.State.CreateAccount(contractAddr)
-	baseCfg.State.SetCode(contractAddr, code)
+	baseCfg.State.SetCode(contractAddr, code, tracing.CodeChangeUnspecified)
 	mirCfg.State.CreateAccount(contractAddr)
-	mirCfg.State.SetCode(contractAddr, code)
+	mirCfg.State.SetCode(contractAddr, code, tracing.CodeChangeUnspecified)
 
 	evmBase := runtime.NewEnv(baseCfg)
 	evmMIR := runtime.NewEnv(mirCfg)

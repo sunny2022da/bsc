@@ -103,7 +103,7 @@ func TestPerfGate_MIRNotSlowerThanEVM_USDT(t *testing.T) {
 		evmBase := evmruntime.NewEnv(cfgBase)
 		addr := common.BytesToAddress([]byte("gate_usdt"))
 		evmBase.StateDB.CreateAccount(addr)
-		evmBase.StateDB.SetCode(addr, code)
+		evmBase.StateDB.SetCode(addr, code, tracing.CodeChangeUnspecified)
 		callBase := func() {
 			benchSinkRet, benchSinkGas, benchSinkErr = evmBase.Call(cfgBase.Origin, addr, input, cfgBase.GasLimit, uint256.NewInt(0))
 		}
@@ -114,7 +114,7 @@ func TestPerfGate_MIRNotSlowerThanEVM_USDT(t *testing.T) {
 		cfgMIR.State, _ = state.New(types.EmptyRootHash, state.NewDatabaseForTesting())
 		evmMIR := evmruntime.NewEnv(cfgMIR)
 		evmMIR.StateDB.CreateAccount(addr)
-		evmMIR.StateDB.SetCode(addr, code)
+		evmMIR.StateDB.SetCode(addr, code, tracing.CodeChangeUnspecified)
 		callMIR := func() {
 			benchSinkRet, benchSinkGas, benchSinkErr = evmMIR.Call(cfgMIR.Origin, addr, input, cfgMIR.GasLimit, uint256.NewInt(0))
 		}
@@ -203,7 +203,7 @@ func TestPerfGate_MIRNotSlowerThanEVM_WBNB(t *testing.T) {
 		evmBase := evmruntime.NewEnv(cfgBase)
 		addr := common.BytesToAddress([]byte("gate_wbnb"))
 		evmBase.StateDB.CreateAccount(addr)
-		evmBase.StateDB.SetCode(addr, code)
+		evmBase.StateDB.SetCode(addr, code, tracing.CodeChangeUnspecified)
 		if m.fundOrigin != nil && !m.fundOrigin.IsZero() {
 			evmBase.StateDB.AddBalance(cfgBase.Origin, m.fundOrigin, tracing.BalanceIncreaseGenesisBalance)
 		}
@@ -215,7 +215,7 @@ func TestPerfGate_MIRNotSlowerThanEVM_WBNB(t *testing.T) {
 		cfgMIR.State, _ = state.New(types.EmptyRootHash, state.NewDatabaseForTesting())
 		evmMIR := evmruntime.NewEnv(cfgMIR)
 		evmMIR.StateDB.CreateAccount(addr)
-		evmMIR.StateDB.SetCode(addr, code)
+		evmMIR.StateDB.SetCode(addr, code, tracing.CodeChangeUnspecified)
 		if m.fundOrigin != nil && !m.fundOrigin.IsZero() {
 			evmMIR.StateDB.AddBalance(cfgMIR.Origin, m.fundOrigin, tracing.BalanceIncreaseGenesisBalance)
 		}

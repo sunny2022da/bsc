@@ -10,6 +10,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/core/tracing"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/core/vm/runtime"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -118,7 +119,7 @@ func BenchmarkMIRVsEVM_AddMul(b *testing.B) {
 		address := common.BytesToAddress([]byte("contract"))
 		sender := cfgBase.Origin
 		evm.StateDB.CreateAccount(address)
-		evm.StateDB.SetCode(address, simpleAddMul)
+		evm.StateDB.SetCode(address, simpleAddMul, tracing.CodeChangeUnspecified)
 
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
@@ -141,7 +142,7 @@ func BenchmarkMIRVsEVM_AddMul(b *testing.B) {
 		address := common.BytesToAddress([]byte("contract"))
 		sender := cfgMIR.Origin
 		evm.StateDB.CreateAccount(address)
-		evm.StateDB.SetCode(address, simpleAddMul)
+		evm.StateDB.SetCode(address, simpleAddMul, tracing.CodeChangeUnspecified)
 
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
@@ -181,7 +182,7 @@ func BenchmarkMIRVsEVM_AddMulReturn(b *testing.B) {
 		address := common.BytesToAddress([]byte("contract"))
 		sender := cfgBase.Origin
 		evm.StateDB.CreateAccount(address)
-		evm.StateDB.SetCode(address, addMulReturn)
+		evm.StateDB.SetCode(address, addMulReturn, tracing.CodeChangeUnspecified)
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
 			_, _, err := evm.Call(sender, address, nil, cfgBase.GasLimit, uint256.MustFromBig(cfgBase.Value))
@@ -199,7 +200,7 @@ func BenchmarkMIRVsEVM_AddMulReturn(b *testing.B) {
 		address := common.BytesToAddress([]byte("contract"))
 		sender := cfgMIR.Origin
 		evm.StateDB.CreateAccount(address)
-		evm.StateDB.SetCode(address, addMulReturn)
+		evm.StateDB.SetCode(address, addMulReturn, tracing.CodeChangeUnspecified)
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
 			_, _, err := evm.Call(sender, address, nil, cfgMIR.GasLimit, uint256.MustFromBig(cfgMIR.Value))
@@ -222,7 +223,7 @@ func BenchmarkMIRVsEVM_Storage(b *testing.B) {
 		address := common.BytesToAddress([]byte("contract_storage"))
 		sender := cfgBase.Origin
 		evm.StateDB.CreateAccount(address)
-		evm.StateDB.SetCode(address, storageStoreLoadReturn)
+		evm.StateDB.SetCode(address, storageStoreLoadReturn, tracing.CodeChangeUnspecified)
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
 			_, _, err := evm.Call(sender, address, nil, cfgBase.GasLimit, uint256.MustFromBig(cfgBase.Value))
@@ -240,7 +241,7 @@ func BenchmarkMIRVsEVM_Storage(b *testing.B) {
 		address := common.BytesToAddress([]byte("contract_storage"))
 		sender := cfgMIR.Origin
 		evm.StateDB.CreateAccount(address)
-		evm.StateDB.SetCode(address, storageStoreLoadReturn)
+		evm.StateDB.SetCode(address, storageStoreLoadReturn, tracing.CodeChangeUnspecified)
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
 			_, _, err := evm.Call(sender, address, nil, cfgMIR.GasLimit, uint256.MustFromBig(cfgMIR.Value))
@@ -263,7 +264,7 @@ func BenchmarkMIRVsEVM_Keccak(b *testing.B) {
 		address := common.BytesToAddress([]byte("contract_keccak"))
 		sender := cfgBase.Origin
 		evm.StateDB.CreateAccount(address)
-		evm.StateDB.SetCode(address, keccakMemReturn)
+		evm.StateDB.SetCode(address, keccakMemReturn, tracing.CodeChangeUnspecified)
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
 			_, _, err := evm.Call(sender, address, nil, cfgBase.GasLimit, uint256.MustFromBig(cfgBase.Value))
@@ -281,7 +282,7 @@ func BenchmarkMIRVsEVM_Keccak(b *testing.B) {
 		address := common.BytesToAddress([]byte("contract_keccak"))
 		sender := cfgMIR.Origin
 		evm.StateDB.CreateAccount(address)
-		evm.StateDB.SetCode(address, keccakMemReturn)
+		evm.StateDB.SetCode(address, keccakMemReturn, tracing.CodeChangeUnspecified)
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
 			_, _, err := evm.Call(sender, address, nil, cfgMIR.GasLimit, uint256.MustFromBig(cfgMIR.Value))
@@ -308,7 +309,7 @@ func BenchmarkMIRVsEVM_CalldataKeccak(b *testing.B) {
 		address := common.BytesToAddress([]byte("contract_calldata"))
 		sender := cfgBase.Origin
 		evm.StateDB.CreateAccount(address)
-		evm.StateDB.SetCode(address, calldataKeccakReturn)
+		evm.StateDB.SetCode(address, calldataKeccakReturn, tracing.CodeChangeUnspecified)
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
 			_, _, err := evm.Call(sender, address, input, cfgBase.GasLimit, uint256.MustFromBig(cfgBase.Value))
@@ -326,7 +327,7 @@ func BenchmarkMIRVsEVM_CalldataKeccak(b *testing.B) {
 		address := common.BytesToAddress([]byte("contract_calldata"))
 		sender := cfgMIR.Origin
 		evm.StateDB.CreateAccount(address)
-		evm.StateDB.SetCode(address, calldataKeccakReturn)
+		evm.StateDB.SetCode(address, calldataKeccakReturn, tracing.CodeChangeUnspecified)
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
 			_, _, err := evm.Call(sender, address, input, cfgMIR.GasLimit, uint256.MustFromBig(cfgMIR.Value))
@@ -351,7 +352,7 @@ func TestMIRVsEVM_Functional(t *testing.T) {
 		address := common.BytesToAddress([]byte(addrLabel))
 		sender := cfg.Origin
 		evm.StateDB.CreateAccount(address)
-		evm.StateDB.SetCode(address, code)
+		evm.StateDB.SetCode(address, code, tracing.CodeChangeUnspecified)
 		ret, _, err := evm.Call(sender, address, input, cfg.GasLimit, uint256.MustFromBig(cfg.Value))
 		return ret, err
 	}
@@ -436,7 +437,7 @@ func TestAddMulReturn_BaseAndMIR(t *testing.T) {
 	addr := common.BytesToAddress([]byte("contract"))
 	sender := cfgBase.Origin
 	evm.StateDB.CreateAccount(addr)
-	evm.StateDB.SetCode(addr, addMulReturn)
+	evm.StateDB.SetCode(addr, addMulReturn, tracing.CodeChangeUnspecified)
 	ret, _, err := evm.Call(sender, addr, nil, cfgBase.GasLimit, uint256.MustFromBig(cfgBase.Value))
 	if err != nil {
 		t.Fatalf("base call err: %v", err)
@@ -463,7 +464,7 @@ func TestAddMulReturn_BaseAndMIR(t *testing.T) {
 	}
 	evm2 := runtime.NewEnv(cfgMIR)
 	evm2.StateDB.CreateAccount(addr)
-	evm2.StateDB.SetCode(addr, addMulReturn)
+	evm2.StateDB.SetCode(addr, addMulReturn, tracing.CodeChangeUnspecified)
 	ret2, _, err2 := evm2.Call(sender, addr, nil, cfgMIR.GasLimit, uint256.MustFromBig(cfgMIR.Value))
 	if err2 != nil {
 		t.Fatalf("mir call err: %v", err2)

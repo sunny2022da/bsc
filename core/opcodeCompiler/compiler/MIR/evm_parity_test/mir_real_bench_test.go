@@ -80,7 +80,7 @@ func BenchmarkMIRVsEVM_USDT(b *testing.B) {
 				evm := runtime.NewEnv(cfgBase)
 				addr := common.BytesToAddress([]byte("bench_usdt"))
 				evm.StateDB.CreateAccount(addr)
-				evm.StateDB.SetCode(addr, code)
+				evm.StateDB.SetCode(addr, code, tracing.CodeChangeUnspecified)
 				// Warm-up to avoid counting one-time init work (e.g. jumpdest scanning) in the loop.
 				benchSinkRet, benchSinkGas, benchSinkErr = evm.Call(cfgBase.Origin, addr, input, cfgBase.GasLimit, uint256.NewInt(0))
 				goruntime.KeepAlive(benchSinkRet)
@@ -100,7 +100,7 @@ func BenchmarkMIRVsEVM_USDT(b *testing.B) {
 				evm := runtime.NewEnv(cfgMIR)
 				addr := common.BytesToAddress([]byte("bench_usdt"))
 				evm.StateDB.CreateAccount(addr)
-				evm.StateDB.SetCode(addr, code)
+				evm.StateDB.SetCode(addr, code, tracing.CodeChangeUnspecified)
 				// Warm-up to populate MIR CFG cache inside the runner (steady-state timing).
 				benchSinkRet, benchSinkGas, benchSinkErr = evm.Call(cfgMIR.Origin, addr, input, cfgMIR.GasLimit, uint256.NewInt(0))
 				goruntime.KeepAlive(benchSinkRet)
@@ -185,7 +185,7 @@ func BenchmarkMIRVsEVM_WBNB(b *testing.B) {
 				evm := runtime.NewEnv(cfgBase)
 				addr := common.BytesToAddress([]byte("bench_wbnb"))
 				evm.StateDB.CreateAccount(addr)
-				evm.StateDB.SetCode(addr, code)
+				evm.StateDB.SetCode(addr, code, tracing.CodeChangeUnspecified)
 				if m.fundOrigin != nil && !m.fundOrigin.IsZero() {
 					evm.StateDB.AddBalance(cfgBase.Origin, m.fundOrigin, tracing.BalanceIncreaseGenesisBalance)
 				}
@@ -207,7 +207,7 @@ func BenchmarkMIRVsEVM_WBNB(b *testing.B) {
 				evm := runtime.NewEnv(cfgMIR)
 				addr := common.BytesToAddress([]byte("bench_wbnb"))
 				evm.StateDB.CreateAccount(addr)
-				evm.StateDB.SetCode(addr, code)
+				evm.StateDB.SetCode(addr, code, tracing.CodeChangeUnspecified)
 				if m.fundOrigin != nil && !m.fundOrigin.IsZero() {
 					evm.StateDB.AddBalance(cfgMIR.Origin, m.fundOrigin, tracing.BalanceIncreaseGenesisBalance)
 				}

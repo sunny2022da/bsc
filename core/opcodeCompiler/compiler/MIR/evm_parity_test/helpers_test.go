@@ -10,6 +10,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/core/tracing"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/core/vm/runtime"
 	"github.com/ethereum/go-ethereum/params"
@@ -57,7 +58,7 @@ func installAndCall(t testing.TB, cfg *runtime.Config, addr common.Address, code
 	t.Helper()
 	env := runtime.NewEnv(cfg)
 	env.StateDB.CreateAccount(addr)
-	env.StateDB.SetCode(addr, code)
+	env.StateDB.SetCode(addr, code, tracing.CodeChangeUnspecified)
 	if value == nil {
 		value = uint256.NewInt(0)
 	}

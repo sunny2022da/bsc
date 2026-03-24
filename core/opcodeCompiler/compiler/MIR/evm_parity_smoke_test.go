@@ -11,6 +11,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/core/tracing"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/holiman/uint256"
@@ -21,7 +22,7 @@ func runGethEVMCall(t *testing.T, code []byte, gasLimit uint64) (gasUsed uint64,
 	contractAddr := common.HexToAddress("0x00000000000000000000000000000000000000cc")
 	statedb, _ := state.New(types.EmptyRootHash, state.NewDatabaseForTesting())
 	statedb.CreateAccount(contractAddr)
-	statedb.SetCode(contractAddr, code)
+	statedb.SetCode(contractAddr, code, tracing.CodeChangeUnspecified)
 	statedb.Finalise(true)
 
 	vmctx := vm.BlockContext{
@@ -41,7 +42,7 @@ func newStateDBWithContract(t *testing.T, code []byte) (*state.StateDB, common.A
 	contractAddr := common.HexToAddress("0x00000000000000000000000000000000000000cc")
 	statedb, _ := state.New(types.EmptyRootHash, state.NewDatabaseForTesting())
 	statedb.CreateAccount(contractAddr)
-	statedb.SetCode(contractAddr, code)
+	statedb.SetCode(contractAddr, code, tracing.CodeChangeUnspecified)
 	statedb.Finalise(true)
 	return statedb, contractAddr
 }
@@ -352,8 +353,8 @@ func TestParity_Stateful_EXTCODE_WarmCold_SameAddrTwice(t *testing.T) {
 	// Install some code at target so EXTCODE* has something to read.
 	stG.CreateAccount(target)
 	stM.CreateAccount(target)
-	stG.SetCode(target, []byte{0x60, 0x00, 0x00}) // PUSH1 0; STOP
-	stM.SetCode(target, []byte{0x60, 0x00, 0x00})
+	stG.SetCode(target, []byte{0x60, 0x00, 0x00}, tracing.CodeChangeUnspecified) // PUSH1 0; STOP
+	stM.SetCode(target, []byte{0x60, 0x00, 0x00}, tracing.CodeChangeUnspecified)
 
 	gGas, _, gErr := runGethEVMCallWithState(t, stG, caddr, code, gasLimit)
 	mGas, _, mErr := runMIRWithStateDB(t, stM, caddr, code, gasLimit)
@@ -417,8 +418,8 @@ func TestParity_Stateful_RETURNDATACOPY_OutOfBoundsErrors(t *testing.T) {
 	// Install callee B in both states
 	stG.CreateAccount(addrB)
 	stM.CreateAccount(addrB)
-	stG.SetCode(addrB, codeB)
-	stM.SetCode(addrB, codeB)
+	stG.SetCode(addrB, codeB, tracing.CodeChangeUnspecified)
+	stM.SetCode(addrB, codeB, tracing.CodeChangeUnspecified)
 
 	// geth baseline: run A in geth interpreter
 	gGas, _, gErr := runGethEVMCallWithState(t, stG, addrA, codeA, gasLimit)

@@ -45,7 +45,7 @@ func TestDebug_USDT_Name_DirectMIR(t *testing.T) {
 	baseEnv := runtime.NewEnv(baseCfg)
 	contractAddr := common.HexToAddress("0xc0de")
 	baseEnv.StateDB.CreateAccount(contractAddr)
-	baseEnv.StateDB.SetCode(contractAddr, code)
+	baseEnv.StateDB.SetCode(contractAddr, code, tracing.CodeChangeUnspecified)
 	baseRet, baseLeft, baseErr := baseEnv.Call(baseCfg.Origin, contractAddr, input, baseCfg.GasLimit, uint256.NewInt(0))
 	t.Logf("BASE: err=%v lastPC=%d gasLeft=%d retLen=%d ret=%x (RETURN offset=%s size=%s)", baseErr, baseLastPC, baseLeft, len(baseRet), baseRet, baseRetOffset, baseRetSize)
 

@@ -68,7 +68,7 @@ func TestMIRParity_USDT(t *testing.T) {
 		baseAddr := common.BytesToAddress([]byte("contract_usdt_base"))
 		baseSender := baseCfg.Origin
 		baseEnv.StateDB.CreateAccount(baseAddr)
-		baseEnv.StateDB.SetCode(baseAddr, realCode)
+		baseEnv.StateDB.SetCode(baseAddr, realCode, tracing.CodeChangeUnspecified)
 		baseCallValue := uint256.NewInt(0)
 		baseRet, baseGasLeft, baseErr := baseEnv.Call(baseSender, baseAddr, input, baseCfg.GasLimit, baseCallValue)
 
@@ -78,7 +78,7 @@ func TestMIRParity_USDT(t *testing.T) {
 		mirAddr := common.BytesToAddress([]byte("contract_usdt_mir"))
 		mirSender := mirCfg.Origin
 		mirEnv.StateDB.CreateAccount(mirAddr)
-		mirEnv.StateDB.SetCode(mirAddr, realCode)
+		mirEnv.StateDB.SetCode(mirAddr, realCode, tracing.CodeChangeUnspecified)
 		mirCallValue := uint256.NewInt(0)
 		mirRet, mirGasLeft, mirErr := mirEnv.Call(mirSender, mirAddr, input, mirCfg.GasLimit, mirCallValue)
 		if (baseErr == nil) != (mirErr == nil) {
@@ -162,7 +162,7 @@ func TestMIRParity_WBNB(t *testing.T) {
 		baseAddr := common.BytesToAddress([]byte("contract_wbnb_base"))
 		baseSender := baseCfg.Origin
 		baseEnv.StateDB.CreateAccount(baseAddr)
-		baseEnv.StateDB.SetCode(baseAddr, code)
+		baseEnv.StateDB.SetCode(baseAddr, code, tracing.CodeChangeUnspecified)
 		// per-call value and optional funding (for deposit)
 		callValue := uint256.NewInt(0)
 		if m.name == "deposit_value_1e18" {
@@ -178,7 +178,7 @@ func TestMIRParity_WBNB(t *testing.T) {
 		mirAddr := common.BytesToAddress([]byte("contract_wbnb_mir"))
 		mirSender := mirCfg.Origin
 		mirEnv.StateDB.CreateAccount(mirAddr)
-		mirEnv.StateDB.SetCode(mirAddr, code)
+		mirEnv.StateDB.SetCode(mirAddr, code, tracing.CodeChangeUnspecified)
 		mirCallValue := uint256.NewInt(0)
 		if m.name == "deposit_value_1e18" {
 			val := new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil)
@@ -229,7 +229,7 @@ func TestMIRParity_Tiny(t *testing.T) {
 	baseAddr := common.BytesToAddress([]byte("tiny_base"))
 	baseSender := baseCfg.Origin
 	baseEnv.StateDB.CreateAccount(baseAddr)
-	baseEnv.StateDB.SetCode(baseAddr, code)
+	baseEnv.StateDB.SetCode(baseAddr, code, tracing.CodeChangeUnspecified)
 	baseRet, baseGasLeft, baseErr := baseEnv.Call(baseSender, baseAddr, input, baseCfg.GasLimit, uint256.NewInt(0))
 	if baseErr != nil {
 		t.Fatalf("base error: %v", baseErr)
@@ -240,7 +240,7 @@ func TestMIRParity_Tiny(t *testing.T) {
 	mirAddr := common.BytesToAddress([]byte("tiny_mir"))
 	mirSender := mirCfg.Origin
 	mirEnv.StateDB.CreateAccount(mirAddr)
-	mirEnv.StateDB.SetCode(mirAddr, code)
+	mirEnv.StateDB.SetCode(mirAddr, code, tracing.CodeChangeUnspecified)
 	mirRet, mirGasLeft, mirErr := mirEnv.Call(mirSender, mirAddr, input, mirCfg.GasLimit, uint256.NewInt(0))
 	if mirErr != nil {
 		t.Fatalf("mir error: %v", mirErr)
@@ -301,7 +301,7 @@ func TestMIRGasTrace_USDT_Decimals(t *testing.T) {
 	baseAddr := common.BytesToAddress([]byte("usdt_decimals_base"))
 	baseSender := baseCfg.Origin
 	baseEnv.StateDB.CreateAccount(baseAddr)
-	baseEnv.StateDB.SetCode(baseAddr, code)
+	baseEnv.StateDB.SetCode(baseAddr, code, tracing.CodeChangeUnspecified)
 	_, baseGasLeft, _ := baseEnv.Call(baseSender, baseAddr, input, baseCfg.GasLimit, uint256.NewInt(0))
 
 	// MIR
@@ -309,7 +309,7 @@ func TestMIRGasTrace_USDT_Decimals(t *testing.T) {
 	mirAddr := common.BytesToAddress([]byte("usdt_decimals_mir"))
 	mirSender := mirCfg.Origin
 	mirEnv.StateDB.CreateAccount(mirAddr)
-	mirEnv.StateDB.SetCode(mirAddr, code)
+	mirEnv.StateDB.SetCode(mirAddr, code, tracing.CodeChangeUnspecified)
 	_, mirGasLeft, _ := mirEnv.Call(mirSender, mirAddr, input, mirCfg.GasLimit, uint256.NewInt(0))
 
 	// Quick parity check, then print a concise diff around divergence

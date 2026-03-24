@@ -60,8 +60,8 @@ func TestMIRUSDT_Name_EVMvsMIR_Single(t *testing.T) {
 	evmM := runtime.NewEnv(mir)
 	evmB.StateDB.CreateAccount(addr)
 	evmM.StateDB.CreateAccount(addr)
-	evmB.StateDB.SetCode(addr, code)
-	evmM.StateDB.SetCode(addr, code)
+	evmB.StateDB.SetCode(addr, code, tracing.CodeChangeUnspecified)
+	evmM.StateDB.SetCode(addr, code, tracing.CodeChangeUnspecified)
 
 	// calldata: name() selector 0x06fdde03
 	input := []byte{0x06, 0xfd, 0xde, 0x03}
