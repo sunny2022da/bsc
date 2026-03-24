@@ -3,6 +3,7 @@ package MIR
 import (
 	"bytes"
 	"encoding/hex"
+	"math/big"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -106,6 +107,57 @@ func TestMIR_TLOAD_TSTORE_Implemented(t *testing.T) {
 	}
 	if !bytes.Equal(got[:], want) {
 		t.Fatalf("expected %x, got %x", want, got)
+	}
+}
+
+func TestMIR_PC_Implemented(t *testing.T) {
+	// Bytecode:
+	//   PC        ; pushes 0x00 (PC of this instruction)
+	//   PUSH1 0x00
+	//   MSTORE    ; mem[0] = 0x00
+	//   PUSH1 0x20
+	//   PUSH1 0x00
+	//   RETURN
+	// Opcode bytes: 0x58 0x60 0x00 0x52 0x60 0x20 0x60 0x00 0xf3
+	code := mustDecodeHexMissingOps(t, "5860005260206000f3")
+	got := runCodeReturnWord(t, code, nil)
+	v := uint256.NewInt(0).SetBytes(got[:])
+	if v.Uint64() != 0 {
+		t.Fatalf("expected PC=0, got %s", v.String())
+	}
+}
+
+func TestMIR_GASPRICE_Implemented(t *testing.T) {
+	// Bytecode:
+	//   GASPRICE  ; pushes tx gas price
+	//   PUSH1 0x00
+	//   MSTORE
+	//   PUSH1 0x20
+	//   PUSH1 0x00
+	//   RETURN
+	// Opcode bytes: 0x3a 0x60 0x00 0x52 0x60 0x20 0x60 0x00 0xf3
+	code := mustDecodeHexMissingOps(t, "3a60005260206000f3")
+	cfg := NewCFG([32]byte{}, code)
+	if err := cfg.Parse(); err != nil {
+		t.Fatalf("CFG.Parse: %v", err)
+	}
+	it := NewMIRInterpreter(cfg)
+	it.SetGasLimit(1_000_000)
+	it.SetContractAddress(common.HexToAddress("0x00000000000000000000000000000000000000aa"))
+	it.SetTxGasPrice(big.NewInt(42))
+	res := it.Run()
+	if res.Err != nil {
+		t.Fatalf("Run error: %v", res.Err)
+	}
+	if res.HaltOp != MirRETURN {
+		t.Fatalf("expected RETURN, got %s", res.HaltOp.String())
+	}
+	if len(res.ReturnData) != 32 {
+		t.Fatalf("expected 32-byte return, got %d", len(res.ReturnData))
+	}
+	v := uint256.NewInt(0).SetBytes(res.ReturnData)
+	if v.Uint64() != 42 {
+		t.Fatalf("expected GASPRICE=42, got %s", v.String())
 	}
 }
 

@@ -267,6 +267,7 @@ func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]b
 	it.contractAddr = contract.Address()
 	it.callerAddr = contract.Caller()
 	it.originAddr = r.evm.Origin
+	it.txGasPrice = r.evm.GasPrice
 	if v := contract.Value(); v != nil {
 		it.callValue = v
 	} else {

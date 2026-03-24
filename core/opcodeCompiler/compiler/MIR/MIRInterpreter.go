@@ -117,6 +117,7 @@ type MIRInterpreter struct {
 	callerAddr   common.Address
 	originAddr   common.Address
 	callValue    *uint256.Int
+	txGasPrice   *big.Int // effective gas price for the current tx (GASPRICE opcode)
 	state        StateBackend
 	// vmStateDB is a fast-path handle for fullnode execution (when StateBackend is *StateDBBackend).
 	// This avoids an extra interface dispatch layer in hot access-list/state paths.
@@ -785,6 +786,10 @@ func (it *MIRInterpreter) SetCallValue(v *uint256.Int) {
 	}
 	// Treat as immutable for the duration of the call.
 	it.callValue = v
+}
+
+func (it *MIRInterpreter) SetTxGasPrice(p *big.Int) {
+	it.txGasPrice = p
 }
 
 func (it *MIRInterpreter) SetStateBackend(s StateBackend) {
@@ -1673,6 +1678,17 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 
 			case MirCALLER:
 				it.resultSlot(m).SetBytes(it.callerAddr.Bytes())
+
+			case MirGASPRICE:
+				out := it.resultSlot(m)
+				if it.txGasPrice == nil {
+					out.Clear()
+				} else {
+					out.SetFromBig(it.txGasPrice)
+				}
+
+			case MirPC:
+				it.resultSlot(m).SetUint64(uint64(m.evmPC))
 
 			case MirCOINBASE:
 				it.resultSlot(m).SetBytes(it.blockCoinbase.Bytes())

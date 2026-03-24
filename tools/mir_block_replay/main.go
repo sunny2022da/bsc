@@ -94,7 +94,7 @@ func newReplayEnvWithState(db ethdb.Database, cfg *params.ChainConfig, genesisHa
 	if err != nil {
 		return nil, fmt.Errorf("NewHeaderChain: %w", err)
 	}
-	processor := core.NewStateProcessor(cfg, chain)
+	processor := core.NewStateProcessor(chain)
 	return &replayEnv{
 		db:        db,
 		cfg:       cfg,
@@ -1995,7 +1995,7 @@ func runUpTo(db ethdb.Database, cfg *params.ChainConfig, genesisHash common.Hash
 	if err != nil {
 		return fmt.Errorf("NewHeaderChain: %w", err)
 	}
-	processor := core.NewStateProcessor(cfg, chain)
+	processor := core.NewStateProcessor(chain)
 
 	vmCfg := vm.Config{
 		EnableOpcodeOptimizations: false,
@@ -2036,7 +2036,7 @@ func flushAllocForReplay(ga *types.GenesisAlloc, tdb *triedb.Database) (common.H
 		if account.Balance != nil {
 			statedb.AddBalance(addr, uint256.MustFromBig(account.Balance), 0)
 		}
-		statedb.SetCode(addr, account.Code)
+		statedb.SetCode(addr, account.Code, tracing.CodeChangeUnspecified)
 		statedb.SetNonce(addr, account.Nonce, 0)
 		for key, value := range account.Storage {
 			statedb.SetState(addr, key, value)
