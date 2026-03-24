@@ -6,6 +6,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/state"
+	"github.com/ethereum/go-ethereum/core/tracing"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/holiman/uint256"
@@ -24,7 +25,7 @@ func newTestEVMWithCode(t *testing.T, addr common.Address, code []byte, cfg Conf
 	t.Helper()
 	statedb, _ := state.New(types.EmptyRootHash, state.NewDatabaseForTesting())
 	statedb.CreateAccount(addr)
-	statedb.SetCode(addr, code)
+	statedb.SetCode(addr, code, tracing.CodeChangeUnspecified)
 	statedb.Finalise(true)
 
 	ctx := BlockContext{
