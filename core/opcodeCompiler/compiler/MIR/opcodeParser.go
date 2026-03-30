@@ -5,6 +5,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/opcodeCompiler/compiler"
+	"github.com/holiman/uint256"
 )
 
 // cfgNonConvergentPrefix is used as a stable marker so higher-level callers (runner/tools)
@@ -284,7 +285,90 @@ func (c *CFG) Parse() error {
 			break
 		}
 	}
+	// Pre-warm jump tables for unresolvedJump blocks so that runtime resolveBB calls
+	// find pre-created target blocks and can cache results in jumpTable immediately.
+	c.preWarmJumpTables()
 	return nil
+}
+
+// preWarmJumpTables runs after Parse() reaches a fixpoint. For every block that ends in a
+// dynamic JUMP/JUMPI (unresolvedJump==true) it scans the per-predecessor incoming-stack
+// snapshots for constant values that are valid JUMPDEST addresses.  For each such constant
+// it pre-creates the target MIRBasicBlock in pcToBlock (without connecting an edge) so that:
+//
+//  1. The first runtime resolveBB call finds a pre-existing block instead of allocating.
+//  2. The first connectEdge call updates jumpTable; subsequent jumps to that target hit the
+//     O(1) jumpTable fast path instead of the resolveBB slow path.
+//
+// Edges are intentionally NOT connected here (that would invalidate builds). Connection and
+// jumpTable population happen on first execution via resolveBB → connectEdge.
+func (c *CFG) preWarmJumpTables() {
+	if c == nil {
+		return
+	}
+	validDests := c.JumpDests()
+	// Iterate over a copy of the slice length to avoid observing blocks created during this pass.
+	n := len(c.basicBlocks)
+	for i := 0; i < n; i++ {
+		blk := c.basicBlocks[i]
+		if blk == nil || !blk.unresolvedJump {
+			continue
+		}
+		// Scan all per-predecessor incoming stack snapshots for constant JUMPDEST candidates.
+		for _, snap := range blk.incomingStacks {
+			for si := range snap {
+				v := &snap[si]
+				if v.kind != Konst {
+					continue
+				}
+				target := constSnapToPC(v)
+				if target == 0 || !validDests[target] {
+					continue
+				}
+				if _, exists := c.pcToBlock[target]; !exists {
+					c.getOrCreateBlock(target)
+				}
+			}
+		}
+		// Also scan the block's own entry stack.
+		for si := range blk.entryStack {
+			v := &blk.entryStack[si]
+			if v.kind != Konst {
+				continue
+			}
+			target := constSnapToPC(v)
+			if target == 0 || !validDests[target] {
+				continue
+			}
+			if _, exists := c.pcToBlock[target]; !exists {
+				c.getOrCreateBlock(target)
+			}
+		}
+	}
+}
+
+// constSnapToPC extracts a uint PC from a constant stack Value.
+// Returns 0 if the Value is not constant or its integer value overflows uint.
+func constSnapToPC(v *Value) uint {
+	if v == nil || v.kind != Konst {
+		return 0
+	}
+	if v.u != nil {
+		u64, ov := v.u.Uint64WithOverflow()
+		if ov {
+			return 0
+		}
+		return uint(u64)
+	}
+	if len(v.payload) == 0 {
+		return 0
+	}
+	u := new(uint256.Int).SetBytes(v.payload)
+	u64, ov := u.Uint64WithOverflow()
+	if ov {
+		return 0
+	}
+	return uint(u64)
 }
 
 // getEntryStackForBlock determines the initial stack state for a block.
@@ -607,6 +691,11 @@ func (c *CFG) connectEdge(parent, child *MIRBasicBlock, exitSnapshot []Value) {
 		if !found {
 			children = append(children, child)
 			parent.SetChildren(children)
+			// Maintain jumpTable in sync for O(1) runtime dispatch.
+			if parent.jumpTable == nil {
+				parent.jumpTable = make(map[uint]*MIRBasicBlock, 4)
+			}
+			parent.jumpTable[child.firstPC] = child
 		}
 	}
 	{

@@ -266,6 +266,12 @@ type MIRBasicBlock struct {
 	// Control-flow bookkeeping: indicates this block ends in a jump whose destination
 	// cannot be resolved at build time (dynamic JUMP/JUMPI). Interpreter may backfill CFG.
 	unresolvedJump bool
+	// jumpTable maps target firstPC → successor MIRBasicBlock for O(1) JUMP/JUMPI dispatch.
+	// For static targets it is populated by connectEdge at parse time; for dynamically
+	// discovered targets it is updated at runtime (via resolveBB → connectEdge).
+	// For unresolvedJump blocks it is additionally pre-warmed by preWarmJumpTables from
+	// incoming-stack constant scanning at the end of CFG.Parse().
+	jumpTable map[uint]*MIRBasicBlock
 }
 
 type evmOpAtPC struct {

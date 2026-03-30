@@ -726,6 +726,65 @@ func (it *MIRInterpreter) tagIncomingEpoch(from, to *MIRBasicBlock) {
 	to.preferredEntryHeight = len(s)
 }
 
+// refreshEdgeIfNeeded refreshes the incoming stack snapshot for the from→to edge when the
+// snapshot is stale or missing, so that PHI resolution has a concrete predecessor shape.
+// It must be called with from being the currently executing block.
+//
+// This is the extracted common logic shared by MirJUMP and MirJUMPI fast paths.  The
+// slow path (resolveBB) calls connectEdge directly, which also updates jumpTable.
+func (it *MIRInterpreter) refreshEdgeIfNeeded(prev, from, to *MIRBasicBlock) {
+	if it.cfg == nil {
+		return
+	}
+	// Only refresh when something might be stale: back-edges, unresolved blocks, or a
+	// runtime-dynamic CFG where calldata-dependent values must be re-materialized.
+	if !(it.cfg.runtimeBecameDynamic || from.unresolvedJump || to.unresolvedJump ||
+		to.firstPC <= from.firstPC || to.entryStack == nil) {
+		return
+	}
+	need := true
+	var oldSnap []Value
+	hadOld := false
+	if to.incomingStacks != nil {
+		if s, ok := to.incomingStacks[from]; ok {
+			oldSnap, hadOld = s, true
+			if to.entryStack != nil {
+				need = false
+			}
+		}
+	}
+	// In runtime-discovered dynamic CFGs the same edge can be traversed with different
+	// calldata-dependent values.  Keep (a small top-K) incoming snapshot fresh so
+	// stack-sensitive control-flow (jump tables) is compiled correctly.
+	var snap []Value
+	if it.cfg.runtimeEpoch != 0 && it.cfg.runtimeBecameDynamic {
+		snap = it.computeExitSnapshotForEdgeTo(prev, from, to)
+		snap = it.materializeSnapshotTopK(snap, 16)
+		if hadOld && stacksEqual(oldSnap, snap) {
+			need = false
+		} else {
+			need = true
+		}
+	}
+	if !need && it.cfg.runtimeEpoch != 0 {
+		// Keep incomingStacksGen aligned with the current epoch even when the snapshot
+		// itself hasn't changed; entry-stack rebuild logic uses this to prefer current
+		// run inputs and avoid stack-height underflows for SWAP/DUP-heavy blocks.
+		if to.incomingStacksGen == nil {
+			to.incomingStacksGen = make(map[*MIRBasicBlock]uint64, 8)
+		}
+		to.incomingStacksGen[from] = it.cfg.runtimeEpoch
+		return
+	}
+	if need {
+		if snap == nil {
+			snap = it.computeExitSnapshotForEdgeTo(prev, from, to)
+		}
+		// connectEdge also updates from.jumpTable[to.firstPC], keeping the table in sync.
+		it.cfg.connectEdge(from, to, snap)
+	}
+}
+
 // SetGasLimit enables out-of-gas checking. If limit==0, gas is tracked but never errors.
 func (it *MIRInterpreter) SetGasLimit(limit uint64) {
 	it.gasLimit = limit
@@ -2180,60 +2239,19 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 					return it.finishResult(ExecResult{Err: err})
 				}
 				target := uint(dest.Uint64())
-				// Fast path: static CFG edge already exists.
+				// Fast path: O(1) jump table lookup.
+				// Static targets are pre-populated by connectEdge during Parse().
+				// Dynamic targets are cached here after the first resolveBB call.
 				if cur != nil {
-					for _, ch := range cur.Children() {
-						if ch != nil && ch.firstPC == target {
-							// Even for forward static edges, if the target entry stack is currently invalidated,
-							// refresh the edge snapshot so PHI resolution has a concrete predecessor shape.
-							if it.cfg != nil && (it.cfg.runtimeBecameDynamic || cur.unresolvedJump || ch.unresolvedJump || ch.firstPC <= cur.firstPC || ch.entryStack == nil) {
-								need := true
-								oldSnap, hadOld := []Value(nil), false
-								if ch.incomingStacks != nil {
-									if s, ok := ch.incomingStacks[cur]; ok {
-										oldSnap, hadOld = s, true
-										if ch.entryStack != nil {
-											need = false
-										}
-									}
-								}
-								// In runtime-discovered dynamic CFGs, the same edge can be traversed with different
-								// calldata-dependent values. Keep (a small top-K) incoming snapshot fresh so stack-
-								// sensitive control-flow (jump tables) is compiled correctly.
-								var snap []Value
-								if it.cfg.runtimeEpoch != 0 && it.cfg.runtimeBecameDynamic {
-									snap = it.computeExitSnapshotForEdgeTo(prev, cur, ch)
-									snap = it.materializeSnapshotTopK(snap, 16)
-									if hadOld && stacksEqual(oldSnap, snap) {
-										need = false
-									} else {
-										need = true
-									}
-								}
-								if !need && it.cfg != nil && it.cfg.runtimeEpoch != 0 {
-									// Keep incomingStacksGen aligned with the current epoch even when the snapshot
-									// itself hasn't changed; entry-stack rebuild logic uses this to prefer current
-									// run inputs and avoid stack-height underflows for SWAP/DUP-heavy blocks.
-									if ch.incomingStacksGen == nil {
-										ch.incomingStacksGen = make(map[*MIRBasicBlock]uint64, 8)
-									}
-									ch.incomingStacksGen[cur] = it.cfg.runtimeEpoch
-								}
-								if need {
-									if snap == nil {
-										snap = it.computeExitSnapshotForEdgeTo(prev, cur, ch)
-									}
-									it.cfg.connectEdge(cur, ch, snap)
-								}
-							}
-							// Even when we skip connectEdge on static forward edges (perf), we must still
-							// tag the actually-taken predecessor edge for this runtime epoch.
-							it.tagIncomingEpoch(cur, ch)
-							prev, cur = cur, ch
-							break execBlock
-						}
+					if ch, ok := cur.jumpTable[target]; ok && ch != nil {
+						it.refreshEdgeIfNeeded(prev, cur, ch)
+						it.tagIncomingEpoch(cur, ch)
+						prev, cur = cur, ch
+						break execBlock
 					}
 				}
+				// Slow path: runtime analysis — validate target PC, build block if new,
+				// connect the edge (which also populates jumpTable for future fast-path hits).
 				nb, err := it.resolveBB(prev, cur, target)
 				if err != nil {
 					return it.finishResult(ExecResult{Err: err})
@@ -2252,52 +2270,19 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 				}
 				target := uint(dest.Uint64())
 				if !cond.IsZero() {
-					// Fast path: static CFG edge already exists.
+					// Fast path: O(1) jump table lookup.
+					// Static targets are pre-populated by connectEdge during Parse().
+					// Dynamic targets are cached here after the first resolveBB call.
 					if cur != nil {
-						for _, ch := range cur.Children() {
-							if ch != nil && ch.firstPC == target {
-								// Even for forward static edges, if the target entry stack is currently invalidated,
-								// refresh the edge snapshot so PHI resolution has a concrete predecessor shape.
-								if it.cfg != nil && (it.cfg.runtimeBecameDynamic || cur.unresolvedJump || ch.unresolvedJump || ch.firstPC <= cur.firstPC || ch.entryStack == nil) {
-									need := true
-									oldSnap, hadOld := []Value(nil), false
-									if ch.incomingStacks != nil {
-										if s, ok := ch.incomingStacks[cur]; ok {
-											oldSnap, hadOld = s, true
-											if ch.entryStack != nil {
-												need = false
-											}
-										}
-									}
-									var snap []Value
-									if it.cfg.runtimeEpoch != 0 && it.cfg.runtimeBecameDynamic {
-										snap = it.computeExitSnapshotForEdgeTo(prev, cur, ch)
-										snap = it.materializeSnapshotTopK(snap, 16)
-										if hadOld && stacksEqual(oldSnap, snap) {
-											need = false
-										} else {
-											need = true
-										}
-									}
-									if !need && it.cfg != nil && it.cfg.runtimeEpoch != 0 {
-										if ch.incomingStacksGen == nil {
-											ch.incomingStacksGen = make(map[*MIRBasicBlock]uint64, 8)
-										}
-										ch.incomingStacksGen[cur] = it.cfg.runtimeEpoch
-									}
-									if need {
-										if snap == nil {
-											snap = it.computeExitSnapshotForEdgeTo(prev, cur, ch)
-										}
-										it.cfg.connectEdge(cur, ch, snap)
-									}
-								}
-								it.tagIncomingEpoch(cur, ch)
-								prev, cur = cur, ch
-								break execBlock
-							}
+						if ch, ok := cur.jumpTable[target]; ok && ch != nil {
+							it.refreshEdgeIfNeeded(prev, cur, ch)
+							it.tagIncomingEpoch(cur, ch)
+							prev, cur = cur, ch
+							break execBlock
 						}
 					}
+					// Slow path: runtime analysis — validate target PC, build block if new,
+					// connect the edge (which also populates jumpTable for future fast-path hits).
 					nb, err := it.resolveBB(prev, cur, target)
 					if err != nil {
 						return it.finishResult(ExecResult{Err: err})
