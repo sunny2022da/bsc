@@ -1307,8 +1307,27 @@ retryBuild:
 					return nil
 				}
 			} else {
-				block.unresolvedJump = true
-				c.hasUnresolvedJumpsFlag = true
+				// Dynamic destination: attempt compile-time def-chain tracing.
+				// Handles the common multi-caller internal-function return pattern where
+				// dest is a MirPHI or a live-in constant from predecessor blocks.
+				candidates, allResolved := traceJumpDestCandidates(&dest, block, validJumpDests)
+				for _, target := range candidates {
+					targetBlock := c.getOrCreateBlock(target)
+					c.connectEdge(block, targetBlock, exitSnap)
+					// Self-loop: entry stack invalidated; request rebuild.
+					if targetBlock == block && block.entryStack == nil {
+						block.SetLastPC(pc + 1)
+						block.SetExitStack(exitSnap)
+						block.built = false
+						return nil
+					}
+				}
+				if !allResolved {
+					// At least one def-chain path was opaque; keep runtime backfill.
+					block.unresolvedJump = true
+					c.hasUnresolvedJumpsFlag = true
+				}
+				// allResolved==true: all successors statically known; no runtime backfill needed.
 			}
 
 			block.SetLastPC(pc + 1)
@@ -1362,9 +1381,22 @@ retryBuild:
 					return nil
 				}
 			} else {
-				// Dynamic target: keep fallthrough edge; runtime will resolve jump target and backfill CFG.
-				block.unresolvedJump = true
-				c.hasUnresolvedJumpsFlag = true
+				// Dynamic destination: attempt compile-time def-chain tracing.
+				candidates, allResolved := traceJumpDestCandidates(&dest, block, validJumpDests)
+				for _, target := range candidates {
+					targetBlock := c.getOrCreateBlock(target)
+					c.connectEdge(block, targetBlock, exitSnap)
+					if targetBlock == block && block.entryStack == nil {
+						block.SetLastPC(pc + 1)
+						block.SetExitStack(exitSnap)
+						block.built = false
+						return nil
+					}
+				}
+				if !allResolved {
+					block.unresolvedJump = true
+					c.hasUnresolvedJumpsFlag = true
+				}
 			}
 
 			block.SetLastPC(pc + 1)
@@ -1390,6 +1422,93 @@ retryBuild:
 }
 
 // Helpers
+
+const maxJumpTraceDepth = 6
+
+// traceJumpDestCandidates walks the def-chain of a JUMP/JUMPI destination Value to enumerate
+// all statically-known JUMPDEST target PCs reachable via compile-time constant propagation.
+//
+// It resolves:
+//   - Direct Konst values
+//   - MirPHI nodes (multi-caller return-address pattern)
+//   - Live-in Variables/Unknowns with a known liveInPos (looks up incomingStacks)
+//
+// Returns (targets, allResolved).
+// allResolved==true means every def-chain path terminated at a known constant (or a valid
+// non-JUMPDEST constant), so the caller can clear unresolvedJump for this block.
+func traceJumpDestCandidates(dest *Value, block *MIRBasicBlock, validJumpDests map[uint]bool) (targets []uint, allResolved bool) {
+	if dest == nil {
+		return nil, false
+	}
+	seenDef := make(map[*MIR]struct{}, 8)
+	foundSet := make(map[uint]struct{}, 4)
+	hitUnknown := false
+
+	var walk func(v *Value, depth int)
+	walk = func(v *Value, depth int) {
+		if v == nil || depth > maxJumpTraceDepth {
+			hitUnknown = true
+			return
+		}
+		switch v.kind {
+		case Konst:
+			target := constSnapToPC(v)
+			if target > 0 && validJumpDests[target] {
+				foundSet[target] = struct{}{}
+			}
+			// Non-JUMPDEST constant is a fully-resolved leaf (not a valid target, but known).
+
+		case Variable:
+			if v.def == nil {
+				// Def-less Variable that is a live-in: look up incomingStacks.
+				if v.liveIn && v.liveInPos >= 0 && block != nil {
+					for _, snap := range block.incomingStacks {
+						if v.liveInPos < len(snap) {
+							sv := snap[v.liveInPos]
+							walk(&sv, depth+1)
+						}
+					}
+					return
+				}
+				hitUnknown = true
+				return
+			}
+			// Guard against PHI cycles.
+			if _, ok := seenDef[v.def]; ok {
+				return
+			}
+			seenDef[v.def] = struct{}{}
+			if v.def.op == MirPHI {
+				// Recurse into every PHI input: each operand is the value from one predecessor.
+				for _, op := range v.def.operands {
+					walk(op, depth+1)
+				}
+				return
+			}
+			// Any other computed Variable (arithmetic, CALLDATALOAD, etc.) is opaque.
+			hitUnknown = true
+
+		default: // Unknown
+			// Live-in with a known position: resolve through all incoming snapshots.
+			if v.liveIn && v.liveInPos >= 0 && block != nil {
+				for _, snap := range block.incomingStacks {
+					if v.liveInPos < len(snap) {
+						sv := snap[v.liveInPos]
+						walk(&sv, depth+1)
+					}
+				}
+				return
+			}
+			hitUnknown = true
+		}
+	}
+	walk(dest, 0)
+
+	for t := range foundSet {
+		targets = append(targets, t)
+	}
+	return targets, len(targets) > 0 && !hitUnknown
+}
 
 func isStackOp(op compiler.ByteCode) bool {
 	return (op == compiler.PUSH0) ||
