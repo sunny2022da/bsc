@@ -1462,7 +1462,14 @@ func traceJumpDestCandidates(dest *Value, block *MIRBasicBlock, validJumpDests m
 			if v.def == nil {
 				// Def-less Variable that is a live-in: look up incomingStacks.
 				if v.liveIn && v.liveInPos >= 0 && block != nil {
-					for _, snap := range block.incomingStacks {
+					// Iterate in deterministic parent order so that the connectEdge calls
+					// driven by discovered candidates always append children in the same order,
+					// regardless of Go map iteration randomness.
+					for _, p := range block.parents {
+						snap, ok := block.incomingStacks[p]
+						if !ok {
+							continue
+						}
 						if v.liveInPos < len(snap) {
 							sv := snap[v.liveInPos]
 							walk(&sv, depth+1)
@@ -1491,7 +1498,12 @@ func traceJumpDestCandidates(dest *Value, block *MIRBasicBlock, validJumpDests m
 		default: // Unknown
 			// Live-in with a known position: resolve through all incoming snapshots.
 			if v.liveIn && v.liveInPos >= 0 && block != nil {
-				for _, snap := range block.incomingStacks {
+				// Same deterministic parent-order iteration as the Variable case above.
+				for _, p := range block.parents {
+					snap, ok := block.incomingStacks[p]
+					if !ok {
+						continue
+					}
 					if v.liveInPos < len(snap) {
 						sv := snap[v.liveInPos]
 						walk(&sv, depth+1)

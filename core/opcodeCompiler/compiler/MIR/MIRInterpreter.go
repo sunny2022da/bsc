@@ -759,7 +759,13 @@ func (it *MIRInterpreter) refreshEdgeIfNeeded(prev, from, to *MIRBasicBlock) {
 	var snap []Value
 	if it.cfg.runtimeEpoch != 0 && it.cfg.runtimeBecameDynamic {
 		snap = it.computeExitSnapshotForEdgeTo(prev, from, to)
-		snap = it.materializeSnapshotTopK(snap, 16)
+		// Back-edges (C→B loop jumps where to.firstPC <= from.firstPC) must NOT be
+		// materialized: their stack values change every iteration, so baking the current
+		// iteration's values as Konsts causes stale PHI operands on outer-loop re-entry
+		// (the same guard already exists in resolveBB and the block-entry refresh path).
+		if to.firstPC > from.firstPC {
+			snap = it.materializeSnapshotTopK(snap, 16)
+		}
 		if hadOld && stacksEqual(oldSnap, snap) {
 			need = false
 		} else {
@@ -964,11 +970,23 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 						// materialize the wrong permutation/values when duplicate constants or PHIs exist.
 						ex := it.computeExitSnapshotForEdgeTo(nil, prev, cur)
 						if ex != nil {
-							k := 64
-							if len(ex) < k {
-								k = len(ex)
+							var fresh []Value
+							// Back-edges (loop jumps where the target block appears earlier in the
+							// bytecode than the source) must NOT be materialized: their values change
+							// every iteration, so baking the current iteration's value as a Konst would
+							// produce stale constants when the outer loop re-enters the same block.
+							// Note: resolveBB already guards against this via its own firstPC check;
+							// this guard covers the block-entry refresh path which had no such check.
+							isBackEdge := cur.firstPC <= prev.firstPC
+							if isBackEdge {
+								fresh = ex
+							} else {
+								k := 64
+								if len(ex) < k {
+									k = len(ex)
+								}
+								fresh = it.materializeSnapshotTopK(ex, k)
 							}
-							fresh := it.materializeSnapshotTopK(ex, k)
 							// Avoid unnecessary edge updates: only connect if the snapshot is stale for this epoch
 							// or the values differ.
 							staleEpoch := false
@@ -2290,32 +2308,35 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 					prev, cur = cur, nb
 					break execBlock
 				}
-				// fallthrough: prefer the non-target child when we have a 2-way branch.
+				// fallthrough: cond == 0, so we take the non-jump successor (evmPC+1).
 				ftPC := m.evmPC + 1
 				var ft *MIRBasicBlock
-				children := cur.Children()
-				if len(children) == 2 {
-					// Prefer the successor that is not the jump target.
-					if children[0] != nil && children[0].firstPC != target {
-						ft = children[0]
-					} else if children[1] != nil && children[1].firstPC != target {
-						ft = children[1]
+				// Fast path: O(1) jumpTable lookup.
+				// The fallthrough block is connected first in buildBasicBlock (connectEdge before
+				// the taken-branch edge), so it is always present in jumpTable[ftPC].
+				// This correctly handles N>1 taken-branch targets (traceJumpDestCandidates), where
+				// cur has more than 2 children (fallthrough + N targets) and the old len==2 fast
+				// path was silently skipped, leaving only the O(N) scan.
+				if cur != nil {
+					if ch, ok := cur.jumpTable[ftPC]; ok && ch != nil {
+						ft = ch
 					}
 				}
 				if ft == nil {
-					// Fallback: choose the child whose firstPC == evmPC+1, else first child.
-					for _, ch := range children {
+					// Fallback: linear scan for transient states where jumpTable may be incomplete
+					// (e.g. before the first Parse() pass for this block has finished).
+					for _, ch := range cur.Children() {
 						if ch != nil && ch.firstPC == ftPC {
 							ft = ch
 							break
 						}
 					}
-				}
-				if ft == nil {
-					if len(children) == 0 {
-						return it.finishResult(ExecResult{HaltOp: MirSTOP})
+					if ft == nil {
+						if len(cur.Children()) == 0 {
+							return it.finishResult(ExecResult{HaltOp: MirSTOP})
+						}
+						ft = cur.Children()[0]
 					}
-					ft = children[0]
 				}
 				// Performance: avoid snapshotting fallthrough edges unless we are in an unresolved
 				// jump region. Static CFG fallthrough edges already have build-time snapshots.
