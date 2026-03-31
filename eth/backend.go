@@ -386,6 +386,12 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 		options.TxLookupLimit = -1
 	}
 
+	if config.EnableMIR {
+		log.Info("MIR contract runner enabled")
+	} else {
+		log.Info("MIR contract runner disabled")
+	}
+
 	if config.VMTrace != "" {
 		traceConfig := json.RawMessage("{}")
 		if config.VMTraceJsonConfig != "" {
