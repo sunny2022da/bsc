@@ -3351,16 +3351,29 @@ func summarizeBadBlock(block *types.Block, receipts []*types.Receipt, config *pa
 		badBlockGauge.Update(int64(badBlockRecords.Cardinality()))
 	}
 
+	var firstBadTx string
+	txs := block.Transactions()
+	if idx := len(receipts); idx < len(txs) {
+		tx := txs[idx]
+		firstBadTx = fmt.Sprintf("\n  index=%d hash=%v to=%v nonce=%v gas=%v gasPrice=%v",
+			idx, tx.Hash().Hex(), tx.To(), tx.Nonce(), tx.Gas(), tx.GasPrice())
+	} else if len(txs) > 0 {
+		firstBadTx = " (all txs processed, error in state validation)"
+	} else {
+		firstBadTx = " (no transactions)"
+	}
+
 	return fmt.Sprintf(`
 ########## BAD BLOCK #########
 Block: %v (%#x)
 Miner: %v
 Error: %v
+First bad tx: %v
 Platform: %v%v
 Chain config: %#v
 Receipts: %v
 ##############################
-`, block.Number(), block.Hash(), block.Coinbase(), err, platform, vcs, config, receiptString)
+`, block.Number(), block.Hash(), block.Coinbase(), err, firstBadTx, platform, vcs, config, receiptString)
 }
 
 // InsertHeaderChain attempts to insert the given header chain in to the local
