@@ -183,7 +183,19 @@ func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]b
 	if entry == nil {
 		e, err := getOrBuildCFGEntry(codeHash, contract.Code)
 		if err != nil {
-			return nil, err
+			// CFG parse failed (e.g. convergence limit exceeded). This is an MIR
+			// infrastructure failure, not an EVM execution error. Fall back to the
+			// base interpreter so execution result matches stock EVM exactly.
+			log.Error("MIR CFG parse failed, falling back to base interpreter",
+				"addr", contract.Address(),
+				"codeHash", codeHash,
+				"codeLen", len(contract.Code),
+				"err", err,
+			)
+			if r.baseIt == nil {
+				r.baseIt = vm.NewEVMInterpreter(r.evm)
+			}
+			return r.baseIt.Run(contract, input, readOnly)
 		}
 		entry = e
 		// If this CFG contains unresolved jumps, keep it in the runner-local cache so
