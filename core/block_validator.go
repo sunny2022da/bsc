@@ -23,6 +23,7 @@ import (
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/trie"
 )
@@ -170,6 +171,27 @@ func (v *BlockValidator) ValidateState(block *types.Block, statedb *state.StateD
 			// The receipt Trie's root (R = (Tr [[H1, R1], ... [Hn, Rn]]))
 			receiptSha := types.DeriveSha(res.Receipts, trie.NewStackTrie(nil))
 			if receiptSha != header.ReceiptHash {
+				log.Error("Receipt root hash mismatch",
+					"block", header.Number,
+					"blockHash", block.Hash(),
+					"remote", header.ReceiptHash,
+					"local", receiptSha,
+					"receipts", len(res.Receipts),
+				)
+				for i, r := range res.Receipts {
+					log.Error("Receipt detail",
+						"index", i,
+						"txHash", r.TxHash,
+						"type", r.Type,
+						"status", r.Status,
+						"postState", fmt.Sprintf("%x", r.PostState),
+						"cumulativeGasUsed", r.CumulativeGasUsed,
+						"gasUsed", r.GasUsed,
+						"contractAddress", r.ContractAddress,
+						"logs", len(r.Logs),
+						"bloom", fmt.Sprintf("%x", r.Bloom[:8]), // first 8 bytes of bloom
+					)
+				}
 				return fmt.Errorf("invalid receipt root hash (remote: %x local: %x)", header.ReceiptHash, receiptSha)
 			}
 

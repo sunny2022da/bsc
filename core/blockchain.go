@@ -25,6 +25,7 @@ import (
 	"runtime"
 	"slices"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -2648,6 +2649,11 @@ func (bc *BlockChain) ProcessBlock(parentRoot common.Hash, block *types.Block, s
 	vstart := time.Now()
 	if err := bc.validator.ValidateState(block, statedb, res, false); err != nil {
 		bc.reportBlock(block, res, err)
+		// If MIR was enabled and this is a receipt root mismatch, re-execute
+		// without MIR so we can compare receipts and isolate the divergence.
+		if bc.cfg.VmConfig.EnableMIR && strings.Contains(err.Error(), "invalid receipt root hash") {
+			bc.replayBlockWithoutMIRAndCompare(parentRoot, block, needBadSharedStorage, res.Receipts)
+		}
 		return nil, err
 	}
 	vtime := time.Since(vstart)
@@ -3374,6 +3380,74 @@ Chain config: %#v
 Receipts: %v
 ##############################
 `, block.Number(), block.Hash(), block.Coinbase(), err, firstBadTx, platform, vcs, config, receiptString)
+}
+
+// replayBlockWithoutMIRAndCompare re-executes block with MIR disabled, then
+// compares each receipt against mirReceipts to surface the first divergence.
+// It is called only when MIR produces an invalid receipt root hash so the diff
+// is printed before the node halts on the bad block.
+func (bc *BlockChain) replayBlockWithoutMIRAndCompare(parentRoot common.Hash, block *types.Block, needBadSharedStorage bool, mirReceipts types.Receipts) {
+	log.Warn("MIR receipt mismatch: replaying block without MIR for comparison",
+		"block", block.Number(), "hash", block.Hash())
+
+	noMIRCfg := bc.cfg.VmConfig
+	noMIRCfg.EnableMIR = false
+
+	replayDB, err := state.New(parentRoot, bc.statedb)
+	if err != nil {
+		log.Error("MIR replay: failed to create statedb", "err", err)
+		return
+	}
+	replayDB.SetExpectedStateRoot(block.Root())
+	replayDB.SetNeedBadSharedStorage(needBadSharedStorage)
+
+	res, err := bc.processor.Process(block, replayDB, noMIRCfg)
+	if err != nil {
+		log.Error("MIR replay: non-MIR execution failed", "block", block.Number(), "err", err)
+		return
+	}
+
+	baseReceipts := res.Receipts
+	log.Warn("MIR replay: execution complete",
+		"block", block.Number(),
+		"mirReceipts", len(mirReceipts),
+		"baseReceipts", len(baseReceipts),
+	)
+
+	n := len(mirReceipts)
+	if len(baseReceipts) < n {
+		n = len(baseReceipts)
+	}
+	foundDiff := false
+	for i := 0; i < n; i++ {
+		m, b := mirReceipts[i], baseReceipts[i]
+		if m.TxHash == b.TxHash &&
+			m.Status == b.Status &&
+			m.CumulativeGasUsed == b.CumulativeGasUsed &&
+			m.GasUsed == b.GasUsed &&
+			fmt.Sprintf("%x", m.PostState) == fmt.Sprintf("%x", b.PostState) &&
+			m.Bloom == b.Bloom &&
+			len(m.Logs) == len(b.Logs) {
+			continue
+		}
+		foundDiff = true
+		log.Error("MIR replay: receipt divergence",
+			"index", i,
+			"txHash", m.TxHash,
+			"mir.status", m.Status, "base.status", b.Status,
+			"mir.cumulativeGas", m.CumulativeGasUsed, "base.cumulativeGas", b.CumulativeGasUsed,
+			"mir.gasUsed", m.GasUsed, "base.gasUsed", b.GasUsed,
+			"mir.postState", fmt.Sprintf("%x", m.PostState), "base.postState", fmt.Sprintf("%x", b.PostState),
+			"mir.bloom[:8]", fmt.Sprintf("%x", m.Bloom[:8]), "base.bloom[:8]", fmt.Sprintf("%x", b.Bloom[:8]),
+			"mir.logs", len(m.Logs), "base.logs", len(b.Logs),
+		)
+	}
+	if len(mirReceipts) != len(baseReceipts) {
+		log.Error("MIR replay: receipt count mismatch",
+			"mir", len(mirReceipts), "base", len(baseReceipts))
+	} else if !foundDiff {
+		log.Warn("MIR replay: all receipt fields match — divergence may be in bloom or trie encoding")
+	}
 }
 
 // InsertHeaderChain attempts to insert the given header chain in to the local
