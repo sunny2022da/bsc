@@ -3601,6 +3601,27 @@ func (bc *BlockChain) traceCallTreeBothModes(parentRoot common.Hash, block *type
 			},
 		}
 
+		// Log intrinsic gas so we can see how much gas is left for execution.
+		rules := bc.chainConfig.Rules(header.Number, true, header.Time)
+		intrinsic, intrinsicErr := IntrinsicGas(msg.Data, msg.AccessList, msg.SetCodeAuthorizations,
+			msg.To == nil,
+			rules.IsHomestead,
+			rules.IsIstanbul, // IsIstanbul == EIP-2028
+			rules.IsShanghai, // IsShanghai == EIP-3860
+		)
+		gasAfterIntrinsic := uint64(0)
+		if intrinsicErr == nil && msg.GasLimit > intrinsic {
+			gasAfterIntrinsic = msg.GasLimit - intrinsic
+		}
+		log.Error("MIR calltree: tx gas budget",
+			"mode", label,
+			"txHash", tx.Hash(),
+			"tx.gasLimit", msg.GasLimit,
+			"intrinsicGas", intrinsic,
+			"intrinsicErr", intrinsicErr,
+			"gasAfterIntrinsic", gasAfterIntrinsic,
+		)
+
 		cfg := bc.cfg.VmConfig
 		cfg.EnableMIR = enableMIR
 		cfg.Tracer = hooks
@@ -3610,9 +3631,18 @@ func (bc *BlockChain) traceCallTreeBothModes(parentRoot common.Hash, block *type
 			evm.SetMIRRunner(mir.NewEVMRunner(evm))
 		}
 		gp := new(GasPool).AddGas(header.GasLimit)
-		ApplyMessage(evm, msg, gp) //nolint:errcheck — we only care about the trace
+		traceResult, _ := ApplyMessage(evm, msg, gp)
+		if traceResult != nil {
+			log.Error("MIR calltree: ApplyMessage result",
+				"mode", label,
+				"usedGas", traceResult.UsedGas,
+				"err", traceResult.Err,
+				"failed", traceResult.Failed(),
+			)
+		}
 
 		for _, f := range frames {
+			overflow := f.gasIn > msg.GasLimit && msg.GasLimit > 0
 			log.Error("MIR calltree",
 				"mode", label,
 				"callIdx", f.callIdx,
@@ -3623,6 +3653,7 @@ func (bc *BlockChain) traceCallTreeBothModes(parentRoot common.Hash, block *type
 				"gasIn", f.gasIn,
 				"gasUsed", f.gasUsed,
 				"err", f.err,
+				"gasOverflow", overflow,
 			)
 		}
 		return frames
