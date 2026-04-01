@@ -10,8 +10,12 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
 )
+
+// mirRunnerDebugLog is true when MIR_DEBUG_LOG=1 is set.
+var mirRunnerDebugLog = os.Getenv("MIR_DEBUG_LOG") == "1"
 
 // EVMRunner adapts MIRInterpreter to the vm.ContractRunner interface so vm.EVM
 // can dispatch top-level executions into MIR without importing the MIR package.
@@ -120,6 +124,9 @@ func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]b
 	//
 	// Note: this is a deliberate performance trade-off; correctness remains native-EVM.
 	if len(contract.Code) > 2048 {
+		if mirRunnerDebugLog {
+			log.Debug("MIR runner: large-code fast-path (optIt)", "addr", contract.Address(), "codeLen", len(contract.Code))
+		}
 		if r.optIt == nil {
 			r.optIt = vm.NewEVMInterpreter(r.evm)
 			r.optIt.CopyAndInstallSuperInstruction()
@@ -191,6 +198,14 @@ func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]b
 	//
 	// NOTE: This still preserves native EVM semantics; it's purely a performance dispatch choice.
 	if cfg != nil && (cfg.needsRuntimeEpoch() || len(contract.Code) > 2048) {
+		if mirRunnerDebugLog {
+			log.Debug("MIR runner: perf fast-path (optIt)",
+				"addr", contract.Address(),
+				"codeHash", codeHash,
+				"codeLen", len(contract.Code),
+				"needsRuntimeEpoch", cfg.needsRuntimeEpoch(),
+			)
+		}
 		if r.optIt == nil {
 			r.optIt = vm.NewEVMInterpreter(r.evm)
 			r.optIt.CopyAndInstallSuperInstruction()
@@ -203,6 +218,13 @@ func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]b
 	// Until MIR can guarantee parity for dynamic jump tables, execute these contracts with
 	// the native interpreter.
 	if cfg != nil && cfg.hasUnresolvedJumps() {
+		if mirRunnerDebugLog {
+			log.Debug("MIR runner: unresolved-jumps fallback (baseIt)",
+				"addr", contract.Address(),
+				"codeHash", codeHash,
+				"codeLen", len(contract.Code),
+			)
+		}
 		if r.baseIt == nil {
 			r.baseIt = vm.NewEVMInterpreter(r.evm)
 		}
@@ -280,7 +302,25 @@ func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]b
 	it.vmStateDB = r.stateBackend.db
 	it.callCreate = &r.callBackend
 
+	if mirRunnerDebugLog {
+		log.Debug("MIR runner: executing MIR interpreter",
+			"addr", contract.Address(),
+			"codeHash", codeHash,
+			"codeLen", len(contract.Code),
+			"gasIn", contract.Gas,
+		)
+	}
 	res := it.Run()
+	if mirRunnerDebugLog {
+		log.Debug("MIR runner: interpreter done",
+			"addr", contract.Address(),
+			"codeHash", codeHash,
+			"gasLeft", res.GasLeft,
+			"retLen", len(res.ReturnData),
+			"runtimeBecameDynamic", cfg.runtimeBecameDynamic,
+			"err", res.Err,
+		)
+	}
 	if res.Err != nil && os.Getenv("MIR_DUMP_ON_ERROR") != "" {
 		// Debug-only: enrich "missing result for def" failures with a local MIR dump around the faulting PC.
 		if strings.Contains(res.Err.Error(), "missing result for def") && cfg != nil {

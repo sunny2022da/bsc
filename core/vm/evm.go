@@ -19,6 +19,7 @@ package vm
 import (
 	"errors"
 	"math/big"
+	"os"
 	"sync/atomic"
 
 	"github.com/holiman/uint256"
@@ -78,6 +79,10 @@ var (
 	mirTopLevelFallbacks atomic.Uint64
 	mirTopLevelLogsTick  atomic.Uint64
 )
+
+// mirDebugLog is true when MIR_DEBUG_LOG=1 is set in the environment.
+// Enables per-call verbose logging to help diagnose BAD BLOCK / state-root mismatches.
+var mirDebugLog = os.Getenv("MIR_DEBUG_LOG") == "1"
 
 func maybeLogMIRCounters() {
 	// Throttle: log at most once per 4096 MIR attempts.
@@ -369,8 +374,33 @@ func (evm *EVM) Call(caller common.Address, addr common.Address, input []byte, g
 				defer ReturnContract(contract)
 				contract.IsSystemCall = isSystemCall(caller)
 				// IMPORTANT: run raw code (not optimized/super-instructions), since MIR parses EVM bytecode.
-				contract.SetCallCode(&addr, evm.resolveCodeHash(addr), code)
+				codeHash := evm.resolveCodeHash(addr)
+				contract.SetCallCode(&addr, codeHash, code)
+				if mirDebugLog {
+					log.Debug("MIR dispatch",
+						"origin", evm.Origin,
+						"to", addr,
+						"codeHash", codeHash,
+						"codeLen", len(code),
+						"gasIn", gas,
+						"inputLen", len(input),
+					)
+				}
 				ret, err = evm.runWithRunner(evm.mirRunner, contract, input, false)
+				if mirDebugLog {
+					retHash := crypto.Keccak256Hash(ret)
+					log.Debug("MIR result",
+						"origin", evm.Origin,
+						"to", addr,
+						"codeHash", codeHash,
+						"gasIn", gas,
+						"gasOut", contract.Gas,
+						"gasUsed", gas-contract.Gas,
+						"retLen", len(ret),
+						"retHash", retHash,
+						"err", err,
+					)
+				}
 				if err == nil {
 					mirTopLevelSucceeded.Add(1)
 					maybeLogMIRCounters()

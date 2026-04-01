@@ -39,6 +39,7 @@ import (
 	"github.com/ethereum/go-ethereum/consensus/misc/eip4844"
 	"github.com/ethereum/go-ethereum/core/history"
 	"github.com/ethereum/go-ethereum/core/monitor"
+	mir "github.com/ethereum/go-ethereum/core/opcodeCompiler/compiler/MIR"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/state/snapshot"
@@ -3431,6 +3432,7 @@ func (bc *BlockChain) replayBlockWithoutMIRAndCompare(parentRoot common.Hash, bl
 			log.Error("MIR replay: TransactionToMessage failed", "txIdx", txIdx, "tx", tx.Hash(), "err", err2)
 			return
 		}
+		snap := replayDB.Snapshot()
 		replayDB.SetTxContext(tx.Hash(), txIdx)
 
 		result, err2 := ApplyMessage(evm, msg, gp)
@@ -3477,7 +3479,6 @@ func (bc *BlockChain) replayBlockWithoutMIRAndCompare(parentRoot common.Hash, bl
 				"base.gasUsed", result.UsedGas,
 				"mir.gasUsed", mirR.GasUsed,
 			)
-			// Log the tx details to aid further debugging.
 			log.Error("MIR replay: diverging tx detail",
 				"txIdx", txIdx,
 				"txHash", tx.Hash(),
@@ -3488,6 +3489,9 @@ func (bc *BlockChain) replayBlockWithoutMIRAndCompare(parentRoot common.Hash, bl
 				"value", tx.Value(),
 				"dataLen", len(tx.Data()),
 			)
+			// Re-run the same tx twice (MIR on vs off) with an OnEnter/OnExit
+			// tracer so we can see exactly where gas diverges in the call tree.
+			bc.traceCallTreeBothModes(replayDB, snap, blockContext, header, tx, msg, txIdx)
 		} else if mirR.CumulativeGasUsed != usedGas || mirR.GasUsed != result.UsedGas {
 			foundDiff = true
 			log.Error("MIR replay: gas divergence found",
@@ -3505,6 +3509,110 @@ func (bc *BlockChain) replayBlockWithoutMIRAndCompare(parentRoot common.Hash, bl
 	if !foundDiff {
 		log.Warn("MIR replay: no per-tx status/gas divergence found — mismatch may be in logs or bloom",
 			"block", block.Number())
+	}
+}
+
+// traceCallTreeBothModes runs the given tx twice — once with MIR enabled and
+// once without — from the same state snapshot, attaching OnEnter/OnExit hooks
+// to log every call frame's gas-in / gas-out / error so the call trees can be
+// compared side by side in the log.
+func (bc *BlockChain) traceCallTreeBothModes(statedb *state.StateDB, snap int, blockCtx vm.BlockContext, header *types.Header, tx *types.Transaction, msg *Message, txIdx int) {
+	type callFrame struct {
+		callIdx int
+		depth   int
+		typ     byte
+		from    common.Address
+		to      common.Address
+		gasIn   uint64
+		gasUsed uint64
+		err     error
+	}
+
+	runWithTracer := func(label string, enableMIR bool) []callFrame {
+		statedb.RevertToSnapshot(snap)
+		statedb.SetTxContext(tx.Hash(), txIdx)
+
+		frames := make([]callFrame, 0, 16)
+		idx := 0
+		stack := make([]int, 0, 8) // indices into frames for open calls
+
+		hooks := &tracing.Hooks{
+			OnEnter: func(depth int, typ byte, from, to common.Address, input []byte, gas uint64, value *big.Int) {
+				frames = append(frames, callFrame{
+					callIdx: idx,
+					depth:   depth,
+					typ:     typ,
+					from:    from,
+					to:      to,
+					gasIn:   gas,
+				})
+				stack = append(stack, idx)
+				idx++
+			},
+			OnExit: func(depth int, output []byte, gasUsed uint64, err error, reverted bool) {
+				if len(stack) == 0 {
+					return
+				}
+				top := stack[len(stack)-1]
+				stack = stack[:len(stack)-1]
+				frames[top].gasUsed = gasUsed
+				frames[top].err = err
+			},
+		}
+
+		cfg := bc.cfg.VmConfig
+		cfg.EnableMIR = enableMIR
+		cfg.Tracer = hooks
+		tracingDB := state.NewHookedState(statedb, hooks)
+		evm := vm.NewEVM(blockCtx, tracingDB, bc.chainConfig, cfg)
+		if enableMIR {
+			evm.SetMIRRunner(mir.NewEVMRunner(evm))
+		}
+		gp := new(GasPool).AddGas(header.GasLimit)
+		ApplyMessage(evm, msg, gp) //nolint:errcheck — we only care about the trace
+
+		for _, f := range frames {
+			log.Error("MIR calltree",
+				"mode", label,
+				"callIdx", f.callIdx,
+				"depth", f.depth,
+				"op", vm.OpCode(f.typ).String(),
+				"from", f.from,
+				"to", f.to,
+				"gasIn", f.gasIn,
+				"gasUsed", f.gasUsed,
+				"err", f.err,
+			)
+		}
+		return frames
+	}
+
+	mirFrames := runWithTracer("MIR", true)
+	baseFrames := runWithTracer("base", false)
+
+	// Diff: find first callIdx where gasUsed or err diverges.
+	n := len(mirFrames)
+	if len(baseFrames) < n {
+		n = len(baseFrames)
+	}
+	for i := 0; i < n; i++ {
+		m, b := mirFrames[i], baseFrames[i]
+		if m.gasUsed != b.gasUsed || m.err != b.err {
+			log.Error("MIR calltree: first diverging call",
+				"callIdx", i,
+				"depth", m.depth,
+				"op", vm.OpCode(m.typ).String(),
+				"to", m.to,
+				"mir.gasIn", m.gasIn, "base.gasIn", b.gasIn,
+				"mir.gasUsed", m.gasUsed, "base.gasUsed", b.gasUsed,
+				"mir.err", m.err, "base.err", b.err,
+			)
+			break
+		}
+	}
+	if len(mirFrames) != len(baseFrames) {
+		log.Error("MIR calltree: call count differs",
+			"mir.calls", len(mirFrames), "base.calls", len(baseFrames))
 	}
 }
 
