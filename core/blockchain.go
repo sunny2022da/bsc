@@ -3382,10 +3382,10 @@ Receipts: %v
 `, block.Number(), block.Hash(), block.Coinbase(), err, firstBadTx, platform, vcs, config, receiptString)
 }
 
-// replayBlockWithoutMIRAndCompare re-executes block with MIR disabled, then
-// compares each receipt against mirReceipts to surface the first divergence.
-// It is called only when MIR produces an invalid receipt root hash so the diff
-// is printed before the node halts on the bad block.
+// replayBlockWithoutMIRAndCompare re-executes block with MIR disabled tx-by-tx,
+// capturing ExecutionResult for each transaction so that when a receipt status
+// diverges from the MIR run, the revert error and return data can be logged.
+// It is called only when MIR produces an invalid receipt root hash.
 func (bc *BlockChain) replayBlockWithoutMIRAndCompare(parentRoot common.Hash, block *types.Block, needBadSharedStorage bool, mirReceipts types.Receipts) {
 	log.Warn("MIR receipt mismatch: replaying block without MIR for comparison",
 		"block", block.Number(), "hash", block.Hash())
@@ -3401,52 +3401,110 @@ func (bc *BlockChain) replayBlockWithoutMIRAndCompare(parentRoot common.Hash, bl
 	replayDB.SetExpectedStateRoot(block.Root())
 	replayDB.SetNeedBadSharedStorage(needBadSharedStorage)
 
-	res, err := bc.processor.Process(block, replayDB, noMIRCfg)
-	if err != nil {
-		log.Error("MIR replay: non-MIR execution failed", "block", block.Number(), "err", err)
-		return
-	}
+	header := block.Header()
+	signer := types.MakeSigner(bc.chainConfig, header.Number, header.Time)
+	blockContext := NewEVMBlockContext(header, bc, nil)
+	evm := vm.NewEVM(blockContext, replayDB, bc.chainConfig, noMIRCfg)
+	gp := new(GasPool).AddGas(block.GasLimit())
+	usedGas := uint64(0)
 
-	baseReceipts := res.Receipts
-	log.Warn("MIR replay: execution complete",
-		"block", block.Number(),
-		"mirReceipts", len(mirReceipts),
-		"baseReceipts", len(baseReceipts),
-	)
+	posa, isPoSA := bc.Engine().(consensus.PoSA)
 
-	n := len(mirReceipts)
-	if len(baseReceipts) < n {
-		n = len(baseReceipts)
-	}
+	// receiptIdx tracks which mirReceipt we are comparing against; system txs
+	// are not included in receipts so we skip them for comparison purposes.
+	receiptIdx := 0
 	foundDiff := false
-	for i := 0; i < n; i++ {
-		m, b := mirReceipts[i], baseReceipts[i]
-		if m.TxHash == b.TxHash &&
-			m.Status == b.Status &&
-			m.CumulativeGasUsed == b.CumulativeGasUsed &&
-			m.GasUsed == b.GasUsed &&
-			fmt.Sprintf("%x", m.PostState) == fmt.Sprintf("%x", b.PostState) &&
-			m.Bloom == b.Bloom &&
-			len(m.Logs) == len(b.Logs) {
-			continue
+
+	for txIdx, tx := range block.Transactions() {
+		// Skip PoSA system transactions — they don't appear in receipts.
+		if isPoSA {
+			if isSystem, err2 := posa.IsSystemTransaction(tx, header); err2 != nil {
+				log.Error("MIR replay: IsSystemTransaction error", "txIdx", txIdx, "err", err2)
+				return
+			} else if isSystem {
+				continue
+			}
 		}
-		foundDiff = true
-		log.Error("MIR replay: receipt divergence",
-			"index", i,
-			"txHash", m.TxHash,
-			"mir.status", m.Status, "base.status", b.Status,
-			"mir.cumulativeGas", m.CumulativeGasUsed, "base.cumulativeGas", b.CumulativeGasUsed,
-			"mir.gasUsed", m.GasUsed, "base.gasUsed", b.GasUsed,
-			"mir.postState", fmt.Sprintf("%x", m.PostState), "base.postState", fmt.Sprintf("%x", b.PostState),
-			"mir.bloom[:8]", fmt.Sprintf("%x", m.Bloom[:8]), "base.bloom[:8]", fmt.Sprintf("%x", b.Bloom[:8]),
-			"mir.logs", len(m.Logs), "base.logs", len(b.Logs),
-		)
+
+		msg, err2 := TransactionToMessage(tx, signer, header.BaseFee)
+		if err2 != nil {
+			log.Error("MIR replay: TransactionToMessage failed", "txIdx", txIdx, "tx", tx.Hash(), "err", err2)
+			return
+		}
+		replayDB.SetTxContext(tx.Hash(), txIdx)
+
+		result, err2 := ApplyMessage(evm, msg, gp)
+		if err2 != nil {
+			// Hard error (e.g. gas pool exhausted) — not a MIR divergence.
+			log.Error("MIR replay: ApplyMessage hard error", "txIdx", txIdx, "tx", tx.Hash(), "err", err2)
+			return
+		}
+
+		// Finalise state changes for this tx (Byzantium+).
+		if bc.chainConfig.IsByzantium(block.Number()) {
+			replayDB.Finalise(true)
+		}
+		usedGas += result.UsedGas
+
+		// Compare with the corresponding MIR receipt.
+		if receiptIdx >= len(mirReceipts) {
+			log.Error("MIR replay: more non-system txs than MIR receipts",
+				"txIdx", txIdx, "receiptIdx", receiptIdx, "mirReceipts", len(mirReceipts))
+			return
+		}
+		mirR := mirReceipts[receiptIdx]
+
+		baseStatus := uint64(types.ReceiptStatusSuccessful)
+		if result.Failed() {
+			baseStatus = types.ReceiptStatusFailed
+		}
+
+		if mirR.Status != baseStatus {
+			foundDiff = true
+			revertReason := ""
+			if rev := result.Revert(); len(rev) > 0 {
+				revertReason = fmt.Sprintf("%x", rev)
+			}
+			log.Error("MIR replay: status divergence found",
+				"block", block.Number(),
+				"txIdx", txIdx,
+				"receiptIdx", receiptIdx,
+				"txHash", tx.Hash(),
+				"mir.status", mirR.Status,
+				"base.status", baseStatus,
+				"base.err", result.Err,
+				"base.revertData", revertReason,
+				"base.gasUsed", result.UsedGas,
+				"mir.gasUsed", mirR.GasUsed,
+			)
+			// Log the tx details to aid further debugging.
+			log.Error("MIR replay: diverging tx detail",
+				"txIdx", txIdx,
+				"txHash", tx.Hash(),
+				"to", tx.To(),
+				"nonce", tx.Nonce(),
+				"gas", tx.Gas(),
+				"gasPrice", tx.GasPrice(),
+				"value", tx.Value(),
+				"dataLen", len(tx.Data()),
+			)
+		} else if mirR.CumulativeGasUsed != usedGas || mirR.GasUsed != result.UsedGas {
+			foundDiff = true
+			log.Error("MIR replay: gas divergence found",
+				"block", block.Number(),
+				"txIdx", txIdx,
+				"txHash", tx.Hash(),
+				"mir.cumulativeGas", mirR.CumulativeGasUsed, "base.cumulativeGas", usedGas,
+				"mir.gasUsed", mirR.GasUsed, "base.gasUsed", result.UsedGas,
+			)
+		}
+
+		receiptIdx++
 	}
-	if len(mirReceipts) != len(baseReceipts) {
-		log.Error("MIR replay: receipt count mismatch",
-			"mir", len(mirReceipts), "base", len(baseReceipts))
-	} else if !foundDiff {
-		log.Warn("MIR replay: all receipt fields match — divergence may be in bloom or trie encoding")
+
+	if !foundDiff {
+		log.Warn("MIR replay: no per-tx status/gas divergence found — mismatch may be in logs or bloom",
+			"block", block.Number())
 	}
 }
 
