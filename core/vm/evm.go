@@ -387,6 +387,18 @@ func (evm *EVM) Call(caller common.Address, addr common.Address, input []byte, g
 					)
 				}
 				ret, err = evm.runWithRunner(evm.mirRunner, contract, input, false)
+				gasUsedByMIR := uint64(0)
+				gasReturnedByMIR := contract.Gas
+				if gasReturnedByMIR <= gas {
+					gasUsedByMIR = gas - gasReturnedByMIR
+				} else {
+					// contract.Gas > gasIn: MIR returned more gas than it received — underflow bug.
+					log.Error("MIR gas underflow: runner returned more gas than provided",
+						"to", addr,
+						"gasIn", gas,
+						"gasOut", contract.Gas,
+					)
+				}
 				if mirDebugLog {
 					retHash := crypto.Keccak256Hash(ret)
 					log.Debug("MIR result",
@@ -394,8 +406,8 @@ func (evm *EVM) Call(caller common.Address, addr common.Address, input []byte, g
 						"to", addr,
 						"codeHash", codeHash,
 						"gasIn", gas,
-						"gasOut", contract.Gas,
-						"gasUsed", gas-contract.Gas,
+						"gasOut", gasReturnedByMIR,
+						"gasUsed", gasUsedByMIR,
 						"retLen", len(ret),
 						"retHash", retHash,
 						"err", err,
@@ -405,7 +417,7 @@ func (evm *EVM) Call(caller common.Address, addr common.Address, input []byte, g
 					mirTopLevelSucceeded.Add(1)
 					maybeLogMIRCounters()
 				}
-				gas = contract.Gas
+				gas = gasReturnedByMIR
 			} else if evm.Config.EnableOpcodeOptimizations {
 				addrCopy := addr
 				// If the account has no code, we can abort here
