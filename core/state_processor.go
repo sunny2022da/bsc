@@ -184,7 +184,9 @@ func (p *StateProcessor) Process(block *types.Block, statedb *state.StateDB, cfg
 	// Finalize the block, applying any consensus engine specific extras (e.g. block rewards)
 	err = p.chain.Engine().Finalize(p.chain, header, tracingStateDB, &commonTxs, block.Uncles(), block.Withdrawals(), &receipts, &systemTxs, usedGas, cfg.Tracer)
 	if err != nil {
-		return nil, err
+		// Return partial receipts (user txs processed before Finalize failed) so
+		// callers can compare them for debugging (e.g. MIR vs base replay).
+		return &ProcessResult{Receipts: receipts, GasUsed: *usedGas}, err
 	}
 	for _, receipt := range receipts {
 		allLogs = append(allLogs, receipt.Logs...)
