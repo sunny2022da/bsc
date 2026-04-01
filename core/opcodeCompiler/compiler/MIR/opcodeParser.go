@@ -210,6 +210,16 @@ func (c *CFG) Parse() error {
 	maxBuilds := 1024 + 64*len(c.rawCode)
 	builds := 0
 
+	// Per-block rebuild limit: non-convergent CFGs (e.g. pre-Solidity-0.5 dynamic function returns
+	// combined with loop back-edges) cause a small set of blocks to oscillate indefinitely. Each
+	// oscillation cycle increments only a few blocks' counts rather than the total, so detecting a
+	// single block exceeding this limit catches the pathology orders-of-magnitude faster than the
+	// global maxBuilds limit. 64 is well above what any normally convergent CFG requires (~3–10
+	// rebuilds even for complex PHI merges), yet far below the thousands of cycles a non-convergent
+	// CFG would need.
+	const maxBuildsPerBlock = 64
+	blockBuilds := make(map[*MIRBasicBlock]int, len(c.basicBlocks)+16)
+
 	for len(queue) > 0 {
 		block := queue[0]
 		queue = queue[1:]
@@ -229,7 +239,8 @@ func (c *CFG) Parse() error {
 
 		// Build the block (emit MIR instructions)
 		builds++
-		if builds > maxBuilds {
+		blockBuilds[block]++
+		if builds > maxBuilds || blockBuilds[block] > maxBuildsPerBlock {
 			return &CFGNonConvergentError{
 				Builds:    builds,
 				MaxBuilds: maxBuilds,
