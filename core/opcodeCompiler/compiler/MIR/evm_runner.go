@@ -118,12 +118,15 @@ func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]b
 	}
 
 	// MIRInterpreter treats gasLimit==0 as "unlimited gas" (tools/test mode).
-	// When contract.Gas is genuinely zero, execution must fail with OOG immediately —
-	// passing 0 to the interpreter would cause gasLeft() to return MaxUint64 and
-	// subcall gas calculations (e.g. CREATE2: gasToSend = MaxUint64 - MaxUint64/64)
-	// to overflow, producing wildly incorrect gas values.
+	// When contract.Gas is genuinely zero, passing 0 would trigger that mode and cause
+	// gasLeft() to return MaxUint64, making subcall gas calculations overflow wildly.
+	// Delegate to the base interpreter to get exact stock-EVM semantics (e.g. STOP at
+	// position 0 with gas=0 succeeds in stock EVM; ErrOutOfGas would be wrong there).
 	if contract.Gas == 0 {
-		return nil, vm.ErrOutOfGas
+		if r.baseIt == nil {
+			r.baseIt = vm.NewEVMInterpreter(r.evm)
+		}
+		return r.baseIt.Run(contract, input, readOnly)
 	}
 
 	// Perf gate fast-path (vm/runtime, common view calls):
