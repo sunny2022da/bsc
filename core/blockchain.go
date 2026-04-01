@@ -25,7 +25,6 @@ import (
 	"runtime"
 	"slices"
 	"sort"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -2642,6 +2641,13 @@ func (bc *BlockChain) ProcessBlock(parentRoot common.Hash, block *types.Block, s
 	res, err := bc.processor.Process(block, statedb, bc.cfg.VmConfig)
 	if err != nil {
 		bc.reportBlock(block, res, err)
+		if bc.cfg.VmConfig.EnableMIR && isMIRReplayableError(err.Error()) {
+			var mirReceipts types.Receipts
+			if res != nil {
+				mirReceipts = res.Receipts
+			}
+			bc.replayBlockWithoutMIRAndCompare(parentRoot, block, needBadSharedStorage, mirReceipts)
+		}
 		return nil, err
 	}
 	ptime := time.Since(pstart)
@@ -2650,9 +2656,7 @@ func (bc *BlockChain) ProcessBlock(parentRoot common.Hash, block *types.Block, s
 	vstart := time.Now()
 	if err := bc.validator.ValidateState(block, statedb, res, false); err != nil {
 		bc.reportBlock(block, res, err)
-		// If MIR was enabled and this is a receipt root mismatch, re-execute
-		// without MIR so we can compare receipts and isolate the divergence.
-		if bc.cfg.VmConfig.EnableMIR && strings.Contains(err.Error(), "invalid receipt root hash") {
+		if bc.cfg.VmConfig.EnableMIR && isMIRReplayableError(err.Error()) {
 			bc.replayBlockWithoutMIRAndCompare(parentRoot, block, needBadSharedStorage, res.Receipts)
 		}
 		return nil, err
@@ -3383,6 +3387,28 @@ Receipts: %v
 `, block.Number(), block.Hash(), block.Coinbase(), err, firstBadTx, platform, vcs, config, receiptString)
 }
 
+// isMIRReplayableError returns true for errors where replaying without MIR can
+// help isolate the divergence. Covers receipt root mismatches and PoSA system-tx
+// hash mismatches (which indicate wrong gas usage → wrong fee credited to SystemAddress).
+func isMIRReplayableError(msg string) bool {
+	for _, substr := range []string{
+		"invalid receipt root hash",
+		"expected tx hash",
+	} {
+		found := false
+		for i := 0; i+len(substr) <= len(msg); i++ {
+			if msg[i:i+len(substr)] == substr {
+				found = true
+				break
+			}
+		}
+		if found {
+			return true
+		}
+	}
+	return false
+}
+
 // replayBlockWithoutMIRAndCompare re-executes block with MIR disabled tx-by-tx,
 // capturing ExecutionResult for each transaction so that when a receipt status
 // diverges from the MIR run, the revert error and return data can be logged.
@@ -3447,66 +3473,87 @@ func (bc *BlockChain) replayBlockWithoutMIRAndCompare(parentRoot common.Hash, bl
 		}
 		usedGas += result.UsedGas
 
-		// Compare with the corresponding MIR receipt.
-		if receiptIdx >= len(mirReceipts) {
-			log.Error("MIR replay: more non-system txs than MIR receipts",
-				"txIdx", txIdx, "receiptIdx", receiptIdx, "mirReceipts", len(mirReceipts))
-			return
-		}
-		mirR := mirReceipts[receiptIdx]
+		// Always log SystemAddress balance after each tx — this is the fee
+		// accumulator that drives PoSA system tx values. A divergence here
+		// means a prior tx consumed a different amount of gas under MIR.
+		baseSysBal := replayDB.GetBalance(consensus.SystemAddress)
+		log.Info("MIR replay: per-tx fee accumulator",
+			"block", block.Number(),
+			"txIdx", txIdx,
+			"txHash", tx.Hash(),
+			"base.gasUsed", result.UsedGas,
+			"base.sysBal", baseSysBal,
+		)
 
-		baseStatus := uint64(types.ReceiptStatusSuccessful)
-		if result.Failed() {
-			baseStatus = types.ReceiptStatusFailed
-		}
+		// Compare with the corresponding MIR receipt (when available).
+		if receiptIdx < len(mirReceipts) {
+			mirR := mirReceipts[receiptIdx]
 
-		if mirR.Status != baseStatus {
-			foundDiff = true
-			revertReason := ""
-			if rev := result.Revert(); len(rev) > 0 {
-				revertReason = fmt.Sprintf("%x", rev)
+			baseStatus := uint64(types.ReceiptStatusSuccessful)
+			if result.Failed() {
+				baseStatus = types.ReceiptStatusFailed
 			}
-			log.Error("MIR replay: status divergence found",
-				"block", block.Number(),
-				"txIdx", txIdx,
-				"receiptIdx", receiptIdx,
-				"txHash", tx.Hash(),
-				"mir.status", mirR.Status,
-				"base.status", baseStatus,
-				"base.err", result.Err,
-				"base.revertData", revertReason,
-				"base.gasUsed", result.UsedGas,
-				"mir.gasUsed", mirR.GasUsed,
-			)
-			log.Error("MIR replay: diverging tx detail",
-				"txIdx", txIdx,
-				"txHash", tx.Hash(),
-				"to", tx.To(),
-				"nonce", tx.Nonce(),
-				"gas", tx.Gas(),
-				"gasPrice", tx.GasPrice(),
-				"value", tx.Value(),
-				"dataLen", len(tx.Data()),
-			)
-			// Re-run the same tx twice (MIR on vs off) with an OnEnter/OnExit
-			// tracer so we can see exactly where gas diverges in the call tree.
-			bc.traceCallTreeBothModes(parentRoot, block, blockContext, header, tx, msg, txIdx)
-		} else if mirR.CumulativeGasUsed != usedGas || mirR.GasUsed != result.UsedGas {
-			foundDiff = true
-			log.Error("MIR replay: gas divergence found",
-				"block", block.Number(),
-				"txIdx", txIdx,
-				"txHash", tx.Hash(),
-				"mir.cumulativeGas", mirR.CumulativeGasUsed, "base.cumulativeGas", usedGas,
-				"mir.gasUsed", mirR.GasUsed, "base.gasUsed", result.UsedGas,
-			)
-		}
 
-		receiptIdx++
+			// Compute what MIR's fee contribution for this tx should have been.
+			mirFee := new(big.Int).SetUint64(mirR.GasUsed)
+			mirFee.Mul(mirFee, tx.GasPrice())
+			baseFee := new(big.Int).SetUint64(result.UsedGas)
+			baseFee.Mul(baseFee, tx.GasPrice())
+
+			if mirR.Status != baseStatus {
+				foundDiff = true
+				revertReason := ""
+				if rev := result.Revert(); len(rev) > 0 {
+					revertReason = fmt.Sprintf("%x", rev)
+				}
+				log.Error("MIR replay: status divergence found",
+					"block", block.Number(),
+					"txIdx", txIdx,
+					"receiptIdx", receiptIdx,
+					"txHash", tx.Hash(),
+					"mir.status", mirR.Status,
+					"base.status", baseStatus,
+					"base.err", result.Err,
+					"base.revertData", revertReason,
+					"base.gasUsed", result.UsedGas,
+					"mir.gasUsed", mirR.GasUsed,
+					"base.fee", baseFee,
+					"mir.fee", mirFee,
+				)
+				log.Error("MIR replay: diverging tx detail",
+					"txIdx", txIdx,
+					"txHash", tx.Hash(),
+					"to", tx.To(),
+					"nonce", tx.Nonce(),
+					"gas", tx.Gas(),
+					"gasPrice", tx.GasPrice(),
+					"value", tx.Value(),
+					"dataLen", len(tx.Data()),
+				)
+				// Re-run the same tx twice (MIR on vs off) with an OnEnter/OnExit
+				// tracer so we can see exactly where gas diverges in the call tree.
+				bc.traceCallTreeBothModes(parentRoot, block, blockContext, header, tx, msg, txIdx)
+			} else if mirR.GasUsed != result.UsedGas {
+				foundDiff = true
+				log.Error("MIR replay: gas divergence found",
+					"block", block.Number(),
+					"txIdx", txIdx,
+					"txHash", tx.Hash(),
+					"mir.cumulativeGas", mirR.CumulativeGasUsed, "base.cumulativeGas", usedGas,
+					"mir.gasUsed", mirR.GasUsed, "base.gasUsed", result.UsedGas,
+					"base.fee", baseFee,
+					"mir.fee", mirFee,
+					"base.sysBal", baseSysBal,
+				)
+				bc.traceCallTreeBothModes(parentRoot, block, blockContext, header, tx, msg, txIdx)
+			}
+
+			receiptIdx++
+		}
 	}
 
 	if !foundDiff {
-		log.Warn("MIR replay: no per-tx status/gas divergence found — mismatch may be in logs or bloom",
+		log.Warn("MIR replay: no per-tx divergence found in receipts — check sysBal log lines above",
 			"block", block.Number())
 	}
 }
