@@ -3432,7 +3432,6 @@ func (bc *BlockChain) replayBlockWithoutMIRAndCompare(parentRoot common.Hash, bl
 			log.Error("MIR replay: TransactionToMessage failed", "txIdx", txIdx, "tx", tx.Hash(), "err", err2)
 			return
 		}
-		snap := replayDB.Snapshot()
 		replayDB.SetTxContext(tx.Hash(), txIdx)
 
 		result, err2 := ApplyMessage(evm, msg, gp)
@@ -3491,7 +3490,7 @@ func (bc *BlockChain) replayBlockWithoutMIRAndCompare(parentRoot common.Hash, bl
 			)
 			// Re-run the same tx twice (MIR on vs off) with an OnEnter/OnExit
 			// tracer so we can see exactly where gas diverges in the call tree.
-			bc.traceCallTreeBothModes(replayDB, snap, blockContext, header, tx, msg, txIdx)
+			bc.traceCallTreeBothModes(parentRoot, block, blockContext, header, tx, msg, txIdx)
 		} else if mirR.CumulativeGasUsed != usedGas || mirR.GasUsed != result.UsedGas {
 			foundDiff = true
 			log.Error("MIR replay: gas divergence found",
@@ -3513,10 +3512,10 @@ func (bc *BlockChain) replayBlockWithoutMIRAndCompare(parentRoot common.Hash, bl
 }
 
 // traceCallTreeBothModes runs the given tx twice — once with MIR enabled and
-// once without — from the same state snapshot, attaching OnEnter/OnExit hooks
-// to log every call frame's gas-in / gas-out / error so the call trees can be
-// compared side by side in the log.
-func (bc *BlockChain) traceCallTreeBothModes(statedb *state.StateDB, snap int, blockCtx vm.BlockContext, header *types.Header, tx *types.Transaction, msg *Message, txIdx int) {
+// once without — each on a fresh statedb fast-forwarded to just before txIdx,
+// attaching OnEnter/OnExit hooks to log every call frame's gas-in / gas-out /
+// error so the call trees can be compared side by side in the log.
+func (bc *BlockChain) traceCallTreeBothModes(parentRoot common.Hash, block *types.Block, blockCtx vm.BlockContext, header *types.Header, tx *types.Transaction, msg *Message, txIdx int) {
 	type callFrame struct {
 		callIdx int
 		depth   int
@@ -3528,8 +3527,50 @@ func (bc *BlockChain) traceCallTreeBothModes(statedb *state.StateDB, snap int, b
 		err     error
 	}
 
+	// buildStateAt creates a fresh statedb and fast-forwards all transactions
+	// before txIdx (without MIR) so the state matches the moment tx is applied.
+	buildStateAt := func() *state.StateDB {
+		db, err := state.New(parentRoot, bc.statedb)
+		if err != nil {
+			return nil
+		}
+		signer := types.MakeSigner(bc.chainConfig, header.Number, header.Time)
+		cfg := bc.cfg.VmConfig
+		cfg.EnableMIR = false
+		cfg.Tracer = nil
+		warmEVM := vm.NewEVM(blockCtx, db, bc.chainConfig, cfg)
+		warmGP := new(GasPool).AddGas(block.GasLimit())
+		posa, isPoSA := bc.Engine().(consensus.PoSA)
+		for i, t := range block.Transactions() {
+			if i >= txIdx {
+				break
+			}
+			if isPoSA {
+				if isSystem, _ := posa.IsSystemTransaction(t, header); isSystem {
+					continue
+				}
+			}
+			m, err2 := TransactionToMessage(t, signer, header.BaseFee)
+			if err2 != nil {
+				return nil
+			}
+			db.SetTxContext(t.Hash(), i)
+			if _, err2 = ApplyMessage(warmEVM, m, warmGP); err2 != nil {
+				return nil
+			}
+			if bc.chainConfig.IsByzantium(block.Number()) {
+				db.Finalise(true)
+			}
+		}
+		return db
+	}
+
 	runWithTracer := func(label string, enableMIR bool) []callFrame {
-		statedb.RevertToSnapshot(snap)
+		statedb := buildStateAt()
+		if statedb == nil {
+			log.Error("MIR calltree: failed to build pre-tx state", "mode", label, "txIdx", txIdx)
+			return nil
+		}
 		statedb.SetTxContext(tx.Hash(), txIdx)
 
 		frames := make([]callFrame, 0, 16)
@@ -3564,7 +3605,7 @@ func (bc *BlockChain) traceCallTreeBothModes(statedb *state.StateDB, snap int, b
 		cfg.EnableMIR = enableMIR
 		cfg.Tracer = hooks
 		tracingDB := state.NewHookedState(statedb, hooks)
-		evm := vm.NewEVM(blockCtx, tracingDB, bc.chainConfig, cfg)
+		evm := vm.NewEVM(blockCtx, vm.StateDB(tracingDB), bc.chainConfig, cfg)
 		if enableMIR {
 			evm.SetMIRRunner(mir.NewEVMRunner(evm))
 		}
