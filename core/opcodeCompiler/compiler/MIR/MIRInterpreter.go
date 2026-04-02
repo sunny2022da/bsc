@@ -2839,6 +2839,12 @@ func (it *MIRInterpreter) chargeSelfdestructDynamicGas(beneficiary common.Addres
 		return nil
 	}
 	var gas uint64
+	// Base cost introduced by EIP-150 (5000 gas). In native geth this is charged as
+	// constantGas post-EIP2929 or as the first item in gasSelfdestruct pre-EIP2929.
+	// MIR has no constantGas split, so we always charge it here.
+	if it.chainRules.IsEIP150 {
+		gas += params.SelfdestructGasEIP150
+	}
 	// EIP-2929: cold account access cost if beneficiary not warm.
 	if it.chainRules.IsEIP2929 && !it.state.AddressInAccessList(beneficiary) {
 		it.state.AddAddressToAccessList(beneficiary)
