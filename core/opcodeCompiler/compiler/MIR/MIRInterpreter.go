@@ -2875,13 +2875,24 @@ func (it *MIRInterpreter) execSelfdestruct(beneficiary common.Address) {
 	if it.state == nil {
 		return
 	}
-	// Transfer balance to beneficiary, then mark selfdestruct.
 	bal := it.state.GetBalanceU256(it.contractAddr)
-	if bal != nil && !bal.IsZero() {
-		it.state.AddBalanceU256(beneficiary, bal)
-		it.state.SetBalanceU256(it.contractAddr, u256Zero)
+	if it.chainRules.IsCancun {
+		// EIP-6780: SELFDESTRUCT only actually destructs if the contract was created in the
+		// current transaction. In all cases the balance is transferred to the beneficiary.
+		// Use SubBalance + AddBalance to match stock EVM (opSelfdestruct6780) balance tracing.
+		if bal != nil && !bal.IsZero() {
+			it.state.SubBalanceU256(it.contractAddr, bal)
+			it.state.AddBalanceU256(beneficiary, bal)
+		}
+		it.state.SelfDestruct6780(it.contractAddr)
+	} else {
+		// Pre-Cancun: always destruct and transfer balance.
+		if bal != nil && !bal.IsZero() {
+			it.state.AddBalanceU256(beneficiary, bal)
+			it.state.SetBalanceU256(it.contractAddr, u256Zero)
+		}
+		it.state.SelfDestruct(it.contractAddr)
 	}
-	it.state.SelfDestruct(it.contractAddr)
 }
 
 func (it *MIRInterpreter) chargeGas(amount uint64) error {

@@ -21,6 +21,10 @@ type StateBackend interface {
 	Empty(addr common.Address) bool
 	HasSelfDestructed(addr common.Address) bool
 	SelfDestruct(addr common.Address)
+	// SelfDestruct6780 implements EIP-6780: only actually destructs if the contract was
+	// created in the current transaction (newContract==true); otherwise only transfers balance.
+	// Returns whether the contract was actually destructed.
+	SelfDestruct6780(addr common.Address) bool
 
 	GetState(addr common.Address, slot common.Hash) common.Hash
 	GetCommittedState(addr common.Address, slot common.Hash) common.Hash
@@ -289,6 +293,13 @@ func (s *InMemoryState) SelfDestruct(addr common.Address) {
 		return
 	}
 	s.selfDestructed[addrKey(addr)] = true
+}
+
+// SelfDestruct6780 for InMemoryState: no newContract tracking, always destructs.
+// This is intentionally conservative for unit tests which don't model transaction context.
+func (s *InMemoryState) SelfDestruct6780(addr common.Address) bool {
+	s.SelfDestruct(addr)
+	return true
 }
 
 func (s *InMemoryState) GetCommittedState(addr common.Address, slot common.Hash) common.Hash {

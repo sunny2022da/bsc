@@ -113,6 +113,14 @@ func (b *StateDBBackend) SelfDestruct(addr common.Address) {
 	b.db.SelfDestruct(addr)
 }
 
+func (b *StateDBBackend) SelfDestruct6780(addr common.Address) bool {
+	if b == nil || b.db == nil {
+		return false
+	}
+	_, destructed := b.db.SelfDestruct6780(addr)
+	return destructed
+}
+
 func (b *StateDBBackend) GetState(addr common.Address, slot common.Hash) common.Hash {
 	if b == nil || b.db == nil {
 		return common.Hash{}
