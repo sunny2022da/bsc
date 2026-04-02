@@ -42,6 +42,14 @@ type Config struct {
 	// Nested calls (CALL*/CREATE*) are still executed by the geth EVM interpreter.
 	// Fullnode wiring must provide a MIR runner via EVM.SetMIRRunner.
 	EnableMIR bool
+
+	// MIRBenchmark enables per-transaction and per-block performance comparison between
+	// the MIR interpreter and the stock EVM interpreter. Only meaningful when EnableMIR
+	// is also true. When set, each transaction that MIR executes without falling back is
+	// executed three times: once for timing via MIR, once for timing via the stock
+	// interpreter, and once for the actual state transition. Results are logged at Info
+	// level. This flag must NOT be enabled in production as it triples execution cost.
+	MIRBenchmark bool
 }
 
 // ScopeContext contains the things that are per-call, such as stack and memory,

@@ -20,6 +20,10 @@ var mirRunnerDebugLog = os.Getenv("MIR_DEBUG_LOG") == "1"
 // EVMRunner adapts MIRInterpreter to the vm.ContractRunner interface so vm.EVM
 // can dispatch top-level executions into MIR without importing the MIR package.
 //
+// FellBack() reports whether the most recent Run() call yielded to a fallback
+// interpreter instead of executing via the MIR engine. Callers (e.g. the
+// benchmark harness) can use this to determine whether MIR actually ran.
+//
 // This runner is intended for fullnode wiring:
 // - Top-level tx Call/Create can use MIR.
 // - Nested calls are delegated back into geth EVM via EVMCallCreateBackend.
@@ -50,6 +54,11 @@ type EVMRunner struct {
 	// Optional factory to build a step hook that can close over the interpreter instance
 	// (e.g., to also sample gasUsed/gasLeft). If set, it takes precedence over mirStepHook.
 	mirStepHookFactory func(it *MIRInterpreter) func(evmPC uint, evmOp byte, op MirOperation)
+
+	// fellBack is set to true whenever Run() yields to a fallback interpreter
+	// (base or opt) instead of executing via the MIR engine. Reset at the top
+	// of each Run() call. Readable via FellBack().
+	fellBack bool
 
 	// it is a per-runner interpreter instance reused across calls.
 	//
@@ -104,6 +113,16 @@ func (r *EVMRunner) SetMIRStepHookFactory(f func(it *MIRInterpreter) func(evmPC 
 	r.mirStepHookFactory = f
 }
 
+// FellBack reports whether the most recent Run() call used a fallback interpreter
+// (base or opt) rather than the MIR engine. The flag is reset at the start of
+// each Run() call, so it always reflects the outcome of the last invocation.
+func (r *EVMRunner) FellBack() bool {
+	if r == nil {
+		return true
+	}
+	return r.fellBack
+}
+
 func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]byte, error) {
 	if r == nil || r.evm == nil {
 		return nil, fmt.Errorf("nil EVM runner")
@@ -111,9 +130,13 @@ func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]b
 	if contract == nil {
 		return nil, fmt.Errorf("nil contract")
 	}
+	// Reset fallback flag for this invocation.
+	r.fellBack = false
+
 	// For now, only support non-readOnly execution for MIR top-level calls/creates.
 	// Nested STATICCALL frames are executed by geth (depth>0), so this is mostly a guard.
 	if readOnly {
+		r.fellBack = true
 		return nil, vm.ErrWriteProtection
 	}
 
@@ -124,6 +147,7 @@ func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]b
 	// position 0 with gas=0 succeeds in stock EVM; ErrOutOfGas would be wrong there).
 	if contract.Gas == 0 {
 		log.Debug("MIR fallback to base interpreter", "reason", "gas=0", "addr", contract.Address(), "codeLen", len(contract.Code))
+		r.fellBack = true
 		if r.baseIt == nil {
 			r.baseIt = vm.NewEVMInterpreter(r.evm)
 		}
@@ -138,6 +162,7 @@ func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]b
 	// Note: this is a deliberate performance trade-off; correctness remains native-EVM.
 	if len(contract.Code) > 2048 {
 		log.Debug("MIR fallback to opt interpreter", "reason", "code>2048", "addr", contract.Address(), "codeLen", len(contract.Code))
+		r.fellBack = true
 		if r.optIt == nil {
 			r.optIt = vm.NewEVMInterpreter(r.evm)
 			r.optIt.CopyAndInstallSuperInstruction()
@@ -192,6 +217,7 @@ func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]b
 				"codeLen", len(contract.Code),
 				"err", err,
 			)
+			r.fellBack = true
 			if r.baseIt == nil {
 				r.baseIt = vm.NewEVMInterpreter(r.evm)
 			}
@@ -229,6 +255,7 @@ func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]b
 			"codeLen", len(contract.Code),
 			"needsRuntimeEpoch", cfg.needsRuntimeEpoch(),
 		)
+		r.fellBack = true
 		if r.optIt == nil {
 			r.optIt = vm.NewEVMInterpreter(r.evm)
 			r.optIt.CopyAndInstallSuperInstruction()
@@ -247,6 +274,7 @@ func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]b
 			"codeHash", codeHash,
 			"codeLen", len(contract.Code),
 		)
+		r.fellBack = true
 		if r.baseIt == nil {
 			r.baseIt = vm.NewEVMInterpreter(r.evm)
 		}

@@ -124,6 +124,9 @@ func (p *StateProcessor) Process(block *types.Block, statedb *state.StateDB, cfg
 	// usually do have two tx, one for validator set contract, another for system reward contract.
 	systemTxs := make([]*types.Transaction, 0, 2)
 
+	// MIR benchmark stats (only populated when cfg.MIRBenchmark is true).
+	var mirBenchStats mirBenchBlockStats
+
 	for i, tx := range block.Transactions() {
 		if isPoSA {
 			if isSystemTx, err := posa.IsSystemTransaction(tx, block.Header()); err != nil {
@@ -147,9 +150,17 @@ func (p *StateProcessor) Process(block *types.Block, statedb *state.StateDB, cfg
 			bloomProcessors.Close()
 			return nil, fmt.Errorf("could not apply tx %d [%v]: %w", i, tx.Hash().Hex(), err)
 		}
-		statedb.SetTxContext(tx.Hash(), i)
 
-		receipt, err := ApplyTransactionWithEVM(msg, gp, statedb, blockNumber, blockHash, context.Time, tx, usedGas, evm, bloomProcessors)
+		var receipt *types.Receipt
+		if cfg.MIRBenchmark && cfg.EnableMIR {
+			// Benchmark path: time MIR vs stock interpreter for each tx.
+			// SetTxContext is handled inside mirBenchmarkTx before each run.
+			receipt, err = mirBenchmarkTx(evm, msg, gp, statedb, blockNumber, blockHash,
+				context.Time, tx, i, usedGas, []ReceiptProcessor{bloomProcessors}, &mirBenchStats)
+		} else {
+			statedb.SetTxContext(tx.Hash(), i)
+			receipt, err = ApplyTransactionWithEVM(msg, gp, statedb, blockNumber, blockHash, context.Time, tx, usedGas, evm, bloomProcessors)
+		}
 		if err != nil {
 			bloomProcessors.Close()
 			return nil, fmt.Errorf("could not apply tx %d [%v]: %w", i, tx.Hash().Hex(), err)
@@ -158,6 +169,10 @@ func (p *StateProcessor) Process(block *types.Block, statedb *state.StateDB, cfg
 		receipts = append(receipts, receipt)
 	}
 	bloomProcessors.Close()
+
+	if cfg.MIRBenchmark && cfg.EnableMIR {
+		mirBenchLogBlock(blockNumber, &mirBenchStats)
+	}
 
 	// Read requests if Prague is enabled.
 	var requests [][]byte

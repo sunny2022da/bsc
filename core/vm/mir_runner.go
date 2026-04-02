@@ -17,3 +17,13 @@ func (evm *EVM) SetMIRRunner(r ContractRunner) {
 	}
 	evm.mirRunner = r
 }
+
+// GetMIRRunner returns the installed MIR runner, or nil if none is set.
+// Callers can type-assert the result to *mir.EVMRunner to access extended
+// methods such as FellBack().
+func (evm *EVM) GetMIRRunner() ContractRunner {
+	if evm == nil {
+		return nil
+	}
+	return evm.mirRunner
+}
