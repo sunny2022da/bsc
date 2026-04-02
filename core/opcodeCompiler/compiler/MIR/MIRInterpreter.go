@@ -4080,6 +4080,17 @@ func (it *MIRInterpreter) evalValue(v *Value) (*uint256.Int, error) {
 		return nil, fmt.Errorf("missing result for def op=%s defPC=%d defBlock=%d phiIdx=%d defResIdx=%d mappedResIdx=%d mappedOk=%v (curFirstPC=%d curEvmPC=%d)",
 			def.op.String(), def.evmPC, def.defBlockNum, def.phiStackIndex, def.resIdx, mapped, mappedOk, curFirstPC, it.curEvmPC)
 	default:
+		// Unknown value with liveIn==false is created exclusively by ValueStack.pop() on an
+		// empty stack during CFG construction (see ValueStack.go). At execution time this means
+		// the EVM operand stack was empty when this instruction consumed an operand — a stack
+		// underflow. Return the error so the caller aborts execution, consuming all gas, exactly
+		// as the base EVM does (via vm.ErrStackUnderflow in EVMInterpreter.Run).
+		//
+		// Unknown with liveIn==true is a legitimate live-in from padBottomTo or a PHI slot
+		// created during iterative CFG construction; those are safe to treat as zero.
+		if !v.liveIn {
+			return nil, fmt.Errorf("stack underflow (0 <=> 1)")
+		}
 		return u256Zero, nil
 	}
 }
