@@ -3424,19 +3424,21 @@ func (it *MIRInterpreter) doCall(op MirOperation, gasReq *uint256.Int, to common
 		}
 	}
 
-	// Determine gas to pass (EIP-150 63/64 cap)
-	var req uint64
-	if gasReq == nil || !gasReq.IsUint64() {
-		return 0, errors.New("call gas overflow")
-	}
-	req = gasReq.Uint64()
+	// Determine gas to pass to the callee (EIP-150 63/64 cap).
+	//
+	// Mirror stock EVM callGas() (core/vm/gas.go): when the requested gas does not fit
+	// in uint64, it is trivially larger than the 63/64 cap, so we forward the cap
+	// instead of returning an error.  Returning an error here causes the entire call to
+	// fail and consume all caller gas, diverging from stock EVM which silently caps.
 	avail := it.gasLeft()
 	if it.chainRules.IsEIP150 {
 		avail = avail - avail/64
 	}
-	gasToSend := req
-	if gasToSend > avail {
+	var gasToSend uint64
+	if gasReq == nil || !gasReq.IsUint64() || gasReq.Uint64() > avail {
 		gasToSend = avail
+	} else {
+		gasToSend = gasReq.Uint64()
 	}
 
 	// Charge the transferred gas (caller pays it)
