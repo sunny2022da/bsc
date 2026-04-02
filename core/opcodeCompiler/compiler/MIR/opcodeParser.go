@@ -1422,6 +1422,23 @@ retryBuild:
 		if err != nil {
 			return err
 		}
+		// Detect parse-time stack underflow on the true EVM entry block.
+		//
+		// The EVM always starts execution with an empty stack. If the entry block
+		// (blockNum==0, no predecessors, empty entry stack) pops from an empty stack,
+		// the bytecode has an instruction that would unconditionally stack-underflow at
+		// runtime. MIR silently returns Unknown operands for such pops, builds a CFG that
+		// "succeeds", and diverges from the base EVM (which fails the tx and consumes all gas).
+		//
+		// We restrict this check to the true entry block (no parents) with a genuinely empty
+		// entry stack (initHeight==0) to avoid false positives during the iterative Parse()
+		// fixpoint: non-entry blocks may have an empty entry stack on their first visit
+		// (predecessor edges not yet connected) and would be re-built correctly once those
+		// edges are recorded. Firing an error there would abort Parse() for legitimate contracts.
+		if stack.underflowed && c != nil && c.runtimeEpoch == 0 &&
+			block.blockNum == 0 && len(block.parents) == 0 && initHeight == 0 {
+			return fmt.Errorf("MIR CFG parse: stack underflow at pc=%d op=0x%02x (instruction requires stack items but entry stack was empty)", currentEVMBuildPC, currentEVMBuildOp)
+		}
 	}
 
 	// End of code reached without explicit terminator

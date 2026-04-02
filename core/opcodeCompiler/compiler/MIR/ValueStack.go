@@ -34,6 +34,10 @@ type Value struct {
 
 type ValueStack struct {
 	data []Value
+	// underflowed is set when pop() is called on an empty stack.
+	// Used by the CFG parser to detect instructions that would always stack-underflow
+	// at runtime (e.g. ADD as the very first instruction with nothing pushed yet).
+	underflowed bool
 }
 
 func (s *ValueStack) push(ptr *Value) {
@@ -45,7 +49,9 @@ func (s *ValueStack) push(ptr *Value) {
 
 func (s *ValueStack) pop() (value Value) {
 	if len(s.data) == 0 {
-		// Return a default value if stack is empty
+		// Record that a pop was attempted on an empty stack so the CFG parser can
+		// detect instructions that would unconditionally stack-underflow at runtime.
+		s.underflowed = true
 		return Value{kind: Unknown, liveInPos: -1}
 	}
 	val := s.data[len(s.data)-1]
