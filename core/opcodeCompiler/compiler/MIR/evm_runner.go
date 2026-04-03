@@ -190,16 +190,15 @@ func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]b
 	// Note: this is a deliberate performance trade-off; correctness remains native-EVM.
 	if len(contract.Code) > 2048 {
 		if mirDebugBlock != 0 && r.blockNumber == mirDebugBlock {
-			log.Warn("MIR fallback", "block", r.blockNumber, "reason", "code>2048", "addr", contract.Address(), "codeLen", len(contract.Code))
+			log.Warn("MIR fallback", "block", r.blockNumber, "reason", "code>2048 (diag: using baseIt)", "addr", contract.Address(), "codeLen", len(contract.Code))
 		} else {
-			log.Debug("MIR fallback to opt interpreter", "reason", "code>2048", "addr", contract.Address(), "codeLen", len(contract.Code))
+			log.Debug("MIR fallback to base interpreter (diag)", "reason", "code>2048", "addr", contract.Address(), "codeLen", len(contract.Code))
 		}
 		r.fellBack = true
-		if r.optIt == nil {
-			r.optIt = vm.NewEVMInterpreter(r.evm)
-			r.optIt.CopyAndInstallSuperInstruction()
+		if r.baseIt == nil {
+			r.baseIt = vm.NewEVMInterpreter(r.evm)
 		}
-		return r.optIt.Run(contract, input, false)
+		return r.baseIt.Run(contract, input, readOnly)
 	}
 
 	codeHash := contract.CodeHash
@@ -297,11 +296,10 @@ func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]b
 			)
 		}
 		r.fellBack = true
-		if r.optIt == nil {
-			r.optIt = vm.NewEVMInterpreter(r.evm)
-			r.optIt.CopyAndInstallSuperInstruction()
+		if r.baseIt == nil {
+			r.baseIt = vm.NewEVMInterpreter(r.evm)
 		}
-		ret, err := r.optIt.Run(contract, input, false)
+		ret, err := r.baseIt.Run(contract, input, readOnly)
 		return ret, err
 	}
 
