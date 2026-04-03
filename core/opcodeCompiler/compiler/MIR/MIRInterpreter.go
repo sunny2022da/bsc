@@ -4046,6 +4046,24 @@ func (it *MIRInterpreter) evalPhi(cur, prev *MIRBasicBlock, phi *MIR) (*uint256.
 					// fall back to snapshot indexing below
 					break
 				}
+				// Guard 2: Unknown live-in operands are placeholders inserted during PHI build
+				// when this parent's incoming snapshot was missing or had the wrong stack height.
+				// evalValue silently returns u256Zero for these — correct for a genuine stack
+				// underflow but catastrophically wrong when the parent block hadn't been connected
+				// via connectEdge yet at build time. Fall through to the runtime snapshot path
+				// which records the actual values from the parent's exit stack.
+				if ov := phi.operands[opIdx]; ov != nil && ov.kind == Unknown && ov.liveIn {
+					if mirRunnerDebugLog {
+						log.Warn("MIR PHI: Unknown live-in operand, falling to snapshot",
+							"curFirstPC", cur.FirstPC(),
+							"prevFirstPC", prev.FirstPC(),
+							"phiPC", phi.evmPC,
+							"phiIdx", phi.phiStackIndex,
+							"opIdx", opIdx,
+						)
+					}
+					break // fall to snapshot indexing below
+				}
 				val, err := it.evalValue(phi.operands[opIdx])
 				if err != nil {
 					// Operand-based PHI selection can become temporarily stale across rebuilds when
