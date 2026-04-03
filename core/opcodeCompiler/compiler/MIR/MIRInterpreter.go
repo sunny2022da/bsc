@@ -2047,6 +2047,19 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 				if it.state != nil {
 					it.state.AddLog(it.contractAddr, topics, data, it.blockNumber)
 				}
+				if mirRunnerDebugLog {
+					topicStrs := make([]string, len(topics))
+					for ti, t := range topics {
+						topicStrs[ti] = t.Hex()
+					}
+					log.Debug("MIR LOG emitted",
+						"addr", it.contractAddr,
+						"pc", m.evmPC,
+						"numTopics", len(topics),
+						"topics", topicStrs,
+						"dataLen", len(data),
+					)
+				}
 
 			case MirBALANCE:
 				addr, err := it.evalAddressOperand(m, 0)
@@ -2839,10 +2852,18 @@ func (it *MIRInterpreter) chargeSelfdestructDynamicGas(beneficiary common.Addres
 		return nil
 	}
 	var gas uint64
-	// Base cost introduced by EIP-150 (5000 gas). In native geth this is charged as
-	// constantGas post-EIP2929 or as the first item in gasSelfdestruct pre-EIP2929.
-	// MIR has no constantGas split, so we always charge it here.
-	if it.chainRules.IsEIP150 {
+	// Base cost introduced by EIP-150 (5000 gas, params.SelfdestructGasEIP150).
+	//
+	// Geth charges this differently across forks:
+	//   Pre-EIP2929:  constantGas = 0; gasSelfdestruct() charges 5000 as its first item.
+	//   Post-EIP2929: enable2929 sets constantGas = 5000; gasSelfdestructEIP2929 no longer
+	//                 includes the 5000 (only the EIP-2929 cold-access delta).
+	//
+	// MIR charges constantGas via blockConstDelta (using ConstantGasForOp, which reads the
+	// same jump table), so:
+	//   Pre-EIP2929:  constantGas = 0 → we must add 5000 here.
+	//   Post-EIP2929: constantGas = 5000 already charged → adding it here would double-count.
+	if it.chainRules.IsEIP150 && !it.chainRules.IsEIP2929 {
 		gas += params.SelfdestructGasEIP150
 	}
 	// EIP-2929: cold account access cost if beneficiary not warm.
@@ -3390,12 +3411,50 @@ func (it *MIRInterpreter) execCallLike(m *MIR) (uint64, error) {
 }
 
 func (it *MIRInterpreter) doCall(op MirOperation, gasReq *uint256.Int, to common.Address, value, inOff, inSz, outOff, outSz *uint256.Int) (uint64, error) {
-	// Memory expansion for in/out regions
-	if err := it.chargeMemoryExpansion(inOff, inSz); err != nil {
-		return 0, err
-	}
-	if err := it.chargeMemoryExpansion(outOff, outSz); err != nil {
-		return 0, err
+	// Memory expansion: stock EVM (memory_table.go memoryCall) takes max(inEnd, outEnd).
+	// Two sequential chargeMemoryExpansion calls are INCORRECT here: the first call
+	// advances memLastGasFee; if the second region is smaller and len(it.mem) has not
+	// yet been extended (ensureMem runs later), the second call computes
+	// newTotalFee - memLastGasFee where newTotalFee < memLastGasFee → uint64 underflow
+	// → chargeGas receives a huge value → spurious "gas uint64 overflow" OOG.
+	{
+		callEnd := func(off, sz *uint256.Int) (uint64, error) {
+			if sz == nil || sz.IsZero() {
+				return 0, nil
+			}
+			var o uint64
+			if off != nil {
+				var ov bool
+				o, ov = off.Uint64WithOverflow()
+				if ov {
+					return 0, errors.New("call memory offset overflow")
+				}
+			}
+			s, ov := sz.Uint64WithOverflow()
+			if ov {
+				return 0, errors.New("call memory size overflow")
+			}
+			end := o + s
+			if end < o {
+				return 0, errors.New("call memory size overflow")
+			}
+			return end, nil
+		}
+		inEnd, err := callEnd(inOff, inSz)
+		if err != nil {
+			return 0, err
+		}
+		outEnd, err := callEnd(outOff, outSz)
+		if err != nil {
+			return 0, err
+		}
+		maxEnd := inEnd
+		if outEnd > maxEnd {
+			maxEnd = outEnd
+		}
+		if err := it.chargeMemoryExpansionMax(maxEnd); err != nil {
+			return 0, err
+		}
 	}
 
 	// EIP-2929 warm/cold account access delta for call target
