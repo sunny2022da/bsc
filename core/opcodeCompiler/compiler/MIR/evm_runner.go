@@ -25,6 +25,18 @@ var mirRunnerDebugLog = os.Getenv("MIR_DEBUG_LOG") == "1"
 // is the root cause of bloom mismatches in a later block.
 var mirForceBase = os.Getenv("MIR_FORCE_BASE") == "1"
 
+// mirDisableFrom, when non-zero, disables MIR for all blocks >= this number.
+// Used for binary search to find the first block where MIR corrupts state.
+// Set via MIR_DISABLE_FROM=<blockNum>.
+var mirDisableFrom = func() uint64 {
+	if s := os.Getenv("MIR_DISABLE_FROM"); s != "" {
+		if n, err := strconv.ParseUint(s, 10, 64); err == nil {
+			return n
+		}
+	}
+	return 0
+}()
+
 // mirDebugBlock, when non-zero, enables detailed Warn-level logging for all
 // LOG topics and silent-zero paths (Unknown live-in, nil def, loop-carried)
 // for executions in that specific block. Set via MIR_DEBUG_BLOCK=<blockNum>.
@@ -164,7 +176,7 @@ func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]b
 
 	// Diagnosis: MIR_FORCE_BASE=1 bypasses all MIR/optIt logic, using only the base
 	// interpreter. If bloom matches with this set, MIR corrupts state in earlier blocks.
-	if mirForceBase {
+	if mirForceBase || (mirDisableFrom != 0 && r.blockNumber >= mirDisableFrom) {
 		r.fellBack = true
 		if r.baseIt == nil {
 			r.baseIt = vm.NewEVMInterpreter(r.evm)
@@ -422,7 +434,25 @@ func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]b
 			"gasIn", contract.Gas,
 		)
 	}
+	if mirDebugBlock != 0 && r.blockNumber == mirDebugBlock {
+		log.Warn("MIR executing (not fallback)",
+			"block", r.blockNumber,
+			"addr", contract.Address(),
+			"codeHash", codeHash,
+			"codeLen", len(contract.Code),
+			"gasIn", contract.Gas,
+		)
+	}
 	res := it.Run()
+	if mirDebugBlock != 0 && r.blockNumber == mirDebugBlock {
+		log.Warn("MIR execution done",
+			"block", r.blockNumber,
+			"addr", contract.Address(),
+			"codeLen", len(contract.Code),
+			"gasLeft", res.GasLeft,
+			"err", res.Err,
+		)
+	}
 	if mirRunnerDebugLog {
 		log.Debug("MIR runner: interpreter done",
 			"addr", contract.Address(),
