@@ -23,6 +23,7 @@ var mirRunnerDebugLog = os.Getenv("MIR_DEBUG_LOG") == "1"
 var mirDebugBlock = func() uint64 {
 	if s := os.Getenv("MIR_DEBUG_BLOCK"); s != "" {
 		if n, err := strconv.ParseUint(s, 10, 64); err == nil {
+			log.Warn("MIR_DEBUG_BLOCK activated", "block", n)
 			return n
 		}
 	}
