@@ -170,7 +170,11 @@ func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]b
 	// Delegate to the base interpreter to get exact stock-EVM semantics (e.g. STOP at
 	// position 0 with gas=0 succeeds in stock EVM; ErrOutOfGas would be wrong there).
 	if contract.Gas == 0 {
-		log.Debug("MIR fallback to base interpreter", "reason", "gas=0", "addr", contract.Address(), "codeLen", len(contract.Code))
+		if mirDebugBlock != 0 && r.blockNumber == mirDebugBlock {
+			log.Warn("MIR fallback", "block", r.blockNumber, "reason", "gas=0", "addr", contract.Address(), "codeLen", len(contract.Code))
+		} else {
+			log.Debug("MIR fallback to base interpreter", "reason", "gas=0", "addr", contract.Address(), "codeLen", len(contract.Code))
+		}
 		r.fellBack = true
 		if r.baseIt == nil {
 			r.baseIt = vm.NewEVMInterpreter(r.evm)
@@ -185,7 +189,11 @@ func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]b
 	//
 	// Note: this is a deliberate performance trade-off; correctness remains native-EVM.
 	if len(contract.Code) > 2048 {
-		log.Debug("MIR fallback to opt interpreter", "reason", "code>2048", "addr", contract.Address(), "codeLen", len(contract.Code))
+		if mirDebugBlock != 0 && r.blockNumber == mirDebugBlock {
+			log.Warn("MIR fallback", "block", r.blockNumber, "reason", "code>2048", "addr", contract.Address(), "codeLen", len(contract.Code))
+		} else {
+			log.Debug("MIR fallback to opt interpreter", "reason", "code>2048", "addr", contract.Address(), "codeLen", len(contract.Code))
+		}
 		r.fellBack = true
 		if r.optIt == nil {
 			r.optIt = vm.NewEVMInterpreter(r.evm)
@@ -272,13 +280,22 @@ func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]b
 	//
 	// NOTE: This still preserves native EVM semantics; it's purely a performance dispatch choice.
 	if cfg != nil && (cfg.needsRuntimeEpoch() || len(contract.Code) > 2048) {
-		log.Debug("MIR fallback to opt interpreter",
-			"reason", "needsRuntimeEpoch or code>2048",
-			"addr", contract.Address(),
-			"codeHash", codeHash,
-			"codeLen", len(contract.Code),
-			"needsRuntimeEpoch", cfg.needsRuntimeEpoch(),
-		)
+		if mirDebugBlock != 0 && r.blockNumber == mirDebugBlock {
+			log.Warn("MIR fallback", "block", r.blockNumber,
+				"reason", "needsRuntimeEpoch or code>2048",
+				"addr", contract.Address(),
+				"codeLen", len(contract.Code),
+				"needsRuntimeEpoch", cfg.needsRuntimeEpoch(),
+			)
+		} else {
+			log.Debug("MIR fallback to opt interpreter",
+				"reason", "needsRuntimeEpoch or code>2048",
+				"addr", contract.Address(),
+				"codeHash", codeHash,
+				"codeLen", len(contract.Code),
+				"needsRuntimeEpoch", cfg.needsRuntimeEpoch(),
+			)
+		}
 		r.fellBack = true
 		if r.optIt == nil {
 			r.optIt = vm.NewEVMInterpreter(r.evm)
@@ -292,12 +309,20 @@ func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]b
 	// Until MIR can guarantee parity for dynamic jump tables, execute these contracts with
 	// the native interpreter.
 	if cfg != nil && cfg.hasUnresolvedJumps() {
-		log.Debug("MIR fallback to base interpreter",
-			"reason", "unresolved jumps",
-			"addr", contract.Address(),
-			"codeHash", codeHash,
-			"codeLen", len(contract.Code),
-		)
+		if mirDebugBlock != 0 && r.blockNumber == mirDebugBlock {
+			log.Warn("MIR fallback", "block", r.blockNumber,
+				"reason", "unresolved jumps",
+				"addr", contract.Address(),
+				"codeLen", len(contract.Code),
+			)
+		} else {
+			log.Debug("MIR fallback to base interpreter",
+				"reason", "unresolved jumps",
+				"addr", contract.Address(),
+				"codeHash", codeHash,
+				"codeLen", len(contract.Code),
+			)
+		}
 		r.fellBack = true
 		if r.baseIt == nil {
 			r.baseIt = vm.NewEVMInterpreter(r.evm)
