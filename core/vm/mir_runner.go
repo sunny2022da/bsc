@@ -7,6 +7,9 @@ package vm
 // NOTE: The EVM is responsible for managing evm.depth when invoking a runner.
 type ContractRunner interface {
 	Run(contract *Contract, input []byte, readOnly bool) (ret []byte, err error)
+	// FellBack reports whether the most recent Run() call fell back to the
+	// base interpreter instead of executing natively.
+	FellBack() bool
 }
 
 // SetMIRRunner installs an optional MIR runner. When Config.EnableMIR is true,

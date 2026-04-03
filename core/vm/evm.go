@@ -387,6 +387,9 @@ func (evm *EVM) Call(caller common.Address, addr common.Address, input []byte, g
 					)
 				}
 				ret, err = evm.runWithRunner(evm.mirRunner, contract, input, false)
+				if evm.mirRunner.FellBack() {
+					mirTopLevelFallbacks.Add(1)
+				}
 				gasUsedByMIR := uint64(0)
 				gasReturnedByMIR := contract.Gas
 				if gasReturnedByMIR <= gas {
