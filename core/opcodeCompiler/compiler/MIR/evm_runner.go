@@ -24,8 +24,12 @@ var mirRunnerDebugLog = os.Getenv("MIR_DEBUG_LOG") == "1"
 // LOG topics and silent-zero paths (Unknown live-in, nil def, loop-carried)
 // for executions in that specific block. Set via MIR_DEBUG_BLOCK=<blockNum>.
 var mirDebugBlock = func() uint64 {
-	if s := os.Getenv("MIR_DEBUG_BLOCK"); s != "" {
+	s := os.Getenv("MIR_DEBUG_BLOCK")
+	// Use fmt.Fprintf to stderr: always works regardless of logger state.
+	fmt.Fprintf(os.Stderr, "[MIR] MIR_DEBUG_BLOCK env = %q\n", s)
+	if s != "" {
 		if n, err := strconv.ParseUint(s, 10, 64); err == nil {
+			fmt.Fprintf(os.Stderr, "[MIR] mirDebugBlock set to %d\n", n)
 			return n
 		}
 	}
