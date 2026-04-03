@@ -4096,9 +4096,32 @@ func (it *MIRInterpreter) evalPhi(cur, prev *MIRBasicBlock, phi *MIR) (*uint256.
 						if r, ok := it.getResult(v.def); ok && r != nil {
 							return r, nil
 						}
-						// Defensive semantics: if we don't have a previous iteration value, treat as 0.
-						// This matches EVM's "missing stack slot => 0" behavior in our interpreter and
-						// prevents spurious aborts on transient CFG/snapshot inconsistencies.
+						// After a CFG rebuild the snapshot still holds stale *MIR pointers whose
+						// resIdx may no longer be current. Try the stable key-based mapping, which
+						// always reflects the post-rebuild resIdx for the same logical PHI.
+						// This is the same defKeyToResIdx lookup that evalValue uses for Variable
+						// operands and must be applied here for consistency.
+						if it.cfg != nil && it.cfg.defKeyToResIdx != nil {
+							if ridx, ok2 := it.cfg.defKeyToResIdx[keyForDef(v.def)]; ok2 && ridx > 0 {
+								if ridx < len(it.resultsGen) && it.resultsGen[ridx] == it.gen {
+									return &it.results[ridx], nil
+								}
+							}
+						}
+						// Truly no previous-iteration result: this is the first time we enter this
+						// loop-back edge. Return zero only as a last resort (appropriate for
+						// loop-carried accumulators whose initial value was 0). Any non-zero initial
+						// value should have been captured via the forward-edge PHI operand path above
+						// (lines 4033-4068) rather than reaching this snapshot fallback.
+						if mirRunnerDebugLog {
+							log.Warn("MIR PHI loop-carried: no previous iteration result, returning 0",
+								"curFirstPC", cur.FirstPC(),
+								"prevFirstPC", prev.FirstPC(),
+								"phiPC", phi.evmPC,
+								"phiIdx", phi.phiStackIndex,
+								"defResIdx", v.def.resIdx,
+							)
+						}
 						return u256Zero, nil
 					}
 					v.liveIn = true
