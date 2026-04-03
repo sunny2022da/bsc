@@ -20,6 +20,11 @@ var mirDebugBlockOnce sync.Once
 // mirRunnerDebugLog is true when MIR_DEBUG_LOG=1 is set.
 var mirRunnerDebugLog = os.Getenv("MIR_DEBUG_LOG") == "1"
 
+// mirForceBase forces every Run() call to use the base interpreter (no MIR, no optIt).
+// Set MIR_FORCE_BASE=1 to diagnose whether MIR state corruption in earlier blocks
+// is the root cause of bloom mismatches in a later block.
+var mirForceBase = os.Getenv("MIR_FORCE_BASE") == "1"
+
 // mirDebugBlock, when non-zero, enables detailed Warn-level logging for all
 // LOG topics and silent-zero paths (Unknown live-in, nil def, loop-carried)
 // for executions in that specific block. Set via MIR_DEBUG_BLOCK=<blockNum>.
@@ -156,6 +161,16 @@ func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]b
 	}
 	// Reset fallback flag for this invocation.
 	r.fellBack = false
+
+	// Diagnosis: MIR_FORCE_BASE=1 bypasses all MIR/optIt logic, using only the base
+	// interpreter. If bloom matches with this set, MIR corrupts state in earlier blocks.
+	if mirForceBase {
+		r.fellBack = true
+		if r.baseIt == nil {
+			r.baseIt = vm.NewEVMInterpreter(r.evm)
+		}
+		return r.baseIt.Run(contract, input, readOnly)
+	}
 
 	// For now, only support non-readOnly execution for MIR top-level calls/creates.
 	// Nested STATICCALL frames are executed by geth (depth>0), so this is mostly a guard.
