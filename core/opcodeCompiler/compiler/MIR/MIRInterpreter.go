@@ -2060,6 +2060,20 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 						"dataLen", len(data),
 					)
 				}
+				if mirDebugBlock != 0 && it.blockNumber == mirDebugBlock {
+					topicStrs := make([]string, len(topics))
+					for ti, t := range topics {
+						topicStrs[ti] = t.Hex()
+					}
+					log.Warn("MIR LOG debug",
+						"block", it.blockNumber,
+						"addr", it.contractAddr,
+						"pc", m.evmPC,
+						"numTopics", len(topics),
+						"topics", topicStrs,
+						"dataLen", len(data),
+					)
+				}
 
 			case MirBALANCE:
 				addr, err := it.evalAddressOperand(m, 0)
@@ -4131,8 +4145,9 @@ func (it *MIRInterpreter) evalPhi(cur, prev *MIRBasicBlock, phi *MIR) (*uint256.
 						// loop-carried accumulators whose initial value was 0). Any non-zero initial
 						// value should have been captured via the forward-edge PHI operand path above
 						// (lines 4033-4068) rather than reaching this snapshot fallback.
-						if mirRunnerDebugLog {
+						if mirRunnerDebugLog || (mirDebugBlock != 0 && it.blockNumber == mirDebugBlock) {
 							log.Warn("MIR PHI loop-carried: no previous iteration result, returning 0",
+								"block", it.blockNumber,
 								"curFirstPC", cur.FirstPC(),
 								"prevFirstPC", prev.FirstPC(),
 								"phiPC", phi.evmPC,
@@ -4166,6 +4181,12 @@ func (it *MIRInterpreter) evalValue(v *Value) (*uint256.Int, error) {
 		return uint256.NewInt(0).SetBytes(v.payload), nil
 	case Variable, Arguments:
 		if v.def == nil {
+			if mirDebugBlock != 0 && it.blockNumber == mirDebugBlock {
+				log.Warn("MIR evalValue: Variable with nil def returns zero",
+					"block", it.blockNumber,
+					"curEvmPC", it.curEvmPC,
+				)
+			}
 			return u256Zero, nil
 		}
 		if r, ok := it.getResult(v.def); ok && r != nil {
@@ -4203,6 +4224,12 @@ func (it *MIRInterpreter) evalValue(v *Value) (*uint256.Int, error) {
 		// created during iterative CFG construction; those are safe to treat as zero.
 		if !v.liveIn {
 			return nil, fmt.Errorf("stack underflow (0 <=> 1)")
+		}
+		if mirDebugBlock != 0 && it.blockNumber == mirDebugBlock {
+			log.Warn("MIR evalValue: Unknown live-in returns zero",
+				"block", it.blockNumber,
+				"curEvmPC", it.curEvmPC,
+			)
 		}
 		return u256Zero, nil
 	}

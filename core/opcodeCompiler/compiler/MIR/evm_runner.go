@@ -17,6 +17,18 @@ import (
 // mirRunnerDebugLog is true when MIR_DEBUG_LOG=1 is set.
 var mirRunnerDebugLog = os.Getenv("MIR_DEBUG_LOG") == "1"
 
+// mirDebugBlock, when non-zero, enables detailed Warn-level logging for all
+// LOG topics and silent-zero paths (Unknown live-in, nil def, loop-carried)
+// for executions in that specific block. Set via MIR_DEBUG_BLOCK=<blockNum>.
+var mirDebugBlock = func() uint64 {
+	if s := os.Getenv("MIR_DEBUG_BLOCK"); s != "" {
+		if n, err := strconv.ParseUint(s, 10, 64); err == nil {
+			return n
+		}
+	}
+	return 0
+}()
+
 // EVMRunner adapts MIRInterpreter to the vm.ContractRunner interface so vm.EVM
 // can dispatch top-level executions into MIR without importing the MIR package.
 //
