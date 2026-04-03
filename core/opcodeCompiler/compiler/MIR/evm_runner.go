@@ -6,6 +6,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/vm"
@@ -13,6 +14,8 @@ import (
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
 )
+
+var mirDebugBlockOnce sync.Once
 
 // mirRunnerDebugLog is true when MIR_DEBUG_LOG=1 is set.
 var mirRunnerDebugLog = os.Getenv("MIR_DEBUG_LOG") == "1"
@@ -23,7 +26,6 @@ var mirRunnerDebugLog = os.Getenv("MIR_DEBUG_LOG") == "1"
 var mirDebugBlock = func() uint64 {
 	if s := os.Getenv("MIR_DEBUG_BLOCK"); s != "" {
 		if n, err := strconv.ParseUint(s, 10, 64); err == nil {
-			log.Warn("MIR_DEBUG_BLOCK activated", "block", n)
 			return n
 		}
 	}
@@ -89,6 +91,11 @@ type EVMRunner struct {
 }
 
 func NewEVMRunner(evm *vm.EVM) *EVMRunner {
+	if mirDebugBlock != 0 {
+		mirDebugBlockOnce.Do(func() {
+			log.Warn("MIR_DEBUG_BLOCK activated", "block", mirDebugBlock)
+		})
+	}
 	r := &EVMRunner{
 		evm:           evm,
 		localCFGCache: make(map[common.Hash]*cfgCacheEntry, 128),
