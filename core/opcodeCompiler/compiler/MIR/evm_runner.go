@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/vm"
@@ -36,6 +37,14 @@ var mirDisableFrom = func() uint64 {
 	}
 	return 0
 }()
+
+// mirHaltAfterBlock, when true, sends SIGSTOP to the process after the debug block
+// finishes execution, so the operator can inspect state and roll back.
+var mirHaltAfterBlock = os.Getenv("MIR_HALT_AFTER_BLOCK") == "1"
+
+// mirSkipAddr, when non-empty, forces fallback for a specific contract address.
+// Set MIR_SKIP_ADDR=0x68Eb5297... to bypass MIR for that address.
+var mirSkipAddr = strings.ToLower(os.Getenv("MIR_SKIP_ADDR"))
 
 // mirDebugBlock, when non-zero, enables detailed Warn-level logging for all
 // LOG topics and silent-zero paths (Unknown live-in, nil def, loop-carried)
@@ -174,9 +183,30 @@ func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]b
 	// Reset fallback flag for this invocation.
 	r.fellBack = false
 
+	// Halt after the debug block has finished: when we see a Run() call for a LATER block,
+	// it means the debug block was processed. Pause so the operator can inspect/rollback.
+	if mirHaltAfterBlock && mirDebugBlock != 0 && r.blockNumber > mirDebugBlock {
+		log.Warn("MIR_HALT_AFTER_BLOCK: debug block completed, halting process",
+			"debugBlock", mirDebugBlock, "currentBlock", r.blockNumber)
+		// Send SIGSTOP to ourselves — the process freezes and can be resumed with kill -CONT.
+		// Use os.Exit(0) instead for a clean shutdown.
+		fmt.Fprintf(os.Stderr, "\n[MIR] Block %d completed. Process halting. Use kill -CONT %d to resume, or kill %d to stop.\n",
+			mirDebugBlock, os.Getpid(), os.Getpid())
+		syscall.Kill(os.Getpid(), syscall.SIGSTOP)
+	}
+
 	// Diagnosis: MIR_FORCE_BASE=1 bypasses all MIR/optIt logic, using only the base
 	// interpreter. If bloom matches with this set, MIR corrupts state in earlier blocks.
 	if mirForceBase || (mirDisableFrom != 0 && r.blockNumber >= mirDisableFrom) {
+		r.fellBack = true
+		if r.baseIt == nil {
+			r.baseIt = vm.NewEVMInterpreter(r.evm)
+		}
+		return r.baseIt.Run(contract, input, readOnly)
+	}
+
+	// Diagnosis: skip MIR for a specific address to isolate which contract causes divergence.
+	if mirSkipAddr != "" && strings.ToLower(contract.Address().Hex()) == mirSkipAddr {
 		r.fellBack = true
 		if r.baseIt == nil {
 			r.baseIt = vm.NewEVMInterpreter(r.evm)
@@ -434,25 +464,13 @@ func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]b
 			"gasIn", contract.Gas,
 		)
 	}
+
+	// ---- Dual-execution comparison mode for mirDebugBlock ----
 	if mirDebugBlock != 0 && r.blockNumber == mirDebugBlock {
-		log.Warn("MIR executing (not fallback)",
-			"block", r.blockNumber,
-			"addr", contract.Address(),
-			"codeHash", codeHash,
-			"codeLen", len(contract.Code),
-			"gasIn", contract.Gas,
-		)
+		return r.dualExecCompare(contract, input, readOnly, codeHash, cfg, it)
 	}
+
 	res := it.Run()
-	if mirDebugBlock != 0 && r.blockNumber == mirDebugBlock {
-		log.Warn("MIR execution done",
-			"block", r.blockNumber,
-			"addr", contract.Address(),
-			"codeLen", len(contract.Code),
-			"gasLeft", res.GasLeft,
-			"err", res.Err,
-		)
-	}
 	if mirRunnerDebugLog {
 		log.Debug("MIR runner: interpreter done",
 			"addr", contract.Address(),
@@ -518,4 +536,94 @@ func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]b
 	}
 	contract.Gas = res.GasLeft
 	return res.ReturnData, res.Err
+}
+
+// dualExecCompare runs the contract through MIR first, reverts state, then runs through
+// baseIt. Logs a detailed comparison and returns the baseIt result as authoritative.
+func (r *EVMRunner) dualExecCompare(contract *vm.Contract, input []byte, readOnly bool,
+	codeHash common.Hash, cfg *CFG, it *MIRInterpreter) ([]byte, error) {
+
+	addr := contract.Address()
+	savedGas := contract.Gas
+
+	// ---- MIR run (on a snapshot) ----
+	snapID := r.evm.StateDB.Snapshot()
+
+	log.Warn("MIR dual-exec: running MIR",
+		"block", r.blockNumber, "addr", addr,
+		"codeLen", len(contract.Code), "gasIn", savedGas)
+
+	mirRes := it.Run()
+	mirGasLeft := mirRes.GasLeft
+	mirErr := mirRes.Err
+	mirErrStr := "<nil>"
+	if mirErr != nil {
+		mirErrStr = mirErr.Error()
+	}
+	mirRetHex := fmt.Sprintf("%x", mirRes.ReturnData)
+	mirRefund := r.evm.StateDB.GetRefund()
+
+	log.Warn("MIR dual-exec: MIR result",
+		"block", r.blockNumber, "addr", addr,
+		"gasLeft", mirGasLeft, "gasUsed", savedGas-mirGasLeft,
+		"err", mirErrStr, "retLen", len(mirRes.ReturnData),
+		"refund", mirRefund)
+
+	// Revert MIR's state changes
+	r.evm.StateDB.RevertToSnapshot(snapID)
+	contract.Gas = savedGas
+
+	// ---- Base interpreter run ----
+	if r.baseIt == nil {
+		r.baseIt = vm.NewEVMInterpreter(r.evm)
+	}
+
+	log.Warn("MIR dual-exec: running baseIt",
+		"block", r.blockNumber, "addr", addr,
+		"codeLen", len(contract.Code), "gasIn", contract.Gas)
+
+	baseRet, baseErr := r.baseIt.Run(contract, input, readOnly)
+	baseGasLeft := contract.Gas
+	baseErrStr := "<nil>"
+	if baseErr != nil {
+		baseErrStr = baseErr.Error()
+	}
+	baseRetHex := fmt.Sprintf("%x", baseRet)
+	baseRefund := r.evm.StateDB.GetRefund()
+
+	log.Warn("MIR dual-exec: baseIt result",
+		"block", r.blockNumber, "addr", addr,
+		"gasLeft", baseGasLeft, "gasUsed", savedGas-baseGasLeft,
+		"err", baseErrStr, "retLen", len(baseRet),
+		"refund", baseRefund)
+
+	// ---- Compare ----
+	if mirGasLeft != baseGasLeft {
+		log.Error("MIR dual-exec MISMATCH: gasLeft",
+			"block", r.blockNumber, "addr", addr,
+			"mir", mirGasLeft, "base", baseGasLeft,
+			"diff", int64(mirGasLeft)-int64(baseGasLeft))
+	}
+	if mirErrStr != baseErrStr {
+		log.Error("MIR dual-exec MISMATCH: error",
+			"block", r.blockNumber, "addr", addr,
+			"mir", mirErrStr, "base", baseErrStr)
+	}
+	if mirRetHex != baseRetHex {
+		log.Error("MIR dual-exec MISMATCH: returnData",
+			"block", r.blockNumber, "addr", addr,
+			"mirRetHex", mirRetHex, "baseRetHex", baseRetHex)
+	}
+	if mirRefund != baseRefund {
+		log.Error("MIR dual-exec MISMATCH: refund",
+			"block", r.blockNumber, "addr", addr,
+			"mir", mirRefund, "base", baseRefund)
+	}
+	if mirGasLeft == baseGasLeft && mirErrStr == baseErrStr && mirRetHex == baseRetHex && mirRefund == baseRefund {
+		log.Warn("MIR dual-exec: MATCH ✓",
+			"block", r.blockNumber, "addr", addr)
+	}
+
+	// Return baseIt result as authoritative (so block can pass)
+	return baseRet, baseErr
 }
