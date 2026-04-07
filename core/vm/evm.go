@@ -217,9 +217,10 @@ func (evm *EVM) shouldUseMIR() bool {
 }
 
 func (evm *EVM) runWithRunner(r ContractRunner, contract *Contract, input []byte, readOnly bool) ([]byte, error) {
-	// Mirror (*EVMInterpreter).Run depth management so nested EVM calls observe the correct depth.
-	evm.depth++
-	defer func() { evm.depth-- }()
+	// NOTE: depth is NOT incremented here. The runner's Run() method (or its fallback
+	// baseIt.Run()) is responsible for depth management, just like EVMInterpreter.Run().
+	// This avoids double-increment when the runner falls back to baseIt.Run().
+
 	// Mirror readOnly propagation: set evm.readOnly so that nested calls routed back
 	// through stock EVM (via EVMCallCreateBackend) see the correct readOnly state.
 	// This matches the stock interpreter's behavior in interpreter.go:191-193.

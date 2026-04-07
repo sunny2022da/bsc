@@ -21,6 +21,21 @@ func (evm *EVM) SetMIRRunner(r ContractRunner) {
 	evm.mirRunner = r
 }
 
+// IncDepth increments the EVM call depth. Used by MIR runner to mirror
+// EVMInterpreter.Run() depth management from an external package.
+func (evm *EVM) IncDepth() {
+	if evm != nil {
+		evm.depth++
+	}
+}
+
+// DecDepth decrements the EVM call depth.
+func (evm *EVM) DecDepth() {
+	if evm != nil {
+		evm.depth--
+	}
+}
+
 // GetMIRRunner returns the installed MIR runner, or nil if none is set.
 // Callers can type-assert the result to *mir.EVMRunner to access extended
 // methods such as FellBack().

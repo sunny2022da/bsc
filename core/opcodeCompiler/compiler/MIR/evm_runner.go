@@ -468,6 +468,12 @@ func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]b
 		)
 	}
 
+	// Manage depth for MIR execution, mirroring EVMInterpreter.Run() depth++ / depth--.
+	// This is done here (not in runWithRunner) so fallback paths that call baseIt.Run()
+	// don't double-increment depth (baseIt.Run() manages its own depth).
+	r.evm.IncDepth()
+	defer r.evm.DecDepth()
+
 	// ---- Dual-execution comparison mode for mirDebugBlock ----
 	if mirDebugBlock != 0 && r.blockNumber == mirDebugBlock {
 		ret, err := r.dualExecCompare(contract, input, readOnly, codeHash, cfg, it)
