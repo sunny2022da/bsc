@@ -3457,6 +3457,11 @@ func (it *MIRInterpreter) doCall(op MirOperation, gasReq *uint256.Int, to common
 	if it.readOnly && value != nil && !value.IsZero() {
 		return 0, vm.ErrWriteProtection
 	}
+	doCallDebug := mirDebugBlock != 0 && it.blockNumber == mirDebugBlock
+	gasAtEntry := it.gasUsed
+	if doCallDebug {
+		log.Warn("MIR doCall entry", "op", op, "to", to, "gasUsed", gasAtEntry, "gasLeft", it.gasLeft())
+	}
 	// Memory expansion: stock EVM (memory_table.go memoryCall) takes max(inEnd, outEnd).
 	// Two sequential chargeMemoryExpansion calls are INCORRECT here: the first call
 	// advances memLastGasFee; if the second region is smaller and len(it.mem) has not
@@ -3507,9 +3512,17 @@ func (it *MIRInterpreter) doCall(op MirOperation, gasReq *uint256.Int, to common
 		}
 	}
 
+	if doCallDebug {
+		log.Warn("MIR doCall after memExpansion", "gasUsed", it.gasUsed, "memDelta", it.gasUsed-gasAtEntry)
+	}
+	gasAfterMem := it.gasUsed
+
 	// EIP-2929 warm/cold account access delta for call target
 	if err := it.chargeAccountAccessDelta(to); err != nil {
 		return 0, err
+	}
+	if doCallDebug {
+		log.Warn("MIR doCall after accessDelta", "gasUsed", it.gasUsed, "accessDelta", it.gasUsed-gasAfterMem)
 	}
 
 	// CALL/CALLCODE: new account + value transfer costs
@@ -3548,6 +3561,10 @@ func (it *MIRInterpreter) doCall(op MirOperation, gasReq *uint256.Int, to common
 		gasToSend = avail
 	} else {
 		gasToSend = gasReq.Uint64()
+	}
+
+	if doCallDebug {
+		log.Warn("MIR doCall gasToSend", "avail", avail, "gasToSend", gasToSend, "gasLeft", it.gasLeft())
 	}
 
 	// Charge the transferred gas (caller pays it)
@@ -3596,6 +3613,12 @@ func (it *MIRInterpreter) doCall(op MirOperation, gasReq *uint256.Int, to common
 	// CALL stipend that was added to the callee gas.
 	if returnGas > gasForCallee {
 		returnGas = gasForCallee
+	}
+	if doCallDebug {
+		log.Warn("MIR doCall return", "op", op, "to", to,
+			"gasForCallee", gasForCallee, "returnGas", returnGas,
+			"gasUsedBeforeRefund", it.gasUsed, "err", err,
+			"totalCallCost", it.gasUsed-gasAtEntry)
 	}
 	it.refundGas(returnGas)
 
