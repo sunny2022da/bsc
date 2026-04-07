@@ -298,8 +298,11 @@ func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]b
 			// CFG parse failed (e.g. convergence limit exceeded). This is an MIR
 			// infrastructure failure, not an EVM execution error. Fall back to the
 			// base interpreter so execution result matches stock EVM exactly.
-			log.Warn("MIR fallback to base interpreter",
-				"reason", "CFG parse failed",
+			// Logged at Debug: the error is cached so this contract won't be re-parsed,
+			// but it will still fallback on every call. Warn-level on first parse is
+			// inside getOrBuildCFGEntry's caller (the Parse() call site).
+			log.Debug("MIR fallback to base interpreter",
+				"reason", "CFG parse failed (cached)",
 				"addr", contract.Address(),
 				"codeHash", codeHash,
 				"codeLen", len(contract.Code),

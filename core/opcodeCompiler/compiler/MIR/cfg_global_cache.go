@@ -28,6 +28,9 @@ type cfgCacheEntry struct {
 	// mutable indicates the CFG is expected to be mutated at runtime (dynamic CFG expansion /
 	// runtime incoming snapshots). Immutable CFGs can be executed without taking the lock.
 	mutable bool
+	// parseErr is non-nil when CFG.Parse() failed for this codeHash. Cached so we don't
+	// re-parse (and re-log) the same failing contract every block.
+	parseErr error
 }
 
 var (
@@ -66,10 +69,17 @@ func getOrBuildCFGEntry(codeHash common.Hash, code []byte) (*cfgCacheEntry, erro
 	c := getGlobalCFGCache()
 	// Fast path: read lock for lookup.
 	globalCFGCacheMu.RLock()
-	if e, ok := c.Get(codeHash); ok && e != nil && e.cfg != nil {
-		globalCFGCacheMu.RUnlock()
-		globalCFGCacheHits.Add(1)
-		return e, nil
+	if e, ok := c.Get(codeHash); ok && e != nil {
+		if e.cfg != nil {
+			globalCFGCacheMu.RUnlock()
+			globalCFGCacheHits.Add(1)
+			return e, nil
+		}
+		if e.parseErr != nil {
+			globalCFGCacheMu.RUnlock()
+			globalCFGCacheHits.Add(1)
+			return nil, e.parseErr
+		}
 	}
 	globalCFGCacheMu.RUnlock()
 	globalCFGCacheMisses.Add(1)
@@ -84,6 +94,9 @@ func getOrBuildCFGEntry(codeHash common.Hash, code []byte) (*cfgCacheEntry, erro
 		if e.cfg != nil {
 			return e, nil
 		}
+		if e.parseErr != nil {
+			return nil, e.parseErr
+		}
 		// Fall through to build below (rare).
 	} else {
 		e := &cfgCacheEntry{}
@@ -97,10 +110,8 @@ func getOrBuildCFGEntry(codeHash common.Hash, code []byte) (*cfgCacheEntry, erro
 		}
 		built := NewCFG(codeHash, code)
 		if err := built.Parse(); err != nil {
-			// Don't keep a permanently broken entry in cache.
-			globalCFGCacheMu.Lock()
-			c.Remove(codeHash)
-			globalCFGCacheMu.Unlock()
+			// Cache the failure so we don't re-parse and re-log every block.
+			e.parseErr = err
 			return nil, err
 		}
 		e.cfg = built
