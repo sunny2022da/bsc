@@ -123,6 +123,11 @@ type MIRInterpreter struct {
 	// This avoids an extra interface dispatch layer in hot access-list/state paths.
 	vmStateDB vm.StateDB
 
+	// readOnly is true when MIR is executing inside a STATICCALL frame.
+	// State-modifying opcodes (SSTORE, LOG, CREATE, SELFDESTRUCT, etc.) must
+	// return ErrWriteProtection when this is set, matching stock EVM behaviour.
+	readOnly bool
+
 	// CALL-like context (needed for CALLDATACOPY/RETURNDATACOPY)
 	callData   []byte
 	returnData []byte
@@ -551,6 +556,7 @@ func (it *MIRInterpreter) ResetForRun(cfg *CFG) {
 	it.memLastGasFee = 0
 	it.returnData = nil
 	it.callData = nil
+	it.readOnly = false
 	it.refundApplied = false
 	it.lastEvmPC = 0
 	it.curBlock = nil
@@ -1936,6 +1942,9 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 				}
 
 			case MirSSTORE:
+				if it.readOnly {
+					return it.finishResult(ExecResult{Err: vm.ErrWriteProtection})
+				}
 				keyU, err := it.evalOperand(m, 0)
 				if err != nil {
 					return it.finishResult(ExecResult{Err: err})
@@ -1966,6 +1975,9 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 				it.resultSlot(m).SetBytes(hv[:])
 
 			case MirTSTORE:
+				if it.readOnly {
+					return it.finishResult(ExecResult{Err: vm.ErrWriteProtection})
+				}
 				keyU, err := it.evalOperand(m, 0)
 				if err != nil {
 					return it.finishResult(ExecResult{Err: err})
@@ -2007,6 +2019,9 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 				copy(it.mem[d:d+n], it.mem[s:s+n])
 
 			case MirLOG0, MirLOG1, MirLOG2, MirLOG3, MirLOG4:
+				if it.readOnly {
+					return it.finishResult(ExecResult{Err: vm.ErrWriteProtection})
+				}
 				if err := it.chargeLogDynamicGas(m); err != nil {
 					return it.finishResult(ExecResult{Err: err})
 				}
@@ -2265,6 +2280,9 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 				it.resultSlot(m).SetUint64(ok)
 
 			case MirCREATE:
+				if it.readOnly {
+					return it.finishResult(ExecResult{Err: vm.ErrWriteProtection})
+				}
 				addr, err := it.execCreateLike(m, false)
 				if err != nil {
 					return it.finishResult(ExecResult{Err: err})
@@ -2272,6 +2290,9 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 				it.resultSlot(m).SetBytes(addr.Bytes())
 
 			case MirCREATE2:
+				if it.readOnly {
+					return it.finishResult(ExecResult{Err: vm.ErrWriteProtection})
+				}
 				addr, err := it.execCreateLike(m, true)
 				if err != nil {
 					return it.finishResult(ExecResult{Err: err})
@@ -2434,6 +2455,9 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 				return it.finishResult(ExecResult{HaltOp: MirREVERT, ReturnData: out, Err: vm.ErrExecutionReverted, ReturnOffset: off.Uint64(), ReturnSize: sz.Uint64()})
 
 			case MirSELFDESTRUCT:
+				if it.readOnly {
+					return it.finishResult(ExecResult{Err: vm.ErrWriteProtection})
+				}
 				beneficiary, err := it.evalAddressOperand(m, 0)
 				if err != nil {
 					return it.finishResult(ExecResult{Err: err})
@@ -3429,6 +3453,10 @@ func (it *MIRInterpreter) execCallLike(m *MIR) (uint64, error) {
 }
 
 func (it *MIRInterpreter) doCall(op MirOperation, gasReq *uint256.Int, to common.Address, value, inOff, inSz, outOff, outSz *uint256.Int) (uint64, error) {
+	// STATICCALL context: CALL with non-zero value is forbidden (writes state).
+	if it.readOnly && value != nil && !value.IsZero() {
+		return 0, vm.ErrWriteProtection
+	}
 	// Memory expansion: stock EVM (memory_table.go memoryCall) takes max(inEnd, outEnd).
 	// Two sequential chargeMemoryExpansion calls are INCORRECT here: the first call
 	// advances memLastGasFee; if the second region is smaller and len(it.mem) has not

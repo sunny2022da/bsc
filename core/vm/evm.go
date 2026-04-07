@@ -213,14 +213,20 @@ type EVM struct {
 func (evm *EVM) shouldUseMIR() bool {
 	return evm != nil &&
 		evm.Config.EnableMIR &&
-		evm.mirRunner != nil &&
-		evm.depth == 0
+		evm.mirRunner != nil
 }
 
 func (evm *EVM) runWithRunner(r ContractRunner, contract *Contract, input []byte, readOnly bool) ([]byte, error) {
 	// Mirror (*EVMInterpreter).Run depth management so nested EVM calls observe the correct depth.
 	evm.depth++
 	defer func() { evm.depth-- }()
+	// Mirror readOnly propagation: set evm.readOnly so that nested calls routed back
+	// through stock EVM (via EVMCallCreateBackend) see the correct readOnly state.
+	// This matches the stock interpreter's behavior in interpreter.go:191-193.
+	if readOnly && !evm.readOnly {
+		evm.readOnly = true
+		defer func() { evm.readOnly = false }()
+	}
 	// Keep contract.Input in sync with interpreter behavior.
 	contract.Input = input
 	return r.Run(contract, input, readOnly)
@@ -503,11 +509,24 @@ func (evm *EVM) CallCode(caller common.Address, addr common.Address, input []byt
 	// It is allowed to call precompiles, even via delegatecall
 	if p, isPrecompile := evm.precompile(addr); isPrecompile {
 		ret, gas, err = RunPrecompiledContract(p, input, gas, evm.Config.Tracer)
+	} else if evm.shouldUseMIR() && !isSystemContract(&addr) {
+		// MIR dispatch for CallCode: code from addr, execution context is caller.
+		contract := GetContract(caller, caller, value, gas, evm.jumpDests)
+		defer ReturnContract(contract)
+		codeHash := evm.resolveCodeHash(addr)
+		contract.SetCallCode(&addr, codeHash, evm.resolveCode(addr))
+		mirTopLevelAttempts.Add(1)
+		ret, err = evm.runWithRunner(evm.mirRunner, contract, input, false)
+		if evm.mirRunner.FellBack() {
+			mirTopLevelFallbacks.Add(1)
+		} else if err == nil {
+			mirTopLevelSucceeded.Add(1)
+		}
+		maybeLogMIRCounters()
+		gas = contract.Gas
 	} else {
 		if evm.Config.EnableOpcodeOptimizations {
 			addrCopy := addr
-			// Initialise a new contract and set the code that is to be used by the EVM.
-			// The contract is a scoped environment for this execution context only.
 			contract := GetContract(caller, caller, value, gas, evm.jumpDests)
 			defer ReturnContract(contract)
 			code := evm.resolveCode(addr)
@@ -526,8 +545,6 @@ func (evm *EVM) CallCode(caller common.Address, addr common.Address, input []byt
 			gas = contract.Gas
 		} else {
 			addrCopy := addr
-			// Initialise a new contract and set the code that is to be used by the EVM.
-			// The contract is a scoped environment for this execution context only.
 			contract := GetContract(caller, caller, value, gas, evm.jumpDests)
 			defer ReturnContract(contract)
 
@@ -571,10 +588,24 @@ func (evm *EVM) DelegateCall(originCaller common.Address, caller common.Address,
 	// It is allowed to call precompiles, even via delegatecall
 	if p, isPrecompile := evm.precompile(addr); isPrecompile {
 		ret, gas, err = RunPrecompiledContract(p, input, gas, evm.Config.Tracer)
+	} else if evm.shouldUseMIR() && !isSystemContract(&addr) {
+		// MIR dispatch for DelegateCall: code from addr, caller context is originCaller/caller.
+		contract := GetContract(originCaller, caller, value, gas, evm.jumpDests)
+		defer ReturnContract(contract)
+		codeHash := evm.resolveCodeHash(addr)
+		contract.SetCallCode(&addr, codeHash, evm.resolveCode(addr))
+		mirTopLevelAttempts.Add(1)
+		ret, err = evm.runWithRunner(evm.mirRunner, contract, input, false)
+		if evm.mirRunner.FellBack() {
+			mirTopLevelFallbacks.Add(1)
+		} else if err == nil {
+			mirTopLevelSucceeded.Add(1)
+		}
+		maybeLogMIRCounters()
+		gas = contract.Gas
 	} else {
 		if evm.Config.EnableOpcodeOptimizations {
 			addrCopy := addr
-			// Initialise a new contract and make initialise the delegate values
 			contract := GetContract(originCaller, caller, value, gas, evm.jumpDests)
 			defer ReturnContract(contract)
 			code := evm.resolveCode(addr)
@@ -591,7 +622,6 @@ func (evm *EVM) DelegateCall(originCaller common.Address, caller common.Address,
 			gas = contract.Gas
 		} else {
 			addrCopy := addr
-			// Initialise a new contract and make initialise the delegate values
 			contract := GetContract(originCaller, caller, value, gas, evm.jumpDests)
 			defer ReturnContract(contract)
 
@@ -643,11 +673,24 @@ func (evm *EVM) StaticCall(caller common.Address, addr common.Address, input []b
 
 	if p, isPrecompile := evm.precompile(addr); isPrecompile {
 		ret, gas, err = RunPrecompiledContract(p, input, gas, evm.Config.Tracer)
+	} else if evm.shouldUseMIR() && !isSystemContract(&addr) {
+		// MIR dispatch for StaticCall (readOnly=true).
+		contract := GetContract(caller, addr, new(uint256.Int), gas, evm.jumpDests)
+		defer ReturnContract(contract)
+		codeHash := evm.resolveCodeHash(addr)
+		contract.SetCallCode(&addr, codeHash, evm.resolveCode(addr))
+		mirTopLevelAttempts.Add(1)
+		ret, err = evm.runWithRunner(evm.mirRunner, contract, input, true)
+		if evm.mirRunner.FellBack() {
+			mirTopLevelFallbacks.Add(1)
+		} else if err == nil {
+			mirTopLevelSucceeded.Add(1)
+		}
+		maybeLogMIRCounters()
+		gas = contract.Gas
 	} else {
 		if evm.Config.EnableOpcodeOptimizations {
 			addrCopy := addr
-			// Initialise a new contract and set the code that is to be used by the EVM.
-			// The contract is a scoped environment for this execution context only.
 			contract := GetContract(caller, addr, new(uint256.Int), gas, evm.jumpDests)
 			defer ReturnContract(contract)
 			code := evm.resolveCode(addr)
@@ -660,22 +703,13 @@ func (evm *EVM) StaticCall(caller common.Address, addr common.Address, input []b
 				evm.UseBaseInterpreter()
 			}
 			contract.SetCallCode(&addrCopy, codeHash, code)
-			// When an error was returned by the EVM or when setting the creation code
-			// above we revert to the snapshot and consume any gas remaining. Additionally
-			// when we're in Homestead this also counts for code storage gas errors.
 			ret, err = evm.interpreter.Run(contract, input, true)
 			gas = contract.Gas
 		} else {
 			addrCopy := addr
-			// Initialise a new contract and set the code that is to be used by the EVM.
-			// The contract is a scoped environment for this execution context only.
 			contract := GetContract(caller, addr, new(uint256.Int), gas, evm.jumpDests)
 			defer ReturnContract(contract)
-
 			contract.SetCallCode(&addrCopy, evm.resolveCodeHash(addr), evm.resolveCode(addr))
-			// When an error was returned by the EVM or when setting the creation code
-			// above we revert to the snapshot and consume any gas remaining. Additionally
-			// when we're in Homestead this also counts for code storage gas errors.
 			ret, err = evm.interpreter.Run(contract, input, true)
 			gas = contract.Gas
 		}

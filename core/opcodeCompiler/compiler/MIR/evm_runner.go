@@ -89,6 +89,10 @@ type EVMRunner struct {
 	lastCodeHash common.Hash
 	lastEntry    *cfgCacheEntry
 
+	// lockedEntries tracks CFG entries locked by this runner during the current call stack.
+	// This prevents deadlocks on re-entrant calls to the same contract (A calls A).
+	lockedEntries map[common.Hash]struct{}
+
 	// Cached per-EVM block context (constant for this EVM instance).
 	blockNumber uint64
 	chainRules  params.Rules
@@ -214,13 +218,6 @@ func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]b
 		return r.baseIt.Run(contract, input, readOnly)
 	}
 
-	// For now, only support non-readOnly execution for MIR top-level calls/creates.
-	// Nested STATICCALL frames are executed by geth (depth>0), so this is mostly a guard.
-	if readOnly {
-		r.fellBack = true
-		return nil, vm.ErrWriteProtection
-	}
-
 	// MIRInterpreter treats gasLimit==0 as "unlimited gas" (tools/test mode).
 	// When contract.Gas is genuinely zero, passing 0 would trigger that mode and cause
 	// gasLeft() to return MaxUint64, making subcall gas calculations overflow wildly.
@@ -310,8 +307,19 @@ func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]b
 	cfg := entry.cfg
 	// CFGs are mutated during execution (incoming snapshots, rebuild metadata, etc.).
 	// Serialize per-contract executions across goroutines to avoid races/corruption.
-	entry.mu.Lock()
-	defer entry.mu.Unlock()
+	// Re-entrant calls (A calls A) skip the lock since this runner already holds it.
+	_, alreadyLocked := r.lockedEntries[codeHash]
+	if !alreadyLocked {
+		entry.mu.Lock()
+		if r.lockedEntries == nil {
+			r.lockedEntries = make(map[common.Hash]struct{})
+		}
+		r.lockedEntries[codeHash] = struct{}{}
+		defer func() {
+			delete(r.lockedEntries, codeHash)
+			entry.mu.Unlock()
+		}()
+	}
 
 	// Performance fast-path:
 	// For some large contracts and CFGs that require runtime repair bookkeeping, MIR is currently
@@ -385,14 +393,21 @@ func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]b
 		cfg.runtimeEpoch = 0
 	}
 
-	it := r.it
-	if it == nil {
+	// Allocate a per-call interpreter from the pool. This supports re-entrant MIR calls
+	// (contract A via MIR calls contract B via MIR) without corrupting the outer frame.
+	// The interpreter is returned to the pool after execution completes.
+	var it *MIRInterpreter
+	if r.it != nil {
+		// Fast path for non-reentrant (most common): reuse cached instance.
+		it = r.it
+		r.it = nil // take ownership; will be restored after Run()
+	} else {
 		it = globalInterpreterPool.Get().(*MIRInterpreter)
-		r.it = it
 	}
 	it.ResetForRun(cfg)
 	// Hot-path setup: write fields directly (same package) to avoid setter call overhead.
 	it.gasLimit = contract.Gas
+	it.readOnly = readOnly
 	// IMPORTANT: Refund cap is applied by geth's state transition logic, not the runner.
 	// If MIR applies it internally, it will incorrectly refund against post-intrinsic call gas.
 	it.applyRefundCapInFinish = false
@@ -449,7 +464,14 @@ func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]b
 
 	// ---- Dual-execution comparison mode for mirDebugBlock ----
 	if mirDebugBlock != 0 && r.blockNumber == mirDebugBlock {
-		return r.dualExecCompare(contract, input, readOnly, codeHash, cfg, it)
+		ret, err := r.dualExecCompare(contract, input, readOnly, codeHash, cfg, it)
+		// Return interpreter to cache or pool.
+		if r.it == nil {
+			r.it = it
+		} else {
+			globalInterpreterPool.Put(it)
+		}
+		return ret, err
 	}
 
 	res := it.Run()
@@ -517,6 +539,14 @@ func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]b
 		delete(r.localCFGCache, codeHash)
 	}
 	contract.Gas = res.GasLeft
+
+	// Return interpreter to cache or pool for reuse.
+	if r.it == nil {
+		r.it = it // restore to fast-path cache for next non-reentrant call
+	} else {
+		globalInterpreterPool.Put(it) // reentrant case: outer already restored r.it
+	}
+
 	return res.ReturnData, res.Err
 }
 
