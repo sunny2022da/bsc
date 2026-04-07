@@ -2991,28 +2991,31 @@ func (it *MIRInterpreter) chargeMemoryExpansion(offset, size *uint256.Int) error
 	if offset == nil || size == nil {
 		return nil
 	}
+	// Match stock EVM (calcMemSize64): check size==0 FIRST, before any offset checks.
+	// When size is zero, no memory expansion is needed regardless of offset value.
+	// This is critical: stock EVM returns (0, false) for size==0 even if offset overflows uint64.
+	if size.IsZero() {
+		return nil
+	}
+
 	// Fast no-expansion path: if the accessed range is already within current memory size,
 	// we can return without any word-size rounding or quadratic fee math.
-	//
-	// This is extremely common for small view calls which touch the same small memory window
-	// repeatedly (e.g. ABI encoding of return values).
 	memLen := uint64(len(it.mem))
 	if memLen != 0 && offset.BitLen() <= 64 && size.BitLen() <= 64 {
 		off := offset.Uint64()
 		sz := size.Uint64()
-		if sz == 0 {
-			return nil
-		}
 		end := off + sz
 		if end < off {
-			return errors.New("memory expansion overflow")
+			// Overflow in fast path: stock EVM → ErrGasUintOverflow → OOG.
+			it.gasUsed = it.gasLimit
+			return nil
 		}
 		if end <= memLen {
 			return nil
 		}
 	}
 
-	// Hot path: most memory accesses are well within uint64. Avoid the slower Uint64WithOverflow.
+	// Slow path: convert to uint64, checking for overflow.
 	var off, sz uint64
 	if offset.BitLen() <= 64 {
 		off = offset.Uint64()
@@ -3020,7 +3023,9 @@ func (it *MIRInterpreter) chargeMemoryExpansion(offset, size *uint256.Int) error
 		var offOverflow bool
 		off, offOverflow = offset.Uint64WithOverflow()
 		if offOverflow {
-			return errors.New("memory offset overflow")
+			// Stock EVM: offset overflow → ErrGasUintOverflow → OOG. Consume all gas.
+			it.gasUsed = it.gasLimit
+			return nil
 		}
 	}
 	if size.BitLen() <= 64 {
@@ -3029,12 +3034,10 @@ func (it *MIRInterpreter) chargeMemoryExpansion(offset, size *uint256.Int) error
 		var szOverflow bool
 		sz, szOverflow = size.Uint64WithOverflow()
 		if szOverflow {
-			return errors.New("memory size overflow")
+			// Stock EVM: size overflow → ErrGasUintOverflow → OOG. Consume all gas.
+			it.gasUsed = it.gasLimit
+			return nil
 		}
-	}
-	// Zero-size access does not expand memory.
-	if sz == 0 {
-		return nil
 	}
 	newSize := off + sz
 	// Mirror vm.memoryGasCost logic, but with our own last-fee tracking.
@@ -3042,7 +3045,8 @@ func (it *MIRInterpreter) chargeMemoryExpansion(offset, size *uint256.Int) error
 		return nil
 	}
 	if newSize > 0x1FFFFFFFE0 {
-		return errors.New("memory expansion overflow")
+		it.gasUsed = it.gasLimit
+		return nil
 	}
 	newWords := toWordSize(newSize)
 	newSizeRounded := newWords * 32
@@ -3441,16 +3445,20 @@ func (it *MIRInterpreter) doCall(op MirOperation, gasReq *uint256.Int, to common
 				var ov bool
 				o, ov = off.Uint64WithOverflow()
 				if ov {
-					return 0, errors.New("call memory offset overflow")
+					// Stock EVM: overflow → ErrGasUintOverflow → OOG.
+					it.gasUsed = it.gasLimit
+					return 0, nil
 				}
 			}
 			s, ov := sz.Uint64WithOverflow()
 			if ov {
-				return 0, errors.New("call memory size overflow")
+				it.gasUsed = it.gasLimit
+				return 0, nil
 			}
 			end := o + s
 			if end < o {
-				return 0, errors.New("call memory size overflow")
+				it.gasUsed = it.gasLimit
+				return 0, nil
 			}
 			return end, nil
 		}
