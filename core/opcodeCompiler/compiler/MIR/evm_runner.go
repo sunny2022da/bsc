@@ -10,6 +10,7 @@ import (
 	"syscall"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/tracing"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/log"
@@ -20,6 +21,11 @@ var mirDebugBlockOnce sync.Once
 
 // mirRunnerDebugLog is true when MIR_DEBUG_LOG=1 is set.
 var mirRunnerDebugLog = os.Getenv("MIR_DEBUG_LOG") == "1"
+
+// mirStepTrace enables per-opcode gas tracing in dual-exec mode (MIR_DEBUG_BLOCK).
+// When set, both MIR and stock EVM runs capture (pc, op, gasUsed) for each step,
+// and the first gas divergence is logged with context.
+var mirStepTrace = os.Getenv("MIR_STEP_TRACE") == "1"
 
 // mirForceBase forces every Run() call to use the base interpreter (no MIR, no optIt).
 // Set MIR_FORCE_BASE=1 to diagnose whether MIR state corruption in earlier blocks
@@ -550,22 +556,48 @@ func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]b
 	return res.ReturnData, res.Err
 }
 
+// stepRecord captures one opcode execution step for gas tracing comparison.
+type stepRecord struct {
+	pc      uint64
+	op      byte
+	gasUsed uint64 // cumulative gas used up to this point
+	depth   int
+}
+
 // dualExecCompare runs the contract through MIR first, reverts state, then runs through
 // baseIt. Logs a detailed comparison and returns the baseIt result as authoritative.
+// When mirStepTrace is enabled, captures per-opcode gas traces and reports the first divergence.
 func (r *EVMRunner) dualExecCompare(contract *vm.Contract, input []byte, readOnly bool,
 	codeHash common.Hash, cfg *CFG, it *MIRInterpreter) ([]byte, error) {
 
 	addr := contract.Address()
 	savedGas := contract.Gas
 
+	// ---- Step trace collection (optional) ----
+	var mirSteps []stepRecord
+	var baseSteps []stepRecord
+
+	if mirStepTrace {
+		// Install MIR step hook to capture per-opcode gas.
+		it.stepHook = func(evmPC uint, evmOp byte, op MirOperation) {
+			mirSteps = append(mirSteps, stepRecord{
+				pc:      uint64(evmPC),
+				op:      evmOp,
+				gasUsed: it.gasUsed,
+			})
+		}
+	}
+
 	// ---- MIR run (on a snapshot) ----
 	snapID := r.evm.StateDB.Snapshot()
 
 	log.Warn("MIR dual-exec: running MIR",
 		"block", r.blockNumber, "addr", addr,
-		"codeLen", len(contract.Code), "gasIn", savedGas)
+		"codeLen", len(contract.Code), "gasIn", savedGas,
+		"stepTrace", mirStepTrace)
 
 	mirRes := it.Run()
+	it.stepHook = nil // clear hook
 	mirGasLeft := mirRes.GasLeft
 	mirErr := mirRes.Err
 	mirErrStr := "<nil>"
@@ -579,7 +611,7 @@ func (r *EVMRunner) dualExecCompare(contract *vm.Contract, input []byte, readOnl
 		"block", r.blockNumber, "addr", addr,
 		"gasLeft", mirGasLeft, "gasUsed", savedGas-mirGasLeft,
 		"err", mirErrStr, "retLen", len(mirRes.ReturnData),
-		"refund", mirRefund)
+		"refund", mirRefund, "steps", len(mirSteps))
 
 	// Revert MIR's state changes
 	r.evm.StateDB.RevertToSnapshot(snapID)
@@ -590,11 +622,32 @@ func (r *EVMRunner) dualExecCompare(contract *vm.Contract, input []byte, readOnl
 		r.baseIt = vm.NewEVMInterpreter(r.evm)
 	}
 
+	// Install stock EVM tracer for step capture.
+	var savedTracer *tracing.Hooks
+	if mirStepTrace {
+		savedTracer = r.evm.Config.Tracer
+		r.evm.Config.Tracer = &tracing.Hooks{
+			OnOpcode: func(pc uint64, op byte, gas, cost uint64, scope tracing.OpContext, rData []byte, depth int, err error) {
+				baseSteps = append(baseSteps, stepRecord{
+					pc:      pc,
+					op:      op,
+					gasUsed: savedGas - gas,
+					depth:   depth,
+				})
+			},
+		}
+	}
+
 	log.Warn("MIR dual-exec: running baseIt",
 		"block", r.blockNumber, "addr", addr,
 		"codeLen", len(contract.Code), "gasIn", contract.Gas)
 
 	baseRet, baseErr := r.baseIt.Run(contract, input, readOnly)
+
+	if mirStepTrace {
+		r.evm.Config.Tracer = savedTracer // restore
+	}
+
 	baseGasLeft := contract.Gas
 	baseErrStr := "<nil>"
 	if baseErr != nil {
@@ -607,7 +660,7 @@ func (r *EVMRunner) dualExecCompare(contract *vm.Contract, input []byte, readOnl
 		"block", r.blockNumber, "addr", addr,
 		"gasLeft", baseGasLeft, "gasUsed", savedGas-baseGasLeft,
 		"err", baseErrStr, "retLen", len(baseRet),
-		"refund", baseRefund)
+		"refund", baseRefund, "steps", len(baseSteps))
 
 	// ---- Compare ----
 	if mirGasLeft != baseGasLeft {
@@ -636,6 +689,79 @@ func (r *EVMRunner) dualExecCompare(contract *vm.Contract, input []byte, readOnl
 			"block", r.blockNumber, "addr", addr)
 	}
 
+	// ---- Step trace comparison ----
+	if mirStepTrace && len(mirSteps) > 0 && len(baseSteps) > 0 {
+		r.compareStepTraces(addr, mirSteps, baseSteps)
+	}
+
 	// Return baseIt result as authoritative (so block can pass)
 	return baseRet, baseErr
+}
+
+// compareStepTraces finds and logs the first opcode where MIR and stock EVM gas diverge.
+func (r *EVMRunner) compareStepTraces(addr common.Address, mirSteps, baseSteps []stepRecord) {
+	// Walk both traces by matching on (pc, op). MIR may skip some PCs that stock EVM steps
+	// through (e.g. PUSH data bytes), so we align by PC.
+	mi, bi := 0, 0
+	for mi < len(mirSteps) && bi < len(baseSteps) {
+		ms, bs := mirSteps[mi], baseSteps[bi]
+		if ms.pc == bs.pc && ms.op == bs.op {
+			if ms.gasUsed != bs.gasUsed {
+				// Found divergence — log context around it.
+				opName := vm.OpCode(ms.op).String()
+				log.Error("MIR step-trace DIVERGENCE",
+					"addr", addr,
+					"stepMIR", mi, "stepBase", bi,
+					"pc", ms.pc, "op", opName,
+					"mir.gasUsed", ms.gasUsed,
+					"base.gasUsed", bs.gasUsed,
+					"diff", int64(ms.gasUsed)-int64(bs.gasUsed),
+				)
+				// Log a few steps before/after for context.
+				start := mi - 5
+				if start < 0 {
+					start = 0
+				}
+				end := mi + 5
+				if end > len(mirSteps) {
+					end = len(mirSteps)
+				}
+				bStart := bi - 5
+				if bStart < 0 {
+					bStart = 0
+				}
+				bEnd := bi + 5
+				if bEnd > len(baseSteps) {
+					bEnd = len(baseSteps)
+				}
+				for i := start; i < end; i++ {
+					s := mirSteps[i]
+					marker := "  "
+					if i == mi {
+						marker = ">>"
+					}
+					log.Error(fmt.Sprintf("MIR step-trace [MIR] %s step=%d pc=%d op=%s gasUsed=%d",
+						marker, i, s.pc, vm.OpCode(s.op).String(), s.gasUsed))
+				}
+				for i := bStart; i < bEnd; i++ {
+					s := baseSteps[i]
+					marker := "  "
+					if i == bi {
+						marker = ">>"
+					}
+					log.Error(fmt.Sprintf("MIR step-trace [BASE] %s step=%d pc=%d op=%s gasUsed=%d",
+						marker, i, s.pc, vm.OpCode(s.op).String(), s.gasUsed))
+				}
+				return
+			}
+			mi++
+			bi++
+		} else if ms.pc < bs.pc {
+			mi++ // MIR has extra step, skip
+		} else {
+			bi++ // base has extra step, skip
+		}
+	}
+	log.Warn("MIR step-trace: no gas divergence found in aligned steps",
+		"addr", addr, "mirSteps", len(mirSteps), "baseSteps", len(baseSteps))
 }
