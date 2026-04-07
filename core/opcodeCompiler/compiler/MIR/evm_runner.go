@@ -694,8 +694,14 @@ func (r *EVMRunner) dualExecCompare(contract *vm.Contract, input []byte, readOnl
 			"block", r.blockNumber, "addr", addr)
 	}
 
-	// ---- Step trace dump on MISMATCH ----
+	// ---- CFG dump on MISMATCH ----
 	hasMismatch := mirGasLeft != baseGasLeft || mirErrStr != baseErrStr
+	if hasMismatch && cfg != nil {
+		dump := DebugDumpMIRForEvmPCRange(cfg, 0, 300)
+		log.Error("MIR dual-exec: CFG dump (pc 0-300):\n" + dump)
+	}
+
+	// ---- Step trace dump on MISMATCH ----
 	if mirStepTrace && hasMismatch {
 		// Dump ALL MIR steps so we can see the full gas progression.
 		log.Error(fmt.Sprintf("MIR step-trace: dumping all %d MIR steps (mismatch detected)", len(mirSteps)))
