@@ -239,25 +239,6 @@ func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]b
 		return r.baseIt.Run(contract, input, readOnly)
 	}
 
-	// Perf gate fast-path (vm/runtime, common view calls):
-	// Avoid any MIR/CFG machinery for large contracts by dispatching directly to an optimized
-	// native interpreter (superinstructions). This ensures EnableMIR never regresses performance
-	// on large, hot contracts.
-	//
-	// Note: this is a deliberate performance trade-off; correctness remains native-EVM.
-	if len(contract.Code) > 2048 {
-		if mirDebugBlock != 0 && r.blockNumber == mirDebugBlock {
-			log.Warn("MIR fallback", "block", r.blockNumber, "reason", "code>2048 (diag: using baseIt)", "addr", contract.Address(), "codeLen", len(contract.Code))
-		} else {
-			log.Debug("MIR fallback to base interpreter (diag)", "reason", "code>2048", "addr", contract.Address(), "codeLen", len(contract.Code))
-		}
-		r.fellBack = true
-		if r.baseIt == nil {
-			r.baseIt = vm.NewEVMInterpreter(r.evm)
-		}
-		return r.baseIt.Run(contract, input, readOnly)
-	}
-
 	codeHash := contract.CodeHash
 	if (codeHash == common.Hash{}) {
 		// Some call paths may not set CodeHash. Prefer fetching it from StateDB (fast),
@@ -338,21 +319,19 @@ func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]b
 	// EnableMIR never regresses performance (perf gate).
 	//
 	// NOTE: This still preserves native EVM semantics; it's purely a performance dispatch choice.
-	if cfg != nil && (cfg.needsRuntimeEpoch() || len(contract.Code) > 2048) {
+	if cfg != nil && cfg.needsRuntimeEpoch() {
 		if mirDebugBlock != 0 && r.blockNumber == mirDebugBlock {
 			log.Warn("MIR fallback", "block", r.blockNumber,
-				"reason", "needsRuntimeEpoch or code>2048",
+				"reason", "needsRuntimeEpoch",
 				"addr", contract.Address(),
 				"codeLen", len(contract.Code),
-				"needsRuntimeEpoch", cfg.needsRuntimeEpoch(),
 			)
 		} else {
-			log.Debug("MIR fallback to opt interpreter",
-				"reason", "needsRuntimeEpoch or code>2048",
+			log.Debug("MIR fallback to base interpreter",
+				"reason", "needsRuntimeEpoch",
 				"addr", contract.Address(),
 				"codeHash", codeHash,
 				"codeLen", len(contract.Code),
-				"needsRuntimeEpoch", cfg.needsRuntimeEpoch(),
 			)
 		}
 		r.fellBack = true

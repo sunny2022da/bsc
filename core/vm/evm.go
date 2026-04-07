@@ -416,7 +416,7 @@ func (evm *EVM) Call(caller common.Address, addr common.Address, input []byte, g
 						"err", err,
 					)
 				}
-				if err == nil {
+				if err == nil && !evm.mirRunner.FellBack() {
 					mirTopLevelSucceeded.Add(1)
 					maybeLogMIRCounters()
 				}
