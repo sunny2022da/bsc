@@ -14,10 +14,12 @@ func DebugDumpMIRForEvmPCRange(cfg *CFG, start, end uint) string {
 		return "<nil cfg>\n"
 	}
 	type row struct {
-		evmPC uint
-		evmOp byte
-		op    MirOperation
-		line  string
+		evmPC    uint
+		evmOp    byte
+		op       MirOperation
+		blockPC  uint
+		instrIdx int
+		line     string
 	}
 	rows := make([]row, 0, 256)
 
@@ -25,7 +27,7 @@ func DebugDumpMIRForEvmPCRange(cfg *CFG, start, end uint) string {
 		if b == nil {
 			continue
 		}
-		for _, m := range b.instructions {
+		for idx, m := range b.instructions {
 			if m == nil {
 				continue
 			}
@@ -58,11 +60,27 @@ func DebugDumpMIRForEvmPCRange(cfg *CFG, start, end uint) string {
 					ops = append(ops, fmt.Sprintf("op%d=UNK", i))
 				}
 			}
+			nChildren := 0
+			childPCs := ""
+			if b.jumpTable != nil {
+				for pc, ch := range b.jumpTable {
+					if ch != nil {
+						if nChildren > 0 {
+							childPCs += ","
+						}
+						childPCs += fmt.Sprintf("%d", pc)
+						nChildren++
+					}
+				}
+			}
+			blockInfo := fmt.Sprintf("[block@%d #%d/%d children=%s]", b.firstPC, idx, len(b.instructions), childPCs)
 			rows = append(rows, row{
-				evmPC: m.evmPC,
-				evmOp: m.evmOp,
-				op:    m.op,
-				line:  fmt.Sprintf("evmPC=%d evmOp=0x%02x mirOp=%s | %s", m.evmPC, m.evmOp, m.op.String(), strings.Join(ops, " ")),
+				evmPC:    m.evmPC,
+				evmOp:    m.evmOp,
+				op:       m.op,
+				blockPC:  b.firstPC,
+				instrIdx: idx,
+				line:     fmt.Sprintf("%s evmPC=%d evmOp=0x%02x mirOp=%s | %s", blockInfo, m.evmPC, m.evmOp, m.op.String(), strings.Join(ops, " ")),
 			})
 		}
 	}
