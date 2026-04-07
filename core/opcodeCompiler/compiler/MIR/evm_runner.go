@@ -695,79 +695,42 @@ func (r *EVMRunner) dualExecCompare(contract *vm.Contract, input []byte, readOnl
 			"block", r.blockNumber, "addr", addr)
 	}
 
-	// ---- Step trace comparison ----
-	if mirStepTrace && len(mirSteps) > 0 && len(baseSteps) > 0 {
-		r.compareStepTraces(addr, mirSteps, baseSteps)
+	// ---- Step trace dump on MISMATCH ----
+	hasMismatch := mirGasLeft != baseGasLeft || mirErrStr != baseErrStr
+	if mirStepTrace && hasMismatch {
+		// Dump ALL MIR steps so we can see the full gas progression.
+		log.Error(fmt.Sprintf("MIR step-trace: dumping all %d MIR steps (mismatch detected)", len(mirSteps)))
+		for i, s := range mirSteps {
+			delta := uint64(0)
+			if i > 0 {
+				delta = s.gasUsed - mirSteps[i-1].gasUsed
+			} else {
+				delta = s.gasUsed
+			}
+			log.Error(fmt.Sprintf("MIR step [MIR] step=%d pc=%d op=%s gasUsed=%d delta=%d",
+				i, s.pc, vm.OpCode(s.op).String(), s.gasUsed, delta))
+		}
+		// Also dump base steps at depth=0 only (filter out sub-call steps).
+		// Stock EVM OnOpcode includes all depths; filter to match outer contract.
+		log.Error(fmt.Sprintf("MIR step-trace: dumping depth-filtered base steps (%d total)", len(baseSteps)))
+		// Find the min depth in base steps (should be the outer call depth).
+		minDepth := int(^uint(0) >> 1)
+		for _, s := range baseSteps {
+			if s.depth < minDepth {
+				minDepth = s.depth
+			}
+		}
+		baseIdx := 0
+		for _, s := range baseSteps {
+			if s.depth != minDepth {
+				continue
+			}
+			log.Error(fmt.Sprintf("MIR step [BASE] idx=%d pc=%d op=%s gasUsed=%d depth=%d",
+				baseIdx, s.pc, vm.OpCode(s.op).String(), s.gasUsed, s.depth))
+			baseIdx++
+		}
 	}
 
 	// Return baseIt result as authoritative (so block can pass)
 	return baseRet, baseErr
-}
-
-// compareStepTraces finds and logs the first opcode where MIR and stock EVM gas diverge.
-func (r *EVMRunner) compareStepTraces(addr common.Address, mirSteps, baseSteps []stepRecord) {
-	// Walk both traces by matching on (pc, op). MIR may skip some PCs that stock EVM steps
-	// through (e.g. PUSH data bytes), so we align by PC.
-	mi, bi := 0, 0
-	for mi < len(mirSteps) && bi < len(baseSteps) {
-		ms, bs := mirSteps[mi], baseSteps[bi]
-		if ms.pc == bs.pc && ms.op == bs.op {
-			if ms.gasUsed != bs.gasUsed {
-				// Found divergence — log context around it.
-				opName := vm.OpCode(ms.op).String()
-				log.Error("MIR step-trace DIVERGENCE",
-					"addr", addr,
-					"stepMIR", mi, "stepBase", bi,
-					"pc", ms.pc, "op", opName,
-					"mir.gasUsed", ms.gasUsed,
-					"base.gasUsed", bs.gasUsed,
-					"diff", int64(ms.gasUsed)-int64(bs.gasUsed),
-				)
-				// Log a few steps before/after for context.
-				start := mi - 5
-				if start < 0 {
-					start = 0
-				}
-				end := mi + 5
-				if end > len(mirSteps) {
-					end = len(mirSteps)
-				}
-				bStart := bi - 5
-				if bStart < 0 {
-					bStart = 0
-				}
-				bEnd := bi + 5
-				if bEnd > len(baseSteps) {
-					bEnd = len(baseSteps)
-				}
-				for i := start; i < end; i++ {
-					s := mirSteps[i]
-					marker := "  "
-					if i == mi {
-						marker = ">>"
-					}
-					log.Error(fmt.Sprintf("MIR step-trace [MIR] %s step=%d pc=%d op=%s gasUsed=%d",
-						marker, i, s.pc, vm.OpCode(s.op).String(), s.gasUsed))
-				}
-				for i := bStart; i < bEnd; i++ {
-					s := baseSteps[i]
-					marker := "  "
-					if i == bi {
-						marker = ">>"
-					}
-					log.Error(fmt.Sprintf("MIR step-trace [BASE] %s step=%d pc=%d op=%s gasUsed=%d",
-						marker, i, s.pc, vm.OpCode(s.op).String(), s.gasUsed))
-				}
-				return
-			}
-			mi++
-			bi++
-		} else if ms.pc < bs.pc {
-			mi++ // MIR has extra step, skip
-		} else {
-			bi++ // base has extra step, skip
-		}
-	}
-	log.Warn("MIR step-trace: no gas divergence found in aligned steps",
-		"addr", addr, "mirSteps", len(mirSteps), "baseSteps", len(baseSteps))
 }
