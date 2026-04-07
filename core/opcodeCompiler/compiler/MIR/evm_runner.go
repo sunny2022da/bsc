@@ -7,7 +7,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/tracing"
@@ -194,15 +193,15 @@ func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]b
 	r.fellBack = false
 
 	// Halt after the debug block has finished: when we see a Run() call for a LATER block,
-	// it means the debug block was processed. Pause so the operator can inspect/rollback.
+	// it means the debug block was processed. Exit so the node stops cleanly.
+	// The debug block was already imported, so next startup resumes from debugBlock+1.
+	// To re-run the debug block, the operator must setHead before restarting.
 	if mirHaltAfterBlock && mirDebugBlock != 0 && r.blockNumber > mirDebugBlock {
-		log.Warn("MIR_HALT_AFTER_BLOCK: debug block completed, halting process",
+		log.Warn("MIR_HALT_AFTER_BLOCK: debug block completed, exiting process",
 			"debugBlock", mirDebugBlock, "currentBlock", r.blockNumber)
-		// Send SIGSTOP to ourselves — the process freezes and can be resumed with kill -CONT.
-		// Use os.Exit(0) instead for a clean shutdown.
-		fmt.Fprintf(os.Stderr, "\n[MIR] Block %d completed. Process halting. Use kill -CONT %d to resume, or kill %d to stop.\n",
-			mirDebugBlock, os.Getpid(), os.Getpid())
-		syscall.Kill(os.Getpid(), syscall.SIGSTOP)
+		fmt.Fprintf(os.Stderr, "\n[MIR] Block %d completed. Exiting.\n", mirDebugBlock)
+		fmt.Fprintf(os.Stderr, "[MIR] To re-run: geth attach <ipc> --exec 'debug.setHead(\"0x%x\")' then restart.\n", mirDebugBlock-1)
+		os.Exit(0)
 	}
 
 	// Diagnosis: MIR_FORCE_BASE=1 bypasses all MIR/optIt logic, using only the base
