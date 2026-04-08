@@ -512,19 +512,24 @@ func (evm *EVM) CallCode(caller common.Address, addr common.Address, input []byt
 		ret, gas, err = RunPrecompiledContract(p, input, gas, evm.Config.Tracer)
 	} else if evm.shouldUseMIR() && !isSystemContract(&addr) {
 		// MIR dispatch for CallCode: code from addr, execution context is caller.
-		contract := GetContract(caller, caller, value, gas, evm.jumpDests)
-		defer ReturnContract(contract)
-		codeHash := evm.resolveCodeHash(addr)
-		contract.SetCallCode(&addr, codeHash, evm.resolveCode(addr))
-		mirTopLevelAttempts.Add(1)
-		ret, err = evm.runWithRunner(evm.mirRunner, contract, input, false)
-		if evm.mirRunner.FellBack() {
-			mirTopLevelFallbacks.Add(1)
-		} else if err == nil {
-			mirTopLevelSucceeded.Add(1)
+		code := evm.resolveCode(addr)
+		if len(code) == 0 {
+			ret, err = nil, nil
+		} else {
+			contract := GetContract(caller, caller, value, gas, evm.jumpDests)
+			defer ReturnContract(contract)
+			codeHash := evm.resolveCodeHash(addr)
+			contract.SetCallCode(&addr, codeHash, code)
+			mirTopLevelAttempts.Add(1)
+			ret, err = evm.runWithRunner(evm.mirRunner, contract, input, false)
+			if evm.mirRunner.FellBack() {
+				mirTopLevelFallbacks.Add(1)
+			} else if err == nil {
+				mirTopLevelSucceeded.Add(1)
+			}
+			maybeLogMIRCounters()
+			gas = contract.Gas
 		}
-		maybeLogMIRCounters()
-		gas = contract.Gas
 	} else {
 		if evm.Config.EnableOpcodeOptimizations {
 			addrCopy := addr
@@ -591,19 +596,24 @@ func (evm *EVM) DelegateCall(originCaller common.Address, caller common.Address,
 		ret, gas, err = RunPrecompiledContract(p, input, gas, evm.Config.Tracer)
 	} else if evm.shouldUseMIR() && !isSystemContract(&addr) {
 		// MIR dispatch for DelegateCall: code from addr, caller context is originCaller/caller.
-		contract := GetContract(originCaller, caller, value, gas, evm.jumpDests)
-		defer ReturnContract(contract)
-		codeHash := evm.resolveCodeHash(addr)
-		contract.SetCallCode(&addr, codeHash, evm.resolveCode(addr))
-		mirTopLevelAttempts.Add(1)
-		ret, err = evm.runWithRunner(evm.mirRunner, contract, input, false)
-		if evm.mirRunner.FellBack() {
-			mirTopLevelFallbacks.Add(1)
-		} else if err == nil {
-			mirTopLevelSucceeded.Add(1)
+		code := evm.resolveCode(addr)
+		if len(code) == 0 {
+			ret, err = nil, nil // no code → immediate return, gas unchanged
+		} else {
+			contract := GetContract(originCaller, caller, value, gas, evm.jumpDests)
+			defer ReturnContract(contract)
+			codeHash := evm.resolveCodeHash(addr)
+			contract.SetCallCode(&addr, codeHash, code)
+			mirTopLevelAttempts.Add(1)
+			ret, err = evm.runWithRunner(evm.mirRunner, contract, input, false)
+			if evm.mirRunner.FellBack() {
+				mirTopLevelFallbacks.Add(1)
+			} else if err == nil {
+				mirTopLevelSucceeded.Add(1)
+			}
+			maybeLogMIRCounters()
+			gas = contract.Gas
 		}
-		maybeLogMIRCounters()
-		gas = contract.Gas
 	} else {
 		if evm.Config.EnableOpcodeOptimizations {
 			addrCopy := addr
@@ -676,19 +686,24 @@ func (evm *EVM) StaticCall(caller common.Address, addr common.Address, input []b
 		ret, gas, err = RunPrecompiledContract(p, input, gas, evm.Config.Tracer)
 	} else if evm.shouldUseMIR() && !isSystemContract(&addr) {
 		// MIR dispatch for StaticCall (readOnly=true).
-		contract := GetContract(caller, addr, new(uint256.Int), gas, evm.jumpDests)
-		defer ReturnContract(contract)
-		codeHash := evm.resolveCodeHash(addr)
-		contract.SetCallCode(&addr, codeHash, evm.resolveCode(addr))
-		mirTopLevelAttempts.Add(1)
-		ret, err = evm.runWithRunner(evm.mirRunner, contract, input, true)
-		if evm.mirRunner.FellBack() {
-			mirTopLevelFallbacks.Add(1)
-		} else if err == nil {
-			mirTopLevelSucceeded.Add(1)
+		code := evm.resolveCode(addr)
+		if len(code) == 0 {
+			ret, err = nil, nil
+		} else {
+			contract := GetContract(caller, addr, new(uint256.Int), gas, evm.jumpDests)
+			defer ReturnContract(contract)
+			codeHash := evm.resolveCodeHash(addr)
+			contract.SetCallCode(&addr, codeHash, code)
+			mirTopLevelAttempts.Add(1)
+			ret, err = evm.runWithRunner(evm.mirRunner, contract, input, true)
+			if evm.mirRunner.FellBack() {
+				mirTopLevelFallbacks.Add(1)
+			} else if err == nil {
+				mirTopLevelSucceeded.Add(1)
+			}
+			maybeLogMIRCounters()
+			gas = contract.Gas
 		}
-		maybeLogMIRCounters()
-		gas = contract.Gas
 	} else {
 		if evm.Config.EnableOpcodeOptimizations {
 			addrCopy := addr
