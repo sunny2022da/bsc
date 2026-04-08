@@ -21,6 +21,7 @@ import (
 	"math/big"
 	"os"
 	"sync/atomic"
+	"time"
 
 	"github.com/holiman/uint256"
 
@@ -77,7 +78,7 @@ var (
 	mirTopLevelAttempts  atomic.Uint64
 	mirTopLevelSucceeded atomic.Uint64
 	mirTopLevelFallbacks atomic.Uint64
-	mirTopLevelLogsTick  atomic.Uint64
+	mirLastLogTime       atomic.Int64
 )
 
 // mirDebugLog is true when MIR_DEBUG_LOG=1 is set in the environment.
@@ -85,18 +86,21 @@ var (
 var mirDebugLog = os.Getenv("MIR_DEBUG_LOG") == "1"
 
 func maybeLogMIRCounters() {
-	// Throttle: log at most once per 256 MIR attempts.
-	const every = uint64(256)
+	// Throttle: log at most once per 30 seconds.
+	now := time.Now().Unix()
+	last := mirLastLogTime.Load()
+	if now-last < 30 {
+		return
+	}
+	if !mirLastLogTime.CompareAndSwap(last, now) {
+		return
+	}
 	n := mirTopLevelAttempts.Load()
-	if n == 0 || (n%every) != 0 {
-		return
-	}
-	// Ensure only one goroutine logs per tick.
-	if !mirTopLevelLogsTick.CompareAndSwap(n-every, n) {
-		return
-	}
 	succ := mirTopLevelSucceeded.Load()
 	fb := mirTopLevelFallbacks.Load()
+	if n == 0 {
+		return
+	}
 	log.Info("MIR counters", "attempts", n, "succeeded", succ, "fallbacks", fb, "fallbackRate", float64(fb)/float64(n))
 }
 
