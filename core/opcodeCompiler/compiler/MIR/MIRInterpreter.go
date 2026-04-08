@@ -935,12 +935,12 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 				}
 			}
 		}
-		// Always reset the per-block instruction cursor on entry.
-		// Basic blocks can be re-entered multiple times due to loops/jump-tables; if we don't reset
-		// `pos`, the block will appear "already executed" and control-flow will silently diverge.
-		if cur != nil {
-			cur.pos = 0
-		}
+		// Reset the per-interpreter block instruction cursor.
+		// NOTE: we use a local variable (blockPos) instead of the block's shared `pos` field
+		// to avoid re-entrant corruption: when contract A (MIR) calls contract A again (MIR),
+		// the inner execution walks the same basic block and advances the shared `pos` field,
+		// causing the outer execution to skip remaining instructions.
+		blockPos := 0
 		// Dynamic repair / runtime snapshot seeding.
 		// Needed not only for unresolved-jump CFGs, but also for CFGs that have merge points
 		// with differing incoming stack heights (requires runtime-epoch tagging).
@@ -1152,8 +1152,8 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 			}
 		}
 
-		// Reset instruction cursor for this block execution.
-		cur.pos = 0
+		// Reset the local instruction cursor for this block execution.
+		blockPos = 0
 		it.curEvmOpIndex = -1
 		it.curBlockConstPrefix = it.ensureBlockConstPrefix(cur)
 		it.curBlockConstDelta, it.curBlockConstTail = it.ensureBlockConstDelta(cur)
@@ -1164,13 +1164,13 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 
 	execBlock:
 		for {
-			// Inline MIRBasicBlock.GetNextOp() to avoid an extra call in the hot loop.
+			// Inline MIRBasicBlock.GetNextOp() using local blockPos to avoid re-entrant corruption.
 			var m *MIR
-			if cur.pos >= len(cur.instructions) {
+			if blockPos >= len(cur.instructions) {
 				m = nil
 			} else {
-				m = cur.instructions[cur.pos]
-				cur.pos++
+				m = cur.instructions[blockPos]
+				blockPos++
 			}
 			if m == nil {
 				// Charge any trailing constant gas in this block not yet accounted for.
