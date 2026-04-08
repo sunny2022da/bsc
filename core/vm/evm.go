@@ -85,8 +85,8 @@ var (
 var mirDebugLog = os.Getenv("MIR_DEBUG_LOG") == "1"
 
 func maybeLogMIRCounters() {
-	// Throttle: log at most once per 4096 MIR attempts.
-	const every = uint64(4096)
+	// Throttle: log at most once per 256 MIR attempts.
+	const every = uint64(256)
 	n := mirTopLevelAttempts.Load()
 	if n == 0 || (n%every) != 0 {
 		return
