@@ -679,8 +679,13 @@ func (r *EVMRunner) dualExecCompare(contract *vm.Contract, input []byte, readOnl
 	// ---- CFG dump on MISMATCH ----
 	hasMismatch := mirGasLeft != baseGasLeft || mirErrStr != baseErrStr
 	if hasMismatch && cfg != nil {
-		dump := DebugDumpMIRForEvmPCRange(cfg, 0, 300)
-		log.Error("MIR dual-exec: CFG dump (pc 0-300):\n" + dump)
+		// Dump full CFG (up to code length) for mismatch diagnosis.
+		codeLen := uint(len(contract.Code))
+		if codeLen > 3000 {
+			codeLen = 3000
+		}
+		dump := DebugDumpMIRForEvmPCRange(cfg, 0, codeLen)
+		log.Error(fmt.Sprintf("MIR dual-exec: CFG dump (pc 0-%d):\n%s", codeLen, dump))
 	}
 
 	// ---- Step trace dump on MISMATCH ----
