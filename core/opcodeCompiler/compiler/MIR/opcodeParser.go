@@ -266,6 +266,7 @@ func (c *CFG) Parse() error {
 	c.needsRuntimeEpochFlag = false
 	rtEpochReason := ""
 	rtEpochBlockPC := uint(0)
+	rtEpochParents := 0
 	for _, b := range c.basicBlocks {
 		if b == nil || len(b.parents) < 2 {
 			continue
@@ -276,6 +277,7 @@ func (c *CFG) Parse() error {
 			c.needsRuntimeEpochFlag = true
 			rtEpochReason = "missing_snapshot"
 			rtEpochBlockPC = b.firstPC
+			rtEpochParents = len(b.parents)
 			break
 		}
 		first := -1
@@ -288,6 +290,7 @@ func (c *CFG) Parse() error {
 				c.needsRuntimeEpochFlag = true
 				rtEpochReason = "parent_not_in_incoming"
 				rtEpochBlockPC = b.firstPC
+				rtEpochParents = len(b.parents)
 				break
 			}
 			if first < 0 {
@@ -298,6 +301,7 @@ func (c *CFG) Parse() error {
 				c.needsRuntimeEpochFlag = true
 				rtEpochReason = fmt.Sprintf("height_mismatch(%d_vs_%d)", first, len(s))
 				rtEpochBlockPC = b.firstPC
+				rtEpochParents = len(b.parents)
 				break
 			}
 		}
@@ -306,12 +310,8 @@ func (c *CFG) Parse() error {
 		}
 	}
 	if c.needsRuntimeEpochFlag && mirRunnerDebugLog {
-		nParents := -1
-		if b := c.basicBlocks[rtEpochBlockPC]; b != nil {
-			nParents = len(b.parents)
-		}
 		fmt.Fprintf(os.Stderr, "[MIR] needsRuntimeEpoch: codeHash=%s reason=%s blockPC=%d parents=%d\n",
-			c.codeAddr, rtEpochReason, rtEpochBlockPC, nParents)
+			c.codeAddr, rtEpochReason, rtEpochBlockPC, rtEpochParents)
 	}
 	// Pre-warm jump tables for unresolvedJump blocks so that runtime resolveBB calls
 	// find pre-created target blocks and can cache results in jumpTable immediately.
