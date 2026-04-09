@@ -1939,6 +1939,9 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 					hv = it.state.GetState(it.contractAddr, slot)
 				}
 				it.resultSlot(m).SetBytes(hv[:])
+				if mirDebugBlock != 0 && it.blockNumber == mirDebugBlock {
+					log.Warn("MIR SLOAD", "addr", it.contractAddr, "pc", m.evmPC, "slot", slot, "value", hv)
+				}
 				// Optional targeted debug: expose the loaded value (post-read).
 				if it.debugOperandHook != nil && keyU != nil {
 					var vv uint256.Int
@@ -2340,6 +2343,9 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 					return it.finishResult(ExecResult{Err: err})
 				}
 				target := uint(dest.Uint64())
+				if mirDebugBlock != 0 && it.blockNumber == mirDebugBlock {
+					log.Warn("MIR JUMPI", "addr", it.contractAddr, "pc", m.evmPC, "target", target, "cond", cond.Uint64(), "taken", !cond.IsZero())
+				}
 				if !cond.IsZero() {
 					// Fast path: O(1) jump table lookup.
 					// Static targets are pre-populated by connectEdge during Parse().
