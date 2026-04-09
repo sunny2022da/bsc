@@ -624,14 +624,27 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 			height = modeLen
 		}
 
+		// Detect if this block is a loop header (has at least one back-edge parent).
+		// Loop headers must always create PHI nodes even if all incoming values look
+		// identical at parse-time, because back-edge values change every iteration.
+		hasBackEdge := false
+		for _, p := range block.parents {
+			if p != nil && p.firstPC >= block.firstPC {
+				hasBackEdge = true
+				break
+			}
+		}
+
 		for i := 0; i < height; i++ {
 			base := valid[0][i]
-			same := true
-			for j := 1; j < len(valid); j++ {
-				v := valid[j][i]
-				if !equalValueForFlow(&base, &v) {
-					same = false
-					break
+			same := !hasBackEdge // force PHI creation for loop headers
+			if same {
+				for j := 1; j < len(valid); j++ {
+					v := valid[j][i]
+					if !equalValueForFlow(&base, &v) {
+						same = false
+						break
+					}
 				}
 			}
 			if same {
