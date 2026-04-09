@@ -332,10 +332,6 @@ func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]b
 	// EnableMIR never regresses performance (perf gate).
 	//
 	// NOTE: This still preserves native EVM semantics; it's purely a performance dispatch choice.
-	// NOTE: needsRuntimeEpoch CFGs are now executed by MIR with runtime repair enabled.
-	// The interpreter handles incoming stack height mismatches via block-entry repair logic
-	// (line 947+), and evalPhi/evalValue gracefully return zero for unresolvable PHI defs.
-
 	// Correctness guard: MIR dynamic CFGs (unresolved jumps) are still not fully stable.
 	// Until MIR can guarantee parity for dynamic jump tables, execute these contracts with
 	// the native interpreter.

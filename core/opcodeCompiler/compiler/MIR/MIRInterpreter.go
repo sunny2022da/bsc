@@ -2608,14 +2608,11 @@ func (it *MIRInterpreter) computeExitSnapshotForEdgeTo(prev, from, to *MIRBasicB
 	// "future defs" when carried into the next iteration. Materialize only produced values
 	// (non-liveIns) into constants to preserve semantics while keeping cost bounded.
 	if to.firstPC <= from.firstPC {
-		// IMPORTANT: in dynamic CFG regions (unresolved jumps / runtime backfill), this "backedge"
-		// often represents a dispatcher jump (not a loop). Materializing produced values here can
-		// freeze a path-dependent value and bake it into earlier blocks (e.g. SSTORE operands),
-		// causing consensus divergence.
-		if it != nil && it.cfg != nil && it.cfg.runtimeEpoch != 0 && (from.unresolvedJump || to.unresolvedJump || it.cfg.runtimeBecameDynamic) {
-			return snap
-		}
-		return it.materializeSnapshotProducedOnly(snap)
+		// Back-edges (loops): NEVER materialize produced values into constants.
+		// Loop-carried values change every iteration; baking the current iteration's
+		// value as a Konst causes getEntryStackForBlock to see all incoming snapshots
+		// as "same" → eliminates the PHI → loop variable becomes constant → infinite loop.
+		return snap
 	}
 	// Correctness: loops may cross blocks without the lexical "backedge" appearing on this edge
 	// (e.g. body->header via an intermediate dispatcher). If an incoming snapshot for `to` carries
