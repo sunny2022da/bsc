@@ -280,13 +280,26 @@ func (c *CFG) Parse() error {
 			rtEpochParents = len(b.parents)
 			break
 		}
+		first := -1
 		for _, p := range b.parents {
 			if p == nil {
 				continue
 			}
-			if _, ok := b.incomingStacks[p]; !ok {
+			s, ok := b.incomingStacks[p]
+			if !ok {
 				c.needsRuntimeEpochFlag = true
 				rtEpochReason = "parent_not_in_incoming"
+				rtEpochBlockPC = b.firstPC
+				rtEpochParents = len(b.parents)
+				break
+			}
+			if first < 0 {
+				first = len(s)
+				continue
+			}
+			if len(s) != first {
+				c.needsRuntimeEpochFlag = true
+				rtEpochReason = fmt.Sprintf("height_mismatch(%d_vs_%d)", first, len(s))
 				rtEpochBlockPC = b.firstPC
 				rtEpochParents = len(b.parents)
 				break
@@ -634,27 +647,19 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 			// even if an incoming snapshot is missing. Missing operands are filled with Unknown; they
 			// should never be selected for real executed predecessors, but keep indices stable.
 			var ops []*Value
-			// distFromTop is 0 for the topmost stack slot, 1 for the second-from-top, etc.
-			distFromTop := (height - 1) - i
 			if incomingsByParent != nil && len(incomingsByParent) == len(block.parents) && len(block.parents) > 0 {
 				ops = make([]*Value, len(block.parents))
 				for j := range block.parents {
 					s := incomingsByParent[j]
-					// Align from stack TOP: index into this parent's stack at (len(s)-1-distFromTop).
-					// If the parent's stack is too short for this depth, fill with Unknown.
-					idx := -1
-					if s != nil {
-						idx = len(s) - 1 - distFromTop
-					}
-					if idx >= 0 && idx < len(s) {
-						v := s[idx]
-						v.liveIn = true
-						vv := v
-						ops[j] = &vv
-					} else {
+					if s == nil || len(s) != height {
 						vv := Value{kind: Unknown, liveIn: true, liveInPos: i}
 						ops[j] = &vv
+						continue
 					}
+					v := s[i]
+					v.liveIn = true
+					vv := v
+					ops[j] = &vv
 				}
 			} else {
 				ops = make([]*Value, 0, len(valid))
