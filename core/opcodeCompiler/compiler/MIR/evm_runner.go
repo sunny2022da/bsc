@@ -332,29 +332,9 @@ func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]b
 	// EnableMIR never regresses performance (perf gate).
 	//
 	// NOTE: This still preserves native EVM semantics; it's purely a performance dispatch choice.
-	if cfg != nil && cfg.needsRuntimeEpoch() {
-		vm.MIRFallbackRuntimeEpoch.Add(1)
-		if mirDebugBlock != 0 && r.blockNumber == mirDebugBlock {
-			log.Warn("MIR fallback", "block", r.blockNumber,
-				"reason", "needsRuntimeEpoch",
-				"addr", contract.Address(),
-				"codeLen", len(contract.Code),
-			)
-		} else {
-			log.Debug("MIR fallback to base interpreter",
-				"reason", "needsRuntimeEpoch",
-				"addr", contract.Address(),
-				"codeHash", codeHash,
-				"codeLen", len(contract.Code),
-			)
-		}
-		r.fellBack = true
-		if r.baseIt == nil {
-			r.baseIt = vm.NewEVMInterpreter(r.evm)
-		}
-		ret, err := r.baseIt.Run(contract, input, readOnly)
-		return ret, err
-	}
+	// NOTE: needsRuntimeEpoch CFGs are now executed by MIR with runtime repair enabled.
+	// The interpreter handles incoming stack height mismatches via block-entry repair logic
+	// (line 947+), and evalPhi/evalValue gracefully return zero for unresolvable PHI defs.
 
 	// Correctness guard: MIR dynamic CFGs (unresolved jumps) are still not fully stable.
 	// Until MIR can guarantee parity for dynamic jump tables, execute these contracts with

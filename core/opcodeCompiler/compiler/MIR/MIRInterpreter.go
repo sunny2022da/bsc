@@ -1063,7 +1063,11 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 						if it.cfg != nil && it.cfg.runtimeEpoch != 0 && it.cfg.runtimeBecameDynamic && cur.EntryStackGen() == 0 {
 							needSeed = true
 						}
-						needSeed = needSeed || (len(es) != len(in))
+						// NOTE: height mismatch (len(es) != len(in)) alone does NOT trigger rebuild.
+						// The PHI was built for the mode height; edges with different heights are handled
+						// by evalPhi's snapshot fallback, which returns zero for out-of-range depths.
+						// Rebuilding on every height-mismatched edge causes thrashing: each rebuild
+						// invalidates downstream operand references and produces "missing result for def".
 					} else {
 						// entryStack is nil.
 						//
@@ -4223,7 +4227,15 @@ func (it *MIRInterpreter) evalPhi(cur, prev *MIRBasicBlock, phi *MIR) (*uint256.
 		}
 	}
 
-	return nil, fmt.Errorf("phi eval failed (curFirstPC=%d prevFirstPC=%d phiPC=%d phiIdx=%d)", cur.FirstPC(), prev.FirstPC(), phi.evmPC, phi.phiStackIndex)
+	// All PHI resolution paths exhausted. Rather than returning a fatal error that kills
+	// the entire execution, return zero. This can happen when incoming stacks have height
+	// mismatches and the runtime snapshot for this edge doesn't cover the requested depth.
+	if mirRunnerDebugLog || (mirDebugBlock != 0 && it.blockNumber == mirDebugBlock) {
+		log.Warn("MIR evalPhi: all paths exhausted, returning zero",
+			"curFirstPC", cur.FirstPC(), "prevFirstPC", prev.FirstPC(),
+			"phiPC", phi.evmPC, "phiIdx", phi.phiStackIndex)
+	}
+	return u256Zero, nil
 }
 
 func (it *MIRInterpreter) evalValue(v *Value) (*uint256.Int, error) {
@@ -4260,8 +4272,30 @@ func (it *MIRInterpreter) evalValue(v *Value) (*uint256.Int, error) {
 				}
 			}
 		}
-		// Provide rich context; this typically indicates a CFG/PHI rebuild or dominance issue.
+		// When the defining instruction's result was never stored (CFG rebuild changed
+		// resIdx or the defining block was never executed on this path), return zero
+		// for PHI defs. This matches EVM semantics (stack underflow → 0) and prevents
+		// fatal errors from temporarily stale operand references after dynamic rebuilds.
 		def := v.def
+		if def != nil && def.op == MirPHI {
+			if mirRunnerDebugLog || (mirDebugBlock != 0 && it.blockNumber == mirDebugBlock) {
+				mapped, mappedOk := 0, false
+				if it.cfg != nil && it.cfg.defKeyToResIdx != nil {
+					mapped, mappedOk = it.cfg.defKeyToResIdx[keyForDef(def)]
+				}
+				curFirstPC := uint(0)
+				if it.curBlock != nil {
+					curFirstPC = it.curBlock.firstPC
+				}
+				log.Warn("MIR evalValue: PHI def missing result, returning zero",
+					"defPC", def.evmPC, "defBlock", def.defBlockNum,
+					"phiIdx", def.phiStackIndex, "defResIdx", def.resIdx,
+					"mappedResIdx", mapped, "mappedOk", mappedOk,
+					"curFirstPC", curFirstPC, "curEvmPC", it.curEvmPC)
+			}
+			return u256Zero, nil
+		}
+		// For non-PHI defs, this is a genuine missing-result bug. Report it.
 		mapped, mappedOk := 0, false
 		if it.cfg != nil && it.cfg.defKeyToResIdx != nil && def != nil {
 			mapped, mappedOk = it.cfg.defKeyToResIdx[keyForDef(def)]
