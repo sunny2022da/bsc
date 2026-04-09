@@ -280,23 +280,31 @@ func (c *CFG) Parse() error {
 			rtEpochParents = len(b.parents)
 			break
 		}
+		first := -1
 		for _, p := range b.parents {
 			if p == nil {
 				continue
 			}
-			if _, ok := b.incomingStacks[p]; !ok {
+			s, ok := b.incomingStacks[p]
+			if !ok {
 				c.needsRuntimeEpochFlag = true
 				rtEpochReason = "parent_not_in_incoming"
 				rtEpochBlockPC = b.firstPC
 				rtEpochParents = len(b.parents)
 				break
 			}
+			if first < 0 {
+				first = len(s)
+				continue
+			}
+			if len(s) != first {
+				c.needsRuntimeEpochFlag = true
+				rtEpochReason = fmt.Sprintf("height_mismatch(%d_vs_%d)", first, len(s))
+				rtEpochBlockPC = b.firstPC
+				rtEpochParents = len(b.parents)
+				break
+			}
 		}
-		// NOTE: height_mismatch check removed. Different incoming stack heights are
-		// common in Solidity (function dispatcher merging into error handlers). PHI
-		// evaluation already handles out-of-range positions by returning u256Zero,
-		// so height differences are safe as long as actually-accessed PHI slots are
-		// consistent across all paths.
 		if c.needsRuntimeEpochFlag {
 			break
 		}
