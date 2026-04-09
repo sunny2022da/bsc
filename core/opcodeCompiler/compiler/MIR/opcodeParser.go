@@ -2,6 +2,7 @@ package MIR
 
 import (
 	"fmt"
+	"os"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/opcodeCompiler/compiler"
@@ -263,6 +264,8 @@ func (c *CFG) Parse() error {
 	// If any merge point has incoming snapshots with differing heights, cached runs must avoid
 	// using a parse-time entry stack specialized to the wrong predecessor height.
 	c.needsRuntimeEpochFlag = false
+	rtEpochReason := ""
+	rtEpochBlockPC := uint(0)
 	for _, b := range c.basicBlocks {
 		if b == nil || len(b.parents) < 2 {
 			continue
@@ -271,6 +274,8 @@ func (c *CFG) Parse() error {
 		// so runtime edge tagging/repair can build a correct entry stack.
 		if b.incomingStacks == nil || len(b.incomingStacks) != len(b.parents) {
 			c.needsRuntimeEpochFlag = true
+			rtEpochReason = "missing_snapshot"
+			rtEpochBlockPC = b.firstPC
 			break
 		}
 		first := -1
@@ -281,6 +286,8 @@ func (c *CFG) Parse() error {
 			s, ok := b.incomingStacks[p]
 			if !ok {
 				c.needsRuntimeEpochFlag = true
+				rtEpochReason = "parent_not_in_incoming"
+				rtEpochBlockPC = b.firstPC
 				break
 			}
 			if first < 0 {
@@ -289,12 +296,22 @@ func (c *CFG) Parse() error {
 			}
 			if len(s) != first {
 				c.needsRuntimeEpochFlag = true
+				rtEpochReason = fmt.Sprintf("height_mismatch(%d_vs_%d)", first, len(s))
+				rtEpochBlockPC = b.firstPC
 				break
 			}
 		}
 		if c.needsRuntimeEpochFlag {
 			break
 		}
+	}
+	if c.needsRuntimeEpochFlag && mirRunnerDebugLog {
+		nParents := -1
+		if b := c.basicBlocks[rtEpochBlockPC]; b != nil {
+			nParents = len(b.parents)
+		}
+		fmt.Fprintf(os.Stderr, "[MIR] needsRuntimeEpoch: codeHash=%s reason=%s blockPC=%d parents=%d\n",
+			c.codeAddr, rtEpochReason, rtEpochBlockPC, nParents)
 	}
 	// Pre-warm jump tables for unresolvedJump blocks so that runtime resolveBB calls
 	// find pre-created target blocks and can cache results in jumpTable immediately.
