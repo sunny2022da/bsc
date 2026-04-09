@@ -1,5 +1,16 @@
 package vm
 
+import "sync/atomic"
+
+// MIR fallback reason counters. Declared in core/vm (not MIR package) to avoid
+// circular imports. MIR's evm_runner.go increments them via vm.MIRFallback*.
+var (
+	MIRFallbackGasZero        atomic.Uint64
+	MIRFallbackCFGParseFailed atomic.Uint64
+	MIRFallbackRuntimeEpoch   atomic.Uint64
+	MIRFallbackUnresolvedJump atomic.Uint64
+)
+
 // ContractRunner is an optional execution backend for running a Contract.
 // It mirrors the signature of (*EVMInterpreter).Run so the EVM can dispatch
 // to alternative engines (e.g. MIR) without importing them (avoids cycles).

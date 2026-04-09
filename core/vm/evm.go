@@ -101,7 +101,12 @@ func maybeLogMIRCounters() {
 	if n == 0 {
 		return
 	}
-	log.Info("MIR counters", "attempts", n, "succeeded", succ, "fallbacks", fb, "fallbackRate", float64(fb)/float64(n))
+	log.Info("MIR counters", "attempts", n, "succeeded", succ, "fallbacks", fb, "fallbackRate", float64(fb)/float64(n),
+		"fb_gasZero", MIRFallbackGasZero.Load(),
+		"fb_cfgFail", MIRFallbackCFGParseFailed.Load(),
+		"fb_rtEpoch", MIRFallbackRuntimeEpoch.Load(),
+		"fb_dynJump", MIRFallbackUnresolvedJump.Load(),
+	)
 }
 
 type (

@@ -21,6 +21,7 @@ var mirDebugBlockOnce sync.Once
 // mirRunnerDebugLog is true when MIR_DEBUG_LOG=1 is set.
 var mirRunnerDebugLog = os.Getenv("MIR_DEBUG_LOG") == "1"
 
+
 // mirStepTrace enables per-opcode gas tracing in dual-exec mode (MIR_DEBUG_BLOCK).
 // When set, both MIR and stock EVM runs capture (pc, op, gasUsed) for each step,
 // and the first gas divergence is logged with context.
@@ -229,6 +230,7 @@ func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]b
 	// Delegate to the base interpreter to get exact stock-EVM semantics (e.g. STOP at
 	// position 0 with gas=0 succeeds in stock EVM; ErrOutOfGas would be wrong there).
 	if contract.Gas == 0 {
+		vm.MIRFallbackGasZero.Add(1)
 		if mirDebugBlock != 0 && r.blockNumber == mirDebugBlock {
 			log.Warn("MIR fallback", "block", r.blockNumber, "reason", "gas=0", "addr", contract.Address(), "codeLen", len(contract.Code))
 		} else {
@@ -281,9 +283,7 @@ func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]b
 			// CFG parse failed (e.g. convergence limit exceeded). This is an MIR
 			// infrastructure failure, not an EVM execution error. Fall back to the
 			// base interpreter so execution result matches stock EVM exactly.
-			// Logged at Debug: the error is cached so this contract won't be re-parsed,
-			// but it will still fallback on every call. Warn-level on first parse is
-			// inside getOrBuildCFGEntry's caller (the Parse() call site).
+			vm.MIRFallbackCFGParseFailed.Add(1)
 			log.Debug("MIR fallback to base interpreter",
 				"reason", "CFG parse failed (cached)",
 				"addr", contract.Address(),
@@ -333,6 +333,7 @@ func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]b
 	//
 	// NOTE: This still preserves native EVM semantics; it's purely a performance dispatch choice.
 	if cfg != nil && cfg.needsRuntimeEpoch() {
+		vm.MIRFallbackRuntimeEpoch.Add(1)
 		if mirDebugBlock != 0 && r.blockNumber == mirDebugBlock {
 			log.Warn("MIR fallback", "block", r.blockNumber,
 				"reason", "needsRuntimeEpoch",
@@ -359,6 +360,7 @@ func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]b
 	// Until MIR can guarantee parity for dynamic jump tables, execute these contracts with
 	// the native interpreter.
 	if cfg != nil && cfg.hasUnresolvedJumps() {
+		vm.MIRFallbackUnresolvedJump.Add(1)
 		if mirDebugBlock != 0 && r.blockNumber == mirDebugBlock {
 			log.Warn("MIR fallback", "block", r.blockNumber,
 				"reason", "unresolved jumps",
