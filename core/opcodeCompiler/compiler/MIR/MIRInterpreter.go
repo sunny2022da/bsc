@@ -1087,9 +1087,10 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 						// In dynamic-jump regions, DO NOT unconditionally specialize to a single predecessor
 						// when heights are consistent. Doing so can bake path-dependent constants into the
 						// entry stack and remove required PHIs, which can flip branch conditions and diverge.
-						if len(counts) > 1 && modeLen >= 0 && len(in) != modeLen {
-							needSeed = true
-						}
+						// NOTE: height mismatch (len(in) != modeLen) does NOT trigger rebuild.
+						// Same rationale as the es!=nil path above: PHIs built at mode height
+						// handle shorter edges via evalPhi's snapshot fallback returning zero.
+						_ = modeLen
 					}
 					if needSeed {
 						// This should be rare for valid bytecode: feasible paths reaching the same JUMPDEST
