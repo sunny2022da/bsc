@@ -2776,17 +2776,32 @@ func (it *MIRInterpreter) resolveBB(prev, from *MIRBasicBlock, targetPC uint) (*
 	return nb, nil
 }
 
-// blockInLoop returns true if the block participates in a loop — i.e., has at least one
-// child whose firstPC <= this block's firstPC (a back-edge). Edges exiting such blocks
-// carry iteration-dependent values (e.g. SLOAD results) that must NOT be materialized
-// into constants, because the cached CFG would then serve stale values to future calls.
+// blockInLoop returns true if the block is a genuine loop header — i.e., has itself
+// as a direct child (self-loop) or has a child that is also a parent (tight cycle).
+// This is more precise than checking firstPC: EVM internal functions live at high PCs
+// and jump back to low PCs without forming loops, which would cause false positives.
 func blockInLoop(b *MIRBasicBlock) bool {
 	if b == nil {
 		return false
 	}
+	// Check for self-loop (child == self)
 	for _, ch := range b.Children() {
-		if ch != nil && ch.firstPC <= b.firstPC {
+		if ch == b {
 			return true
+		}
+	}
+	// Check for tight 2-node cycle: child that is also a parent
+	parentSet := make(map[*MIRBasicBlock]struct{}, len(b.Parents()))
+	for _, p := range b.Parents() {
+		if p != nil {
+			parentSet[p] = struct{}{}
+		}
+	}
+	for _, ch := range b.Children() {
+		if ch != nil {
+			if _, ok := parentSet[ch]; ok {
+				return true
+			}
 		}
 	}
 	return false
