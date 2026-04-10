@@ -955,12 +955,12 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 		// Needed not only for unresolved-jump CFGs, but also for CFGs that have merge points
 		// with differing incoming stack heights (requires runtime-epoch tagging).
 		if it.cfg != nil && it.cfg.needsRuntimeEpoch() {
-			// Skip runtime snapshot refresh for back-edges (including self-loops).
-			// The parse-time entry stack already has correct PHIs for loop-carried values.
-			// Refreshing here triggers connectEdge → rebuild → invalidateBlockResults,
-			// which destroys results from the current loop iteration.
+			// Skip runtime snapshot refresh for back-edges and loop headers.
+			// Loop headers have forced parse-time PHIs that are correct; any rebuild
+			// via connectEdge creates new MIR objects with new resIdx, breaking
+			// back-edge PHI operands that still reference old defs.
 			isBackEdgeEntry := prev != nil && cur != nil && prev.firstPC >= cur.firstPC
-			if prev != nil && cur != nil && cur.incomingStacks != nil && !isBackEdgeEntry {
+			if prev != nil && cur != nil && cur.incomingStacks != nil && !isBackEdgeEntry && !blockInLoop(cur) {
 				if in, ok := cur.incomingStacks[prev]; ok && in != nil {
 					// Dynamic CFG correctness: even if stack *heights* match, stack *values* feeding into
 					// dispatcher blocks (SWAP/POP-heavy jump tables) can be calldata-/path-dependent.
