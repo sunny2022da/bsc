@@ -742,6 +742,12 @@ func (it *MIRInterpreter) refreshEdgeIfNeeded(prev, from, to *MIRBasicBlock) {
 	if it.cfg == nil {
 		return
 	}
+	// Back-edges (including self-loops): if the target already has a built entry stack
+	// with PHIs, skip refresh entirely. Calling connectEdge on a back-edge can trigger
+	// rebuild → invalidateBlockResults, destroying loop-carried values mid-iteration.
+	if to.firstPC <= from.firstPC && to.entryStack != nil && to.built {
+		return
+	}
 	// Only refresh when something might be stale: back-edges, unresolved blocks, or a
 	// runtime-dynamic CFG where calldata-dependent values must be re-materialized.
 	if !(it.cfg.runtimeBecameDynamic || from.unresolvedJump || to.unresolvedJump ||
