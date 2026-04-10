@@ -967,7 +967,13 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 			// via connectEdge creates new MIR objects with new resIdx, breaking
 			// back-edge PHI operands that still reference old defs.
 			isBackEdgeEntry := prev != nil && cur != nil && prev.firstPC >= cur.firstPC
-			if prev != nil && cur != nil && cur.incomingStacks != nil && !isBackEdgeEntry && !blockInLoop(cur) {
+			// Also skip blocks pending rebuild from parse-time (built=false).
+			// These blocks have symbolic parse-time incomingStacks that correctly
+			// differentiate multiple paths. Refreshing here materializes runtime
+			// values into constants, which can make different symbolic paths look
+			// identical → no PHIs created → stale def references leak through.
+			isPendingRebuild := cur != nil && !cur.built
+			if prev != nil && cur != nil && cur.incomingStacks != nil && !isBackEdgeEntry && !blockInLoop(cur) && !isPendingRebuild {
 				if in, ok := cur.incomingStacks[prev]; ok && in != nil {
 					// Dynamic CFG correctness: even if stack *heights* match, stack *values* feeding into
 					// dispatcher blocks (SWAP/POP-heavy jump tables) can be calldata-/path-dependent.
