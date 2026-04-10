@@ -659,6 +659,13 @@ func (it *MIRInterpreter) invalidateBlockResults(b *MIRBasicBlock) {
 	if it == nil || b == nil {
 		return
 	}
+	if mirDebugBlock != 0 && it.blockNumber == mirDebugBlock {
+		log.Warn("MIR invalidateBlockResults called",
+			"block", it.blockNumber,
+			"firstPC", b.FirstPC(),
+			"numInstr", len(b.instructions),
+		)
+	}
 	for _, m := range b.instructions {
 		if m == nil {
 			continue
