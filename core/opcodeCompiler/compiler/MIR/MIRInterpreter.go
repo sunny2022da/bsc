@@ -924,16 +924,13 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 		// can be over-specialized (or built from a different predecessor-height heuristic) and may
 		// embed def references that are not valid on the actually-taken edge, leading to
 		// "missing result for def" later.
-		if it.cfg != nil && it.cfg.runtimeEpoch != 0 && cur != nil && cur.EntryStackGen() == 0 && cur.incomingStacksGen != nil && cur.EntryStack() != nil {
+		if it.cfg != nil && it.cfg.runtimeEpoch != 0 && cur != nil && cur.EntryStackGen() == 0 && cur.incomingStacksGen != nil && cur.EntryStack() != nil && !blockInLoop(cur) {
+			// Skip loop headers entirely: their parse-time entry stack already has
+			// forced PHIs for all stack positions (commit 7dff24e50). Rebuilding would
+			// create new MIR instructions with new resIdx values, but the back-edge PHI
+			// operands still point to old defs → "missing result" on loop iterations.
 			for _, p := range cur.parents {
-				if p == nil {
-					continue
-				}
-				// Skip back-edge parents (including self-loops): their incoming snapshots
-				// are symbolic and the parse-time entry stack already has proper PHIs for
-				// loop-carried values. Rebuilding here would invalidate results from the
-				// current loop iteration, causing PHIs to fall back to zero.
-				if p.firstPC >= cur.firstPC {
+				if p == nil || p.firstPC >= cur.firstPC {
 					continue
 				}
 				if g, ok := cur.incomingStacksGen[p]; ok && g == it.cfg.runtimeEpoch {
