@@ -4253,6 +4253,14 @@ func (it *MIRInterpreter) evalPhi(cur, prev *MIRBasicBlock, phi *MIR) (*uint256.
 							if v.def.resIdx > 0 && v.def.resIdx < len(it.resultsGen) {
 								genMatch = it.resultsGen[v.def.resIdx] == it.gen
 							}
+							// Find the ACTUAL instruction in cur.instructions with matching evmPC
+							actualResIdx := -1
+							for _, ins := range cur.instructions {
+								if ins != nil && ins.evmPC == v.def.evmPC && ins.op == v.def.op {
+									actualResIdx = ins.resIdx
+									break
+								}
+							}
 							log.Warn("MIR PHI loop-carried: no previous iteration result, returning 0",
 								"block", it.blockNumber,
 								"curFirstPC", cur.FirstPC(),
@@ -4261,6 +4269,7 @@ func (it *MIRInterpreter) evalPhi(cur, prev *MIRBasicBlock, phi *MIR) (*uint256.
 								"phiIdx", phi.phiStackIndex,
 								"defOp", v.def.op.String(),
 								"defResIdx", v.def.resIdx,
+								"actualResIdx", actualResIdx,
 								"mappedResIdx", mapped,
 								"mappedOk", mappedOk,
 								"genMatch", genMatch,
