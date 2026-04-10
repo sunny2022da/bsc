@@ -4244,7 +4244,15 @@ func (it *MIRInterpreter) evalPhi(cur, prev *MIRBasicBlock, phi *MIR) (*uint256.
 						// loop-carried accumulators whose initial value was 0). Any non-zero initial
 						// value should have been captured via the forward-edge PHI operand path above
 						// (lines 4033-4068) rather than reaching this snapshot fallback.
-						if mirRunnerDebugLog || (mirDebugBlock != 0 && it.blockNumber == mirDebugBlock) {
+						{
+							mapped, mappedOk := 0, false
+							if it.cfg != nil && it.cfg.defKeyToResIdx != nil {
+								mapped, mappedOk = it.cfg.defKeyToResIdx[keyForDef(v.def)]
+							}
+							genMatch := false
+							if v.def.resIdx > 0 && v.def.resIdx < len(it.resultsGen) {
+								genMatch = it.resultsGen[v.def.resIdx] == it.gen
+							}
 							log.Warn("MIR PHI loop-carried: no previous iteration result, returning 0",
 								"block", it.blockNumber,
 								"curFirstPC", cur.FirstPC(),
@@ -4253,6 +4261,10 @@ func (it *MIRInterpreter) evalPhi(cur, prev *MIRBasicBlock, phi *MIR) (*uint256.
 								"phiIdx", phi.phiStackIndex,
 								"defOp", v.def.op.String(),
 								"defResIdx", v.def.resIdx,
+								"mappedResIdx", mapped,
+								"mappedOk", mappedOk,
+								"genMatch", genMatch,
+								"curBuilt", cur.built,
 							)
 						}
 						return u256Zero, nil
