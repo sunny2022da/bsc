@@ -765,11 +765,11 @@ func (it *MIRInterpreter) refreshEdgeIfNeeded(prev, from, to *MIRBasicBlock) {
 	var snap []Value
 	if it.cfg.runtimeEpoch != 0 && it.cfg.runtimeBecameDynamic {
 		snap = it.computeExitSnapshotForEdgeTo(prev, from, to)
-		// Back-edges (C→B loop jumps where to.firstPC <= from.firstPC) must NOT be
-		// materialized: their stack values change every iteration, so baking the current
-		// iteration's values as Konsts causes stale PHI operands on outer-loop re-entry
-		// (the same guard already exists in resolveBB and the block-entry refresh path).
-		if to.firstPC > from.firstPC {
+		// Back-edges and loop-exit edges must NOT be materialized:
+		// - Back-edges: values change every iteration (stale PHI operands on re-entry)
+		// - Loop-exit edges: values are iteration-dependent (e.g. SLOAD results);
+		//   materializing them poisons the cached CFG for future calls with different state.
+		if to.firstPC > from.firstPC && !blockInLoop(from) {
 			snap = it.materializeSnapshotTopK(snap, 16)
 		}
 		if hadOld && stacksEqual(oldSnap, snap) {
@@ -991,7 +991,10 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 							// Note: resolveBB already guards against this via its own firstPC check;
 							// this guard covers the block-entry refresh path which had no such check.
 							isBackEdge := cur.firstPC <= prev.firstPC
-							if isBackEdge {
+							if isBackEdge || blockInLoop(prev) {
+								// Back-edges and loop-exit edges must stay symbolic:
+								// materializing iteration-dependent values (SLOAD etc.)
+								// poisons the cached CFG for future calls.
 								fresh = ex
 							} else {
 								k := 64
@@ -2739,10 +2742,10 @@ func (it *MIRInterpreter) resolveBB(prev, from *MIRBasicBlock, targetPC uint) (*
 			// leaking symbolic/stale defs across rebuilds. Materialize enough of the stack to cover
 			// common ABI/dispatcher patterns (often > 16 deep) without always paying full cost.
 			if it.cfg != nil && it.cfg.runtimeEpoch != 0 && (from.unresolvedJump || nb.unresolvedJump || it.cfg.runtimeBecameDynamic) && snap != nil {
-				// Heuristic: for backward jumps into earlier dispatchers, avoid materializing.
-				// Materialization can freeze path-dependent values into constants and later get baked
-				// into storage/memory ops in the dispatcher region.
-				if nb.firstPC > from.firstPC {
+				// Avoid materializing back-edges, backward jumps into dispatchers, and
+				// loop-exit edges. Materialization can freeze iteration-dependent values
+				// (SLOAD etc.) into constants and poison the cached CFG.
+				if nb.firstPC > from.firstPC && !blockInLoop(from) {
 					k := 64
 					if len(snap) < k {
 						k = len(snap)
@@ -2754,6 +2757,22 @@ func (it *MIRInterpreter) resolveBB(prev, from *MIRBasicBlock, targetPC uint) (*
 		}
 	}
 	return nb, nil
+}
+
+// blockInLoop returns true if the block participates in a loop — i.e., has at least one
+// child whose firstPC <= this block's firstPC (a back-edge). Edges exiting such blocks
+// carry iteration-dependent values (e.g. SLOAD results) that must NOT be materialized
+// into constants, because the cached CFG would then serve stale values to future calls.
+func blockInLoop(b *MIRBasicBlock) bool {
+	if b == nil {
+		return false
+	}
+	for _, ch := range b.Children() {
+		if ch != nil && ch.firstPC <= b.firstPC {
+			return true
+		}
+	}
+	return false
 }
 
 // materializeSnapshotTopK materializes only the top K stack elements (top-of-stack is at the end
