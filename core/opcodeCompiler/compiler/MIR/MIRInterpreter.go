@@ -923,6 +923,13 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 				if p == nil {
 					continue
 				}
+				// Skip back-edge parents (including self-loops): their incoming snapshots
+				// are symbolic and the parse-time entry stack already has proper PHIs for
+				// loop-carried values. Rebuilding here would invalidate results from the
+				// current loop iteration, causing PHIs to fall back to zero.
+				if p.firstPC >= cur.firstPC {
+					continue
+				}
 				if g, ok := cur.incomingStacksGen[p]; ok && g == it.cfg.runtimeEpoch {
 					// Force rebuild from current-epoch incomings.
 					cur.SetEntryStack(nil)
