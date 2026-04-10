@@ -4188,16 +4188,18 @@ func (it *MIRInterpreter) evalPhi(cur, prev *MIRBasicBlock, phi *MIR) (*uint256.
 			if idx >= 0 && idx < len(in) {
 				v := in[idx]
 				if v.kind != Unknown {
-					// If the incoming snapshot points at a PHI defined in this join block, it's a
-					// loop-carried self-reference. If we have already executed this PHI earlier in the
-					// current run (previous loop iteration), use the cached result as the live-in value.
-					if v.kind == Variable && v.def != nil && v.def.op == MirPHI && v.def.defBlockNum == cur.blockNum {
+					// If the incoming snapshot points at a def defined in this same block, it's a
+					// loop-carried self-reference. This covers both PHI defs and non-PHI defs
+					// (e.g. MirADD in a self-looping block where instruction #N references
+					// instruction #M > N). If we have already executed this def in a previous
+					// loop iteration, use the cached result as the live-in value.
+					if v.kind == Variable && v.def != nil && v.def.defBlockNum == cur.blockNum {
 						if r, ok := it.getResult(v.def); ok && r != nil {
 							return r, nil
 						}
 						// After a CFG rebuild the snapshot still holds stale *MIR pointers whose
 						// resIdx may no longer be current. Try the stable key-based mapping, which
-						// always reflects the post-rebuild resIdx for the same logical PHI.
+						// always reflects the post-rebuild resIdx for the same logical def.
 						// This is the same defKeyToResIdx lookup that evalValue uses for Variable
 						// operands and must be applied here for consistency.
 						if it.cfg != nil && it.cfg.defKeyToResIdx != nil {
@@ -4219,6 +4221,7 @@ func (it *MIRInterpreter) evalPhi(cur, prev *MIRBasicBlock, phi *MIR) (*uint256.
 								"prevFirstPC", prev.FirstPC(),
 								"phiPC", phi.evmPC,
 								"phiIdx", phi.phiStackIndex,
+								"defOp", v.def.op.String(),
 								"defResIdx", v.def.resIdx,
 							)
 						}
