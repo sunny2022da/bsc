@@ -798,10 +798,14 @@ func (c *CFG) connectEdge(parent, child *MIRBasicBlock, exitSnapshot []Value) {
 	if c != nil && c.runtimeEpoch != 0 {
 		child.preferredEntryHeight = len(exitSnapshot)
 	}
-	// At runtime, do NOT invalidate loop header blocks via back-edge or self-loop
-	// connectEdge. The parse-time PHIs are correct, and invalidating at runtime
-	// triggers rebuild → invalidateBlockResults → destroys loop-carried values.
-	if c != nil && c.runtimeEpoch != 0 && parent.firstPC >= child.firstPC {
+	// At runtime, do NOT invalidate loop header blocks via actual loop back-edges.
+	// The parse-time PHIs are correct, and invalidating at runtime triggers
+	// rebuild → invalidateBlockResults → destroys loop-carried values.
+	// IMPORTANT: only skip when the child is a genuine loop header (has a back-edge
+	// child itself). Using parent.firstPC >= child.firstPC alone is too broad and
+	// blocks legitimate forward edges (e.g. utility function returns where the
+	// callee block has a higher PC than the continuation).
+	if c != nil && c.runtimeEpoch != 0 && parent.firstPC >= child.firstPC && blockInLoop(child) {
 		return
 	}
 	child.SetEntryStack(nil)
