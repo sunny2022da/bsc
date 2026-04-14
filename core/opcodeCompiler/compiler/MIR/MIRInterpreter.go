@@ -749,10 +749,11 @@ func (it *MIRInterpreter) refreshEdgeIfNeeded(prev, from, to *MIRBasicBlock) {
 	if it.cfg == nil {
 		return
 	}
-	// Back-edges (including self-loops): if the target already has a built entry stack
-	// with PHIs, skip refresh entirely. Calling connectEdge on a back-edge can trigger
+	// Genuine loop back-edges: if the target is a loop header with a built entry stack,
+	// skip refresh entirely. Calling connectEdge on a loop back-edge can trigger
 	// rebuild → invalidateBlockResults, destroying loop-carried values mid-iteration.
-	if to.firstPC <= from.firstPC && to.entryStack != nil && to.built {
+	// IMPORTANT: only skip for genuine loop headers (blockInLoop), not all high→low PC edges.
+	if to.firstPC <= from.firstPC && to.entryStack != nil && to.built && blockInLoop(to) {
 		return
 	}
 	// Only refresh when something might be stale: back-edges, unresolved blocks, or a
@@ -966,7 +967,7 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 			// Loop headers have forced parse-time PHIs that are correct; any rebuild
 			// via connectEdge creates new MIR objects with new resIdx, breaking
 			// back-edge PHI operands that still reference old defs.
-			isBackEdgeEntry := prev != nil && cur != nil && prev.firstPC >= cur.firstPC
+			isBackEdgeEntry := prev != nil && cur != nil && prev.firstPC >= cur.firstPC && blockInLoop(cur)
 			// Also skip blocks pending rebuild from parse-time (built=false).
 			// These blocks have symbolic parse-time incomingStacks that correctly
 			// differentiate multiple paths. Refreshing here materializes runtime
