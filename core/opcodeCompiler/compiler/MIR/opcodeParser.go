@@ -634,6 +634,19 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 				break
 			}
 		}
+		// Detect multi-block cycles: a parent that is reachable from this block
+		// (via children edges) forms a cycle even if parent.firstPC < block.firstPC.
+		// Without forced PHI creation here, constant-folding at parse-time can make
+		// all incoming snapshots look identical, hiding loop-carried value changes
+		// and causing infinite loops at runtime (counter stuck at initial value).
+		if !hasBackEdge && len(block.parents) > 1 {
+			for _, p := range block.parents {
+				if p != nil && isReachableViaChildren(block, p, 12) {
+					hasBackEdge = true
+					break
+				}
+			}
+		}
 
 		for i := 0; i < height; i++ {
 			base := valid[0][i]
@@ -716,6 +729,43 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 		stack.push(&val)
 	}
 	return stack
+}
+
+// isReachableViaChildren returns true if `target` is reachable from `start` by following
+// children edges within `maxDepth` hops. Used to detect multi-block cycles where a parent
+// of a block is also a descendant, forming a loop that the simple firstPC comparison misses.
+func isReachableViaChildren(start, target *MIRBasicBlock, maxDepth int) bool {
+	if start == nil || target == nil || maxDepth <= 0 {
+		return false
+	}
+	type item struct {
+		block *MIRBasicBlock
+		depth int
+	}
+	queue := []item{{start, 0}}
+	visited := make(map[*MIRBasicBlock]struct{}, 32)
+	visited[start] = struct{}{}
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+		for _, ch := range cur.block.Children() {
+			if ch == nil {
+				continue
+			}
+			if ch == target {
+				return true
+			}
+			if cur.depth+1 >= maxDepth {
+				continue
+			}
+			if _, ok := visited[ch]; ok {
+				continue
+			}
+			visited[ch] = struct{}{}
+			queue = append(queue, item{ch, cur.depth + 1})
+		}
+	}
+	return false
 }
 
 // connectEdge links parent -> child and records the incoming stack snapshot for child.
