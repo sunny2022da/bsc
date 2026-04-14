@@ -632,24 +632,15 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 		}
 
 		// Force PHI creation for loop headers and loop-internal merge points.
-		// After ComputeLoopInfo has run, use the accurate SCC-based flags.
-		// During Parse (before ComputeLoopInfo), fall back to heuristics.
+		// EnsureLoopInfo runs Tarjan SCC incrementally: it recomputes only when
+		// the CFG structure changed (new edges via connectEdge). This is precise
+		// enough to distinguish real cycles from internal-function call-return
+		// patterns, which the old BFS heuristic could not.
+		c.EnsureLoopInfo()
 		hasBackEdge := block.IsLoopHeader || (block.IsInLoop && len(block.parents) > 1)
 		if !hasBackEdge {
 			for _, p := range block.parents {
 				if p != nil && p.firstPC >= block.firstPC {
-					hasBackEdge = true
-					break
-				}
-			}
-		}
-		// Parse-time fallback: detect multi-block cycles via BFS when loop
-		// analysis hasn't run yet (IsLoopHeader/IsInLoop are all false).
-		// This catches merge points like block@1603 in a 4-node loop where
-		// both parents have lower PCs than the block itself.
-		if !hasBackEdge && !c.loopInfoValid && len(block.parents) > 1 {
-			for _, p := range block.parents {
-				if p != nil && isReachableViaChildren(block, p, 12) {
 					hasBackEdge = true
 					break
 				}
@@ -737,43 +728,6 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 		stack.push(&val)
 	}
 	return stack
-}
-
-// isReachableViaChildren returns true if `target` is reachable from `start` by
-// following children edges within `maxDepth` hops. Used during Parse to detect
-// multi-block cycles before ComputeLoopInfo has run.
-func isReachableViaChildren(start, target *MIRBasicBlock, maxDepth int) bool {
-	if start == nil || target == nil || maxDepth <= 0 {
-		return false
-	}
-	type item struct {
-		block *MIRBasicBlock
-		depth int
-	}
-	queue := []item{{start, 0}}
-	visited := make(map[*MIRBasicBlock]struct{}, 32)
-	visited[start] = struct{}{}
-	for len(queue) > 0 {
-		cur := queue[0]
-		queue = queue[1:]
-		for _, ch := range cur.block.Children() {
-			if ch == nil {
-				continue
-			}
-			if ch == target {
-				return true
-			}
-			if cur.depth+1 >= maxDepth {
-				continue
-			}
-			if _, ok := visited[ch]; ok {
-				continue
-			}
-			visited[ch] = struct{}{}
-			queue = append(queue, item{ch, cur.depth + 1})
-		}
-	}
-	return false
 }
 
 // connectEdge links parent -> child and records the incoming stack snapshot for child.
