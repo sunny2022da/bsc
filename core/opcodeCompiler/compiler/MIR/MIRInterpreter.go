@@ -753,13 +753,13 @@ func (it *MIRInterpreter) refreshEdgeIfNeeded(prev, from, to *MIRBasicBlock) {
 	// skip refresh entirely. Calling connectEdge on a loop back-edge can trigger
 	// rebuild → invalidateBlockResults, destroying loop-carried values mid-iteration.
 	// IMPORTANT: only skip for genuine loop headers (blockInLoop), not all high→low PC edges.
-	if to.firstPC <= from.firstPC && to.entryStack != nil && to.built && blockInLoop(to) {
+	it.cfg.EnsureLoopInfo()
+	if to.IsLoopHeader && to.IsBackEdgeFrom(from) && to.entryStack != nil && to.built {
 		return
 	}
-	// Only refresh when something might be stale: back-edges, unresolved blocks, or a
-	// runtime-dynamic CFG where calldata-dependent values must be re-materialized.
+	isBackEdge := to.IsLoopHeader && to.IsBackEdgeFrom(from)
 	if !(it.cfg.runtimeBecameDynamic || from.unresolvedJump || to.unresolvedJump ||
-		to.firstPC <= from.firstPC || to.entryStack == nil) {
+		isBackEdge || to.entryStack == nil) {
 		return
 	}
 	need := true
@@ -783,7 +783,7 @@ func (it *MIRInterpreter) refreshEdgeIfNeeded(prev, from, to *MIRBasicBlock) {
 		// - Back-edges: values change every iteration (stale PHI operands on re-entry)
 		// - Loop-exit edges: values are iteration-dependent (e.g. SLOAD results);
 		//   materializing them poisons the cached CFG for future calls with different state.
-		if to.firstPC > from.firstPC && !blockInLoop(from) {
+		if !from.IsInLoop && !isBackEdge {
 			snap = it.materializeSnapshotTopK(snap, 16)
 		}
 		if hadOld && stacksEqual(oldSnap, snap) {
@@ -932,13 +932,13 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 		// can be over-specialized (or built from a different predecessor-height heuristic) and may
 		// embed def references that are not valid on the actually-taken edge, leading to
 		// "missing result for def" later.
-		if it.cfg != nil && it.cfg.runtimeEpoch != 0 && cur != nil && cur.EntryStackGen() == 0 && cur.incomingStacksGen != nil && cur.EntryStack() != nil && !blockInLoop(cur) {
+		if it.cfg != nil && it.cfg.runtimeEpoch != 0 && cur != nil && cur.EntryStackGen() == 0 && cur.incomingStacksGen != nil && cur.EntryStack() != nil && !cur.IsLoopHeader {
 			// Skip loop headers entirely: their parse-time entry stack already has
 			// forced PHIs for all stack positions (commit 7dff24e50). Rebuilding would
 			// create new MIR instructions with new resIdx values, but the back-edge PHI
 			// operands still point to old defs → "missing result" on loop iterations.
 			for _, p := range cur.parents {
-				if p == nil || p.firstPC >= cur.firstPC {
+				if p == nil || cur.IsBackEdgeFrom(p) {
 					continue
 				}
 				if g, ok := cur.incomingStacksGen[p]; ok && g == it.cfg.runtimeEpoch {
@@ -967,14 +967,14 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 			// Loop headers have forced parse-time PHIs that are correct; any rebuild
 			// via connectEdge creates new MIR objects with new resIdx, breaking
 			// back-edge PHI operands that still reference old defs.
-			isBackEdgeEntry := prev != nil && cur != nil && prev.firstPC >= cur.firstPC && blockInLoop(cur)
+			isBackEdgeEntry := prev != nil && cur != nil && cur.IsLoopHeader && cur.IsBackEdgeFrom(prev)
 			// Also skip blocks pending rebuild from parse-time (built=false).
 			// These blocks have symbolic parse-time incomingStacks that correctly
 			// differentiate multiple paths. Refreshing here materializes runtime
 			// values into constants, which can make different symbolic paths look
 			// identical → no PHIs created → stale def references leak through.
 			isPendingRebuild := cur != nil && !cur.built
-			if prev != nil && cur != nil && cur.incomingStacks != nil && !isBackEdgeEntry && !blockInLoop(cur) && !isPendingRebuild {
+			if prev != nil && cur != nil && cur.incomingStacks != nil && !isBackEdgeEntry && !cur.IsLoopHeader && !isPendingRebuild {
 				if in, ok := cur.incomingStacks[prev]; ok && in != nil {
 					// Dynamic CFG correctness: even if stack *heights* match, stack *values* feeding into
 					// dispatcher blocks (SWAP/POP-heavy jump tables) can be calldata-/path-dependent.
@@ -1008,8 +1008,8 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 							// produce stale constants when the outer loop re-enters the same block.
 							// Note: resolveBB already guards against this via its own firstPC check;
 							// this guard covers the block-entry refresh path which had no such check.
-							isBackEdge := cur.firstPC <= prev.firstPC
-							if isBackEdge || blockInLoop(prev) {
+							isBackEdge := cur.IsLoopHeader && cur.IsBackEdgeFrom(prev)
+							if isBackEdge || prev.IsInLoop {
 								// Back-edges and loop-exit edges must stay symbolic:
 								// materializing iteration-dependent values (SLOAD etc.)
 								// poisons the cached CFG for future calls.
@@ -1223,7 +1223,7 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 				// rely on build-time snapshots unless we detect a mismatch and explicitly repair it.
 				if it.cfg != nil && cur != nil && children[0] != nil {
 					to := children[0]
-					if cur.unresolvedJump || to.unresolvedJump || to.firstPC <= cur.firstPC {
+					if cur.unresolvedJump || to.unresolvedJump || (to.IsLoopHeader && to.IsBackEdgeFrom(cur)) {
 						// Avoid allocation-heavy snapshot computation on stable edges:
 						// only refresh if this edge hasn't been recorded yet or the target entry stack
 						// is currently invalidated (nil) and may need PHI rebuild.
@@ -2429,7 +2429,7 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 				// jump region. Static CFG fallthrough edges already have build-time snapshots.
 				// However, if the fallthrough target entry stack is invalidated, refresh this edge snapshot
 				// even for forward static edges.
-				if cur != nil && ft != nil && it.cfg != nil && (cur.unresolvedJump || ft.unresolvedJump || ft.firstPC <= cur.firstPC || ft.entryStack == nil) {
+				if cur != nil && ft != nil && it.cfg != nil && (cur.unresolvedJump || ft.unresolvedJump || (ft.IsLoopHeader && ft.IsBackEdgeFrom(cur)) || ft.entryStack == nil) {
 					need := true
 					if ft.incomingStacks != nil {
 						if _, ok := ft.incomingStacks[cur]; ok && ft.entryStack != nil {
@@ -2635,11 +2635,10 @@ func (it *MIRInterpreter) computeExitSnapshotForEdgeTo(prev, from, to *MIRBasicB
 	// Correctness: on back-edges/self-loops, symbolic Values produced within `from` become
 	// "future defs" when carried into the next iteration. Materialize only produced values
 	// (non-liveIns) into constants to preserve semantics while keeping cost bounded.
-	if to.firstPC <= from.firstPC {
-		// Back-edges (loops): NEVER materialize produced values into constants.
-		// Loop-carried values change every iteration; baking the current iteration's
-		// value as a Konst causes getEntryStackForBlock to see all incoming snapshots
-		// as "same" → eliminates the PHI → loop variable becomes constant → infinite loop.
+	if it.cfg != nil {
+		it.cfg.EnsureLoopInfo()
+	}
+	if to.IsLoopHeader && to.IsBackEdgeFrom(from) {
 		return snap
 	}
 	// Correctness: loops may cross blocks without the lexical "backedge" appearing on this edge
@@ -2763,7 +2762,7 @@ func (it *MIRInterpreter) resolveBB(prev, from *MIRBasicBlock, targetPC uint) (*
 				// Avoid materializing back-edges, backward jumps into dispatchers, and
 				// loop-exit edges. Materialization can freeze iteration-dependent values
 				// (SLOAD etc.) into constants and poison the cached CFG.
-				if nb.firstPC > from.firstPC && !blockInLoop(from) {
+				if !from.IsInLoop && !(nb.IsLoopHeader && nb.IsBackEdgeFrom(from)) {
 					k := 64
 					if len(snap) < k {
 						k = len(snap)
@@ -2775,37 +2774,6 @@ func (it *MIRInterpreter) resolveBB(prev, from *MIRBasicBlock, targetPC uint) (*
 		}
 	}
 	return nb, nil
-}
-
-// blockInLoop returns true if the block is a genuine loop header — i.e., has itself
-// as a direct child (self-loop) or has a child that is also a parent (tight cycle).
-// This is more precise than checking firstPC: EVM internal functions live at high PCs
-// and jump back to low PCs without forming loops, which would cause false positives.
-func blockInLoop(b *MIRBasicBlock) bool {
-	if b == nil {
-		return false
-	}
-	// Check for self-loop (child == self)
-	for _, ch := range b.Children() {
-		if ch == b {
-			return true
-		}
-	}
-	// Check for tight 2-node cycle: child that is also a parent
-	parentSet := make(map[*MIRBasicBlock]struct{}, len(b.Parents()))
-	for _, p := range b.Parents() {
-		if p != nil {
-			parentSet[p] = struct{}{}
-		}
-	}
-	for _, ch := range b.Children() {
-		if ch != nil {
-			if _, ok := parentSet[ch]; ok {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 // materializeSnapshotTopK materializes only the top K stack elements (top-of-stack is at the end

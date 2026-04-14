@@ -272,6 +272,15 @@ type MIRBasicBlock struct {
 	// For unresolvedJump blocks it is additionally pre-warmed by preWarmJumpTables from
 	// incoming-stack constant scanning at the end of CFG.Parse().
 	jumpTable map[uint]*MIRBasicBlock
+
+	// Loop analysis results (populated by CFG.ComputeLoopInfo after Parse fixpoint).
+	// Incrementally refreshed when runtime edge additions invalidate loopInfoValid.
+	IsInLoop     bool // block participates in at least one cycle
+	IsLoopHeader bool // block is the target of at least one back-edge
+	LoopDepth    int  // nesting depth (0 = not in loop, 1 = outermost, …)
+	// backEdgeParents is the set of parents whose edge into this block is a back-edge.
+	// Only meaningful when IsLoopHeader is true. Populated by ComputeLoopInfo.
+	backEdgeParents map[*MIRBasicBlock]struct{}
 }
 
 type evmOpAtPC struct {
@@ -587,6 +596,16 @@ func (b *MIRBasicBlock) newKeccakMIR(data *Value, stack *ValueStack) *MIR {
 	mir.genStackDepth = stack.size()
 	// noisy generation logging removed
 	return mir
+}
+
+// IsBackEdgeFrom returns true if the edge from parent to this block is a back-edge
+// (this block is a loop header and parent is one of its back-edge sources).
+func (b *MIRBasicBlock) IsBackEdgeFrom(parent *MIRBasicBlock) bool {
+	if b == nil || parent == nil || !b.IsLoopHeader || b.backEdgeParents == nil {
+		return false
+	}
+	_, ok := b.backEdgeParents[parent]
+	return ok
 }
 
 func NewMIRBasicBlock(blockNum, pc uint) *MIRBasicBlock {

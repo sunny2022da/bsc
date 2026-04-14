@@ -68,6 +68,10 @@ type CFG struct {
 	// needsRuntimeEpochFlag is set if the CFG contains merge points with differing incoming stack heights.
 	// These contracts require runtime-epoch tagging to select the correct entry stack during cached runs.
 	needsRuntimeEpochFlag bool
+
+	// loopInfoValid is true after ComputeLoopInfo has run. Reset to false when
+	// the CFG structure changes (new blocks/edges added at runtime).
+	loopInfoValid bool
 }
 
 func NewCFG(hash common.Hash, code []byte) (c *CFG) {
@@ -260,6 +264,9 @@ func (c *CFG) Parse() error {
 			queue = append(queue, child)
 		}
 	}
+	// Compute loop analysis now that the CFG structure is stable.
+	c.ComputeLoopInfo()
+
 	// After reaching a parse-time fixpoint, detect whether this CFG needs runtime epoch tagging.
 	// If any merge point has incoming snapshots with differing heights, cached runs must avoid
 	// using a parse-time entry stack specialized to the wrong predecessor height.
@@ -624,24 +631,13 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 			height = modeLen
 		}
 
-		// Detect if this block is a loop header (has at least one back-edge parent).
-		// Loop headers must always create PHI nodes even if all incoming values look
-		// identical at parse-time, because back-edge values change every iteration.
-		hasBackEdge := false
-		for _, p := range block.parents {
-			if p != nil && p.firstPC >= block.firstPC {
-				hasBackEdge = true
-				break
-			}
-		}
-		// Detect multi-block cycles: a parent that is reachable from this block
-		// (via children edges) forms a cycle even if parent.firstPC < block.firstPC.
-		// Without forced PHI creation here, constant-folding at parse-time can make
-		// all incoming snapshots look identical, hiding loop-carried value changes
-		// and causing infinite loops at runtime (counter stuck at initial value).
-		if !hasBackEdge && len(block.parents) > 1 {
+		// Force PHI creation for loop headers and loop-internal merge points.
+		// After ComputeLoopInfo has run, use the accurate SCC-based flags.
+		// During Parse (before ComputeLoopInfo), fall back to the firstPC heuristic.
+		hasBackEdge := block.IsLoopHeader || (block.IsInLoop && len(block.parents) > 1)
+		if !hasBackEdge {
 			for _, p := range block.parents {
-				if p != nil && isReachableViaChildren(block, p, 12) {
+				if p != nil && p.firstPC >= block.firstPC {
 					hasBackEdge = true
 					break
 				}
@@ -732,42 +728,6 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 }
 
 // isReachableViaChildren returns true if `target` is reachable from `start` by following
-// children edges within `maxDepth` hops. Used to detect multi-block cycles where a parent
-// of a block is also a descendant, forming a loop that the simple firstPC comparison misses.
-func isReachableViaChildren(start, target *MIRBasicBlock, maxDepth int) bool {
-	if start == nil || target == nil || maxDepth <= 0 {
-		return false
-	}
-	type item struct {
-		block *MIRBasicBlock
-		depth int
-	}
-	queue := []item{{start, 0}}
-	visited := make(map[*MIRBasicBlock]struct{}, 32)
-	visited[start] = struct{}{}
-	for len(queue) > 0 {
-		cur := queue[0]
-		queue = queue[1:]
-		for _, ch := range cur.block.Children() {
-			if ch == nil {
-				continue
-			}
-			if ch == target {
-				return true
-			}
-			if cur.depth+1 >= maxDepth {
-				continue
-			}
-			if _, ok := visited[ch]; ok {
-				continue
-			}
-			visited[ch] = struct{}{}
-			queue = append(queue, item{ch, cur.depth + 1})
-		}
-	}
-	return false
-}
-
 // connectEdge links parent -> child and records the incoming stack snapshot for child.
 // If the incoming snapshot for this (parent,child) pair changed, invalidate child's entry stack
 // and mark it for rebuild (PHI may be required later).
@@ -795,6 +755,10 @@ func (c *CFG) connectEdge(parent, child *MIRBasicBlock, exitSnapshot []Value) {
 				parent.jumpTable = make(map[uint]*MIRBasicBlock, 4)
 			}
 			parent.jumpTable[child.firstPC] = child
+			// New edge may create or modify loops; invalidate loop analysis.
+			if c != nil {
+				c.loopInfoValid = false
+			}
 		}
 	}
 	{
@@ -855,8 +819,11 @@ func (c *CFG) connectEdge(parent, child *MIRBasicBlock, exitSnapshot []Value) {
 	// child itself). Using parent.firstPC >= child.firstPC alone is too broad and
 	// blocks legitimate forward edges (e.g. utility function returns where the
 	// callee block has a higher PC than the continuation).
-	if c != nil && c.runtimeEpoch != 0 && parent.firstPC >= child.firstPC && blockInLoop(child) {
-		return
+	if c != nil && c.runtimeEpoch != 0 {
+		c.EnsureLoopInfo()
+		if child.IsLoopHeader && child.IsBackEdgeFrom(parent) {
+			return
+		}
 	}
 	child.SetEntryStack(nil)
 	child.built = false
