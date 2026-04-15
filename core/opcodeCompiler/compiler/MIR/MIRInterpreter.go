@@ -38,6 +38,11 @@ var u256Zero = new(uint256.Int)
 // whether to fall back to the stock EVM interpreter for the current frame.
 var ErrMIRInternal = errors.New("MIR internal failure")
 
+// blockHistoryMax caps the block history ring buffer. Deep enough to find
+// live-in defs across typical internal-function call chains, bounded to
+// keep memory usage predictable.
+const blockHistoryMax = 256
+
 // Common small constants (immutable). These are safe to share because MIRInterpreter never mutates
 // the operand values passed into gas/memory helpers.
 var (
@@ -203,6 +208,14 @@ type MIRInterpreter struct {
 	curBlock *MIRBasicBlock
 	curEvmPC uint
 	curEvmOp byte
+
+	// blockHistory tracks the sequence of basic blocks executed in this frame.
+	// Used by evalPhi's Unknown-resolution fallback: when a PHI operand traces
+	// to a live-in that MIR couldn't resolve at Parse time, walk back through
+	// the history to find the actual runtime value in an earlier block's
+	// result table. Ring buffer capped at blockHistoryMax to bound memory.
+	blockHistory    []*MIRBasicBlock
+	blockHistoryPos int // next write index (ring buffer)
 
 	// Cached per-block prefix sums of constant gas for original EVM opcode stream.
 	// Indexed by basic block number; each entry is len(block.evmOps)+1 where prefix[i] is sum of 0..i-1.
@@ -571,6 +584,11 @@ func (it *MIRInterpreter) ResetForRun(cfg *CFG) {
 	it.curBlockConstPrefix = nil
 	it.curBlockConstDelta = nil
 	it.curBlockConstTail = 0
+	// Reset block history ring buffer (keep capacity).
+	if it.blockHistory != nil {
+		it.blockHistory = it.blockHistory[:0]
+	}
+	it.blockHistoryPos = 0
 	it.debugOperandHook = nil
 	it.debugOperandHookEx = nil
 	it.debugKeccakHook = nil
@@ -580,6 +598,26 @@ func (it *MIRInterpreter) ResetForRun(cfg *CFG) {
 
 func (it *MIRInterpreter) SetStepHook(h func(evmPC uint, evmOp byte, op MirOperation)) {
 	it.stepHook = h
+}
+
+// recordBlockEntry pushes a block into the history ring buffer. Used by
+// evalPhi's Unknown-resolution fallback to walk back through the execution
+// chain and find the actual runtime value for a live-in that MIR's static
+// analysis couldn't trace at Parse time.
+func (it *MIRInterpreter) recordBlockEntry(b *MIRBasicBlock) {
+	if b == nil {
+		return
+	}
+	if len(it.blockHistory) < blockHistoryMax {
+		it.blockHistory = append(it.blockHistory, b)
+		return
+	}
+	// Ring buffer full: overwrite oldest.
+	it.blockHistory[it.blockHistoryPos] = b
+	it.blockHistoryPos++
+	if it.blockHistoryPos >= blockHistoryMax {
+		it.blockHistoryPos = 0
+	}
 }
 
 // SetResolveHook installs an optional hook invoked during JUMP/JUMPI resolution.
@@ -933,6 +971,8 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 
 	var prev *MIRBasicBlock
 	for {
+		// Record this block in the execution history for Unknown-resolution fallback.
+		it.recordBlockEntry(cur)
 		// Ensure loop analysis is current before any IsLoopHeader/IsInLoop checks.
 		// Runtime edge additions (connectEdge) invalidate loopInfoValid; without this
 		// call, stale IsLoopHeader=false can cause loop headers to be incorrectly
@@ -4358,8 +4398,102 @@ func (it *MIRInterpreter) evalPhi(cur, prev *MIRBasicBlock, phi *MIR) (*uint256.
 		}
 	}
 
+	// Deep fallback: walk back through the block execution history to find
+	// the actual runtime value for this stack position. Unknown values in
+	// the static analysis are live-ins that MIR couldn't trace at Parse
+	// time, but the values themselves exist in runtime — they flowed through
+	// earlier blocks' exit stacks and are captured in the result table.
+	if val, ok := it.resolveViaHistory(prev, phi.phiStackIndex); ok {
+		return val, nil
+	}
+
 	return nil, fmt.Errorf("%w: phi eval failed: all paths exhausted (curFirstPC=%d prevFirstPC=%d phiPC=%d phiIdx=%d)",
 		ErrMIRInternal, cur.FirstPC(), prev.FirstPC(), phi.evmPC, phi.phiStackIndex)
+}
+
+// resolveViaHistory walks back through the block execution history to find
+// the runtime value at `stackDepthFromTop` of `startBlock`'s exit stack.
+//
+// Strategy: if startBlock's exit at that position is a live-in (Unknown or
+// a Variable whose value wasn't produced in startBlock), the value came
+// from startBlock's entry stack. We compute what slot of the predecessor's
+// exit stack corresponds to that entry slot (accounting for the block's
+// net stack effect), then recurse. We stop when we find a concrete value
+// (Konst, or a Variable with an executed def in the result table).
+func (it *MIRInterpreter) resolveViaHistory(startBlock *MIRBasicBlock, stackDepthFromTop int) (*uint256.Int, bool) {
+	if startBlock == nil || len(it.blockHistory) == 0 {
+		return nil, false
+	}
+	// Find startBlock's position in the history. Search from the newest entry back.
+	// (Ring buffer: effective order is positions [pos..end] then [0..pos-1] when full.)
+	hist := it.blockHistory
+	startIdx := -1
+	for i := len(hist) - 1; i >= 0; i-- {
+		if hist[i] == startBlock {
+			startIdx = i
+			break
+		}
+	}
+	if startIdx < 0 {
+		return nil, false
+	}
+
+	// Walk back: at each step, map the current depth-from-top through the
+	// block's exit stack. If the value is live-in, re-map to the entry
+	// depth and move to the previous block in history.
+	curDepth := stackDepthFromTop
+	for i := startIdx; i >= 0; i-- {
+		b := hist[i]
+		if b == nil {
+			return nil, false
+		}
+		exitStatic := b.ExitStack()
+		entryStatic := b.EntryStack()
+		if exitStatic == nil {
+			// Without a static exit snapshot we can't map positions.
+			return nil, false
+		}
+		exitIdx := (len(exitStatic) - 1) - curDepth
+		if exitIdx < 0 || exitIdx >= len(exitStatic) {
+			return nil, false
+		}
+		v := exitStatic[exitIdx]
+		// Case 1: live-in — value came from entry stack. Map to entry position
+		// and continue to the previous block.
+		if v.liveIn {
+			if entryStatic == nil {
+				return nil, false
+			}
+			// Map exit-stack liveIn position to entry stack depth-from-top.
+			if v.liveInPos < 0 || v.liveInPos >= len(entryStatic) {
+				return nil, false
+			}
+			curDepth = (len(entryStatic) - 1) - v.liveInPos
+			continue
+		}
+		// Case 2: concrete value produced in this block.
+		if v.kind == Konst && v.u != nil {
+			return v.u, true
+		}
+		if v.kind == Variable && v.def != nil {
+			if r, ok := it.getResult(v.def); ok && r != nil {
+				return r, true
+			}
+			// Try stable key mapping for rebuilt blocks.
+			if it.cfg != nil && it.cfg.defKeyToResIdx != nil {
+				if ridx, ok2 := it.cfg.defKeyToResIdx[keyForDef(v.def)]; ok2 && ridx > 0 {
+					if ridx < len(it.resultsGen) && it.resultsGen[ridx] == it.gen {
+						return &it.results[ridx], true
+					}
+				}
+			}
+			// Def exists but no result — give up.
+			return nil, false
+		}
+		// Unknown or other kind: give up.
+		return nil, false
+	}
+	return nil, false
 }
 
 func (it *MIRInterpreter) evalValue(v *Value) (*uint256.Int, error) {
