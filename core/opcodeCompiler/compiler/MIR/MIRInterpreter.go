@@ -1181,6 +1181,22 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 		// when new incoming edges are discovered at runtime (dynamic jumps): we must never rebuild
 		// a block while it is actively executing, because that can invalidate PHI/results mid-run.
 		if cur != nil && !cur.built {
+			// Save loop-carried results before rebuild: when a new back-edge is
+			// discovered mid-iteration, the current iteration's def results may be
+			// referenced by the next iteration's PHI. Preserve them by (evmPC, op,
+			// phiStackIndex) key and restore to the new resIdx after rebuild.
+			var savedResults map[mirDefKey]uint256.Int
+			if cur.IsLoopHeader || cur.IsInLoop {
+				savedResults = make(map[mirDefKey]uint256.Int, len(cur.instructions))
+				for _, m := range cur.instructions {
+					if m == nil || m.op == MirPHI {
+						continue
+					}
+					if m.resIdx > 0 && m.resIdx < len(it.resultsGen) && it.resultsGen[m.resIdx] == it.gen {
+						savedResults[keyForDef(m)] = it.results[m.resIdx]
+					}
+				}
+			}
 			if len(cur.instructions) > 0 {
 				it.invalidateBlockResults(cur)
 				// Clear entryStack on runtime rebuild: preserving it can retain stale def pointers
@@ -1189,6 +1205,20 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 			}
 			if err := it.cfg.buildBasicBlock(cur, it.validJumpDests); err != nil {
 				return it.finishResult(ExecResult{Err: err})
+			}
+			// Restore saved loop-carried results to their new resIdx slots.
+			if savedResults != nil {
+				for _, m := range cur.instructions {
+					if m == nil || m.op == MirPHI {
+						continue
+					}
+					if v, ok := savedResults[keyForDef(m)]; ok {
+						if m.resIdx > 0 && m.resIdx < len(it.results) {
+							it.results[m.resIdx] = v
+							it.resultsGen[m.resIdx] = it.gen
+						}
+					}
+				}
 			}
 		}
 
