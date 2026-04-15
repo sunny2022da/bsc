@@ -4221,6 +4221,17 @@ func (it *MIRInterpreter) evalPhi(cur, prev *MIRBasicBlock, phi *MIR) (*uint256.
 			idx := (len(in) - 1) - phi.phiStackIndex
 			if idx >= 0 && idx < len(in) {
 				v := in[idx]
+				// If the incoming snapshot has Unknown at this position, try to
+				// resolve from the predecessor's actual exit stack (runtime values).
+				if v.kind == Unknown && prev.ExitStack() != nil {
+					exitSnap := it.computeExitSnapshotForEdge(nil, prev)
+					if exitSnap != nil {
+						eidx := (len(exitSnap) - 1) - phi.phiStackIndex
+						if eidx >= 0 && eidx < len(exitSnap) && exitSnap[eidx].kind != Unknown {
+							v = exitSnap[eidx]
+						}
+					}
+				}
 				if v.kind != Unknown {
 					// If the incoming snapshot points at a def defined in this same block, it's a
 					// loop-carried self-reference. This covers both PHI defs and non-PHI defs
@@ -4289,9 +4300,28 @@ func (it *MIRInterpreter) evalPhi(cur, prev *MIRBasicBlock, phi *MIR) (*uint256.
 		}
 	}
 
-	// All PHI resolution paths exhausted. The CFG has incomplete information for
-	// this edge — return an error to trigger fallback to the stock EVM interpreter
-	// rather than silently producing zero (which corrupts downstream computation).
+	// Last resort: all static PHI resolution paths exhausted (operand was Unknown,
+	// snapshot was missing or also Unknown). Before giving up, try to materialize
+	// the predecessor's exit stack from actual runtime results. The predecessor
+	// was just executed, so all its instruction results are in the result table.
+	// This avoids a costly fallback to the stock EVM for CFGs where Parse couldn't
+	// determine a value statically but runtime execution has all the information.
+	if prev.ExitStack() != nil {
+		exitSnap := it.computeExitSnapshotForEdge(nil, prev)
+		if exitSnap != nil {
+			idx := (len(exitSnap) - 1) - phi.phiStackIndex
+			if idx >= 0 && idx < len(exitSnap) {
+				v := exitSnap[idx]
+				if v.kind != Unknown {
+					val, err := it.evalValue(&v)
+					if err == nil && val != nil {
+						return val, nil
+					}
+				}
+			}
+		}
+	}
+
 	return nil, fmt.Errorf("phi eval failed: all paths exhausted (curFirstPC=%d prevFirstPC=%d phiPC=%d phiIdx=%d)",
 		cur.FirstPC(), prev.FirstPC(), phi.evmPC, phi.phiStackIndex)
 }
@@ -4336,8 +4366,19 @@ func (it *MIRInterpreter) evalValue(v *Value) (*uint256.Int, error) {
 		// fatal errors from temporarily stale operand references after dynamic rebuilds.
 		def := v.def
 		if def != nil && def.op == MirPHI {
-			// PHI def with no result — the CFG is incomplete for this path.
-			// Return error to trigger fallback rather than silently producing zero.
+			// PHI def with stale resIdx after rebuild. Scan the actual block
+			// instructions for the matching (evmPC, op) to find the current resIdx.
+			if defBlock := it.cfg.pcToBlock[uint(def.evmPC)]; defBlock != nil {
+				for _, ins := range defBlock.instructions {
+					if ins != nil && ins.evmPC == def.evmPC && ins.op == def.op && ins.phiStackIndex == def.phiStackIndex {
+						if ins.resIdx > 0 && ins.resIdx < len(it.resultsGen) && it.resultsGen[ins.resIdx] == it.gen {
+							return &it.results[ins.resIdx], nil
+						}
+						break
+					}
+				}
+			}
+			// Still no result — CFG is incomplete for this path.
 			mapped, mappedOk := 0, false
 			if it.cfg != nil && it.cfg.defKeyToResIdx != nil {
 				mapped, mappedOk = it.cfg.defKeyToResIdx[keyForDef(def)]
