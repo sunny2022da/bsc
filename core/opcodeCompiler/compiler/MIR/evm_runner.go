@@ -45,6 +45,28 @@ var mirDisableFrom = func() uint64 {
 	return 0
 }()
 
+// mirContractDenylist tracks contract codeHashes for which MIR has previously
+// failed (returned ErrMIRInternal). Subsequent calls to these contracts skip
+// MIR entirely and go straight to the stock EVM, avoiding the cost of
+// snapshot+execute+revert+rerun on contracts MIR can't handle.
+var (
+	mirContractDenylist   = make(map[common.Hash]struct{}, 64)
+	mirContractDenylistMu sync.RWMutex
+)
+
+func mirIsContractDenylisted(h common.Hash) bool {
+	mirContractDenylistMu.RLock()
+	_, ok := mirContractDenylist[h]
+	mirContractDenylistMu.RUnlock()
+	return ok
+}
+
+func mirDenylistContract(h common.Hash) {
+	mirContractDenylistMu.Lock()
+	mirContractDenylist[h] = struct{}{}
+	mirContractDenylistMu.Unlock()
+}
+
 // mirHaltAfterBlock, when true, sends SIGSTOP to the process after the debug block
 // finishes execution, so the operator can inspect state and roll back.
 var mirHaltAfterBlock = os.Getenv("MIR_HALT_AFTER_BLOCK") == "1"
@@ -268,6 +290,17 @@ func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]b
 		contract.CodeHash = codeHash
 	}
 
+	// Process-wide denylist: if MIR previously failed on this contract
+	// (returned ErrMIRInternal), skip MIR entirely to avoid repeated
+	// snapshot+execute+revert+rerun overhead.
+	if mirIsContractDenylisted(codeHash) {
+		r.fellBack = true
+		if r.baseIt == nil {
+			r.baseIt = vm.NewEVMInterpreter(r.evm)
+		}
+		return r.baseIt.Run(contract, input, readOnly)
+	}
+
 	// Use global (process-wide) CFG cache to avoid re-parsing hot contracts every block.
 	var entry *cfgCacheEntry
 	if r.lastEntry != nil && r.lastCodeHash == codeHash {
@@ -327,39 +360,13 @@ func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]b
 		}()
 	}
 
-	// Performance fast-path:
-	// For some large contracts and CFGs that require runtime repair bookkeeping, MIR is currently
-	// slower than the native interpreter. Use an optimized interpreter (superinstructions) so
-	// EnableMIR never regresses performance (perf gate).
-	//
-	// NOTE: This still preserves native EVM semantics; it's purely a performance dispatch choice.
-	// Correctness guard: MIR dynamic CFGs (unresolved jumps) are still not fully stable.
-	// Until MIR can guarantee parity for dynamic jump tables, execute these contracts with
-	// the native interpreter.
-	if cfg != nil && cfg.hasUnresolvedJumps() {
-		vm.MIRFallbackUnresolvedJump.Add(1)
-		if mirDebugBlock != 0 && r.blockNumber == mirDebugBlock {
-			log.Warn("MIR fallback", "block", r.blockNumber,
-				"reason", "unresolved jumps",
-				"addr", contract.Address(),
-				"codeLen", len(contract.Code),
-			)
-		} else {
-			log.Debug("MIR fallback to base interpreter",
-				"reason", "unresolved jumps",
-				"addr", contract.Address(),
-				"codeHash", codeHash,
-				"codeLen", len(contract.Code),
-			)
-		}
-		r.fellBack = true
-		if r.baseIt == nil {
-			r.baseIt = vm.NewEVMInterpreter(r.evm)
-		}
-		ret, err := r.baseIt.Run(contract, input, false)
-		// contract.Gas is updated by base interpreter.
-		return ret, err
-	}
+	// NOTE: previously, contracts with hasUnresolvedJumps() were unconditionally
+	// fallback-routed to the stock EVM as a correctness guard. With today's
+	// runtime recovery mechanisms (resolveBB backfill, resolveViaHistory,
+	// EnsureLoopInfo, ErrMIRInternal-driven safe fallback, contract denylist),
+	// MIR can attempt these contracts and only fall back on actual failure.
+	// First-failure denylist below ensures repeated bad-contract calls don't
+	// pay the snapshot/revert overhead.
 
 	// Only enable runtimeEpoch tagging for CFGs that actually need it.
 	// For the common case (valid bytecode with consistent stack heights at merge points),
@@ -490,6 +497,9 @@ func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]b
 		} else if curRefund < mirRefundBefore {
 			r.evm.StateDB.AddRefund(mirRefundBefore - curRefund)
 		}
+		// Add this contract to the process-wide denylist so future calls skip
+		// MIR entirely and avoid repeated snapshot/revert overhead.
+		mirDenylistContract(codeHash)
 		if mirRunnerDebugLog || (mirDebugBlock != 0 && r.blockNumber == mirDebugBlock) {
 			log.Warn("MIR fallback to base interpreter (MIR internal failure)",
 				"block", r.blockNumber,
