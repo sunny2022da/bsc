@@ -4289,15 +4289,11 @@ func (it *MIRInterpreter) evalPhi(cur, prev *MIRBasicBlock, phi *MIR) (*uint256.
 		}
 	}
 
-	// All PHI resolution paths exhausted. Rather than returning a fatal error that kills
-	// the entire execution, return zero. This can happen when incoming stacks have height
-	// mismatches and the runtime snapshot for this edge doesn't cover the requested depth.
-	if mirRunnerDebugLog || (mirDebugBlock != 0 && it.blockNumber == mirDebugBlock) {
-		log.Warn("MIR evalPhi: all paths exhausted, returning zero",
-			"curFirstPC", cur.FirstPC(), "prevFirstPC", prev.FirstPC(),
-			"phiPC", phi.evmPC, "phiIdx", phi.phiStackIndex)
-	}
-	return u256Zero, nil
+	// All PHI resolution paths exhausted. The CFG has incomplete information for
+	// this edge — return an error to trigger fallback to the stock EVM interpreter
+	// rather than silently producing zero (which corrupts downstream computation).
+	return nil, fmt.Errorf("phi eval failed: all paths exhausted (curFirstPC=%d prevFirstPC=%d phiPC=%d phiIdx=%d)",
+		cur.FirstPC(), prev.FirstPC(), phi.evmPC, phi.phiStackIndex)
 }
 
 func (it *MIRInterpreter) evalValue(v *Value) (*uint256.Int, error) {
@@ -4340,22 +4336,18 @@ func (it *MIRInterpreter) evalValue(v *Value) (*uint256.Int, error) {
 		// fatal errors from temporarily stale operand references after dynamic rebuilds.
 		def := v.def
 		if def != nil && def.op == MirPHI {
-			if mirRunnerDebugLog || (mirDebugBlock != 0 && it.blockNumber == mirDebugBlock) {
-				mapped, mappedOk := 0, false
-				if it.cfg != nil && it.cfg.defKeyToResIdx != nil {
-					mapped, mappedOk = it.cfg.defKeyToResIdx[keyForDef(def)]
-				}
-				curFirstPC := uint(0)
-				if it.curBlock != nil {
-					curFirstPC = it.curBlock.firstPC
-				}
-				log.Warn("MIR evalValue: PHI def missing result, returning zero",
-					"defPC", def.evmPC, "defBlock", def.defBlockNum,
-					"phiIdx", def.phiStackIndex, "defResIdx", def.resIdx,
-					"mappedResIdx", mapped, "mappedOk", mappedOk,
-					"curFirstPC", curFirstPC, "curEvmPC", it.curEvmPC)
+			// PHI def with no result — the CFG is incomplete for this path.
+			// Return error to trigger fallback rather than silently producing zero.
+			mapped, mappedOk := 0, false
+			if it.cfg != nil && it.cfg.defKeyToResIdx != nil {
+				mapped, mappedOk = it.cfg.defKeyToResIdx[keyForDef(def)]
 			}
-			return u256Zero, nil
+			curFirstPC := uint(0)
+			if it.curBlock != nil {
+				curFirstPC = it.curBlock.firstPC
+			}
+			return nil, fmt.Errorf("missing result for PHI def defPC=%d defBlock=%d phiIdx=%d defResIdx=%d mappedResIdx=%d mappedOk=%v (curFirstPC=%d curEvmPC=%d)",
+				def.evmPC, def.defBlockNum, def.phiStackIndex, def.resIdx, mapped, mappedOk, curFirstPC, it.curEvmPC)
 		}
 		// For non-PHI defs, this is a genuine missing-result bug. Report it.
 		mapped, mappedOk := 0, false
@@ -4375,18 +4367,14 @@ func (it *MIRInterpreter) evalValue(v *Value) (*uint256.Int, error) {
 		// underflow. Return the error so the caller aborts execution, consuming all gas, exactly
 		// as the base EVM does (via vm.ErrStackUnderflow in EVMInterpreter.Run).
 		//
-		// Unknown with liveIn==true is a legitimate live-in from padBottomTo or a PHI slot
-		// created during iterative CFG construction; those are safe to treat as zero.
+		// Unknown with liveIn==false: stack underflow (ValueStack.pop on empty stack).
 		if !v.liveIn {
 			return nil, fmt.Errorf("stack underflow (0 <=> 1)")
 		}
-		if mirDebugBlock != 0 && it.blockNumber == mirDebugBlock {
-			log.Warn("MIR evalValue: Unknown live-in returns zero",
-				"block", it.blockNumber,
-				"curEvmPC", it.curEvmPC,
-			)
-		}
-		return u256Zero, nil
+		// Unknown with liveIn==true: placeholder from padBottomTo or a PHI slot
+		// when a parent's incoming snapshot was missing. At runtime this means
+		// the CFG is incomplete — return error to trigger fallback.
+		return nil, fmt.Errorf("unresolved Unknown live-in at evmPC=%d", it.curEvmPC)
 	}
 }
 
