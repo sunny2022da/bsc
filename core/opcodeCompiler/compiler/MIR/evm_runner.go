@@ -1,6 +1,7 @@
 package MIR
 
 import (
+	"errors"
 	"fmt"
 	"math/big"
 	"os"
@@ -463,6 +464,10 @@ func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]b
 		return ret, err
 	}
 
+	// Snapshot StateDB before MIR execution so we can roll back on MIR-internal
+	// failures (e.g. unresolved Unknown values) and fall back to stock EVM cleanly.
+	mirSnapID := r.evm.StateDB.Snapshot()
+	mirRefundBefore := r.evm.StateDB.GetRefund()
 	res := it.Run()
 	if mirRunnerDebugLog {
 		log.Debug("MIR runner: interpreter done",
@@ -473,6 +478,37 @@ func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]b
 			"runtimeBecameDynamic", cfg.runtimeBecameDynamic,
 			"err", res.Err,
 		)
+	}
+	// MIR-internal failure (incomplete CFG analysis): rollback any state mutations
+	// MIR made during this frame and re-execute via the stock EVM interpreter.
+	if res.Err != nil && errors.Is(res.Err, ErrMIRInternal) {
+		r.evm.StateDB.RevertToSnapshot(mirSnapID)
+		// Restore refund counter to pre-MIR value.
+		curRefund := r.evm.StateDB.GetRefund()
+		if curRefund > mirRefundBefore {
+			r.evm.StateDB.SubRefund(curRefund - mirRefundBefore)
+		} else if curRefund < mirRefundBefore {
+			r.evm.StateDB.AddRefund(mirRefundBefore - curRefund)
+		}
+		if mirRunnerDebugLog || (mirDebugBlock != 0 && r.blockNumber == mirDebugBlock) {
+			log.Warn("MIR fallback to base interpreter (MIR internal failure)",
+				"block", r.blockNumber,
+				"addr", contract.Address(),
+				"codeLen", len(contract.Code),
+				"err", res.Err,
+			)
+		}
+		// Return interpreter to pool before falling back.
+		if r.it == nil {
+			r.it = it
+		} else {
+			globalInterpreterPool.Put(it)
+		}
+		r.fellBack = true
+		if r.baseIt == nil {
+			r.baseIt = vm.NewEVMInterpreter(r.evm)
+		}
+		return r.baseIt.Run(contract, input, readOnly)
 	}
 	if res.Err != nil && os.Getenv("MIR_DUMP_ON_ERROR") != "" {
 		// Debug-only: enrich "missing result for def" failures with a local MIR dump around the faulting PC.

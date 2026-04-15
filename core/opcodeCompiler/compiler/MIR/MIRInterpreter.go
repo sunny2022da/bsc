@@ -32,6 +32,12 @@ type ExecResult struct {
 // Shared immutable zero value to avoid allocations in hot paths.
 var u256Zero = new(uint256.Int)
 
+// ErrMIRInternal marks errors that originate from MIR's incomplete static analysis
+// (unresolved Unknown values, missing PHI results, exhausted resolution paths)
+// rather than legitimate EVM execution errors. The runner uses this to decide
+// whether to fall back to the stock EVM interpreter for the current frame.
+var ErrMIRInternal = errors.New("MIR internal failure")
+
 // Common small constants (immutable). These are safe to share because MIRInterpreter never mutates
 // the operand values passed into gas/memory helpers.
 var (
@@ -4230,8 +4236,8 @@ func (it *MIRInterpreter) evalPhi(cur, prev *MIRBasicBlock, phi *MIR) (*uint256.
 			break
 		}
 		if !foundPrev {
-			return nil, fmt.Errorf("phi eval failed: predecessor not found in parents (curFirstPC=%d prevFirstPC=%d phiPC=%d phiIdx=%d)",
-				cur.FirstPC(), prev.FirstPC(), phi.evmPC, phi.phiStackIndex)
+			return nil, fmt.Errorf("%w: phi eval failed: predecessor not found in parents (curFirstPC=%d prevFirstPC=%d phiPC=%d phiIdx=%d)",
+				ErrMIRInternal, cur.FirstPC(), prev.FirstPC(), phi.evmPC, phi.phiStackIndex)
 		}
 		// Found predecessor but operand was missing/nil: fall back to snapshot indexing below.
 	}
@@ -4242,8 +4248,8 @@ func (it *MIRInterpreter) evalPhi(cur, prev *MIRBasicBlock, phi *MIR) (*uint256.
 		// Ignore stale runtime snapshots from previous executions when CFG is cached.
 		if it.cfg != nil && it.cfg.runtimeEpoch != 0 && cur.incomingStacksGen != nil {
 			if g, ok := cur.incomingStacksGen[prev]; ok && g != 0 && g != it.cfg.runtimeEpoch {
-				return nil, fmt.Errorf("phi eval failed: stale incoming snapshot (curFirstPC=%d prevFirstPC=%d phiPC=%d phiIdx=%d)",
-					cur.FirstPC(), prev.FirstPC(), phi.evmPC, phi.phiStackIndex)
+				return nil, fmt.Errorf("%w: phi eval failed: stale incoming snapshot (curFirstPC=%d prevFirstPC=%d phiPC=%d phiIdx=%d)",
+					ErrMIRInternal, cur.FirstPC(), prev.FirstPC(), phi.evmPC, phi.phiStackIndex)
 			}
 		}
 		in := cur.incomingStacks[prev]
@@ -4352,8 +4358,8 @@ func (it *MIRInterpreter) evalPhi(cur, prev *MIRBasicBlock, phi *MIR) (*uint256.
 		}
 	}
 
-	return nil, fmt.Errorf("phi eval failed: all paths exhausted (curFirstPC=%d prevFirstPC=%d phiPC=%d phiIdx=%d)",
-		cur.FirstPC(), prev.FirstPC(), phi.evmPC, phi.phiStackIndex)
+	return nil, fmt.Errorf("%w: phi eval failed: all paths exhausted (curFirstPC=%d prevFirstPC=%d phiPC=%d phiIdx=%d)",
+		ErrMIRInternal, cur.FirstPC(), prev.FirstPC(), phi.evmPC, phi.phiStackIndex)
 }
 
 func (it *MIRInterpreter) evalValue(v *Value) (*uint256.Int, error) {
@@ -4417,8 +4423,8 @@ func (it *MIRInterpreter) evalValue(v *Value) (*uint256.Int, error) {
 			if it.curBlock != nil {
 				curFirstPC = it.curBlock.firstPC
 			}
-			return nil, fmt.Errorf("missing result for PHI def defPC=%d defBlock=%d phiIdx=%d defResIdx=%d mappedResIdx=%d mappedOk=%v (curFirstPC=%d curEvmPC=%d)",
-				def.evmPC, def.defBlockNum, def.phiStackIndex, def.resIdx, mapped, mappedOk, curFirstPC, it.curEvmPC)
+			return nil, fmt.Errorf("%w: missing result for PHI def defPC=%d defBlock=%d phiIdx=%d defResIdx=%d mappedResIdx=%d mappedOk=%v (curFirstPC=%d curEvmPC=%d)",
+				ErrMIRInternal, def.evmPC, def.defBlockNum, def.phiStackIndex, def.resIdx, mapped, mappedOk, curFirstPC, it.curEvmPC)
 		}
 		// For non-PHI defs, this is a genuine missing-result bug. Report it.
 		mapped, mappedOk := 0, false
@@ -4429,8 +4435,8 @@ func (it *MIRInterpreter) evalValue(v *Value) (*uint256.Int, error) {
 		if it.curBlock != nil {
 			curFirstPC = it.curBlock.firstPC
 		}
-		return nil, fmt.Errorf("missing result for def op=%s defPC=%d defBlock=%d phiIdx=%d defResIdx=%d mappedResIdx=%d mappedOk=%v (curFirstPC=%d curEvmPC=%d)",
-			def.op.String(), def.evmPC, def.defBlockNum, def.phiStackIndex, def.resIdx, mapped, mappedOk, curFirstPC, it.curEvmPC)
+		return nil, fmt.Errorf("%w: missing result for def op=%s defPC=%d defBlock=%d phiIdx=%d defResIdx=%d mappedResIdx=%d mappedOk=%v (curFirstPC=%d curEvmPC=%d)",
+			ErrMIRInternal, def.op.String(), def.evmPC, def.defBlockNum, def.phiStackIndex, def.resIdx, mapped, mappedOk, curFirstPC, it.curEvmPC)
 	default:
 		// Unknown value with liveIn==false is created exclusively by ValueStack.pop() on an
 		// empty stack during CFG construction (see ValueStack.go). At execution time this means
@@ -4445,7 +4451,7 @@ func (it *MIRInterpreter) evalValue(v *Value) (*uint256.Int, error) {
 		// Unknown with liveIn==true: placeholder from padBottomTo or a PHI slot
 		// when a parent's incoming snapshot was missing. At runtime this means
 		// the CFG is incomplete — return error to trigger fallback.
-		return nil, fmt.Errorf("unresolved Unknown live-in at evmPC=%d", it.curEvmPC)
+		return nil, fmt.Errorf("%w: unresolved Unknown live-in at evmPC=%d", ErrMIRInternal, it.curEvmPC)
 	}
 }
 
