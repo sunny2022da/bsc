@@ -763,6 +763,7 @@ func (c *CFG) connectEdge(parent, child *MIRBasicBlock, exitSnapshot []Value) {
 			}
 		}
 	}
+	newParent := false
 	{
 		parents := child.Parents()
 		found := false
@@ -775,6 +776,7 @@ func (c *CFG) connectEdge(parent, child *MIRBasicBlock, exitSnapshot []Value) {
 		if !found {
 			parents = append(parents, parent)
 			child.SetParents(parents)
+			newParent = true
 		}
 	}
 	// Treat nil snapshot as an empty stack snapshot (important to record the predecessor).
@@ -814,14 +816,15 @@ func (c *CFG) connectEdge(parent, child *MIRBasicBlock, exitSnapshot []Value) {
 	if c != nil && c.runtimeEpoch != 0 {
 		child.preferredEntryHeight = len(exitSnapshot)
 	}
-	// At runtime, do NOT invalidate loop header blocks via actual loop back-edges.
+	// At runtime, do NOT invalidate loop header blocks via existing back-edges.
 	// The parse-time PHIs are correct, and invalidating at runtime triggers
 	// rebuild → invalidateBlockResults → destroys loop-carried values.
-	// IMPORTANT: only skip when the child is a genuine loop header (has a back-edge
-	// child itself). Using parent.firstPC >= child.firstPC alone is too broad and
-	// blocks legitimate forward edges (e.g. utility function returns where the
-	// callee block has a higher PC than the continuation).
-	if c != nil && c.runtimeEpoch != 0 {
+	//
+	// IMPORTANT: only skip for EXISTING back-edges (parent was already known).
+	// A newly discovered back-edge (newParent=true) means the entry stack was
+	// built without this parent's incoming snapshot, so PHIs have UNK operands
+	// for this edge. We MUST invalidate and rebuild to add the new operand.
+	if c != nil && c.runtimeEpoch != 0 && !newParent {
 		c.EnsureLoopInfo()
 		if child.IsLoopHeader && child.IsBackEdgeFrom(parent) {
 			return
