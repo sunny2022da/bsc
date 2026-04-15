@@ -927,6 +927,13 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 
 	var prev *MIRBasicBlock
 	for {
+		// Ensure loop analysis is current before any IsLoopHeader/IsInLoop checks.
+		// Runtime edge additions (connectEdge) invalidate loopInfoValid; without this
+		// call, stale IsLoopHeader=false can cause loop headers to be incorrectly
+		// invalidated, destroying loop-carried PHI results.
+		if it.cfg != nil {
+			it.cfg.EnsureLoopInfo()
+		}
 		// Cached-CFG correctness: if runtime has recorded any current-epoch incoming snapshots for
 		// this block, do not keep using a parse-time (gen=0) entry stack. Parse-time entry stacks
 		// can be over-specialized (or built from a different predecessor-height heuristic) and may
