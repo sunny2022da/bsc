@@ -1090,6 +1090,113 @@ func equalValueForFlow(a, b *Value) bool {
 // ResetForRebuild clears transient build artifacts so the block can be rebuilt cleanly
 // without duplicating MIR instructions. It preserves structural CFG data and entry/incoming
 // stacks so PHIs can be regenerated deterministically.
+// RebuildPhiOnly updates only the PHI instructions at the start of the block
+// without discarding the non-PHI instructions. The non-PHI operands that
+// reference old PHI defs are remapped to the new PHI resIdx values.
+//
+// Returns true if the PHI-only rebuild was performed, false if a full rebuild
+// is needed instead (e.g. entry stack height changed).
+func (b *MIRBasicBlock) RebuildPhiOnly(c *CFG) bool {
+	if b == nil || c == nil || len(b.instructions) == 0 {
+		return false
+	}
+	oldEntryStack := b.entryStack
+	if oldEntryStack == nil {
+		return false
+	}
+	oldHeight := len(oldEntryStack)
+
+	// Count existing PHIs (they are always at the front of instructions).
+	oldPhiCount := 0
+	for _, m := range b.instructions {
+		if m == nil || m.op != MirPHI {
+			break
+		}
+		oldPhiCount++
+	}
+
+	// Save old PHI resIdx by phiStackIndex so we can build the remap.
+	oldPhiResIdx := make(map[int]int, oldPhiCount) // phiStackIndex → old resIdx
+	for i := 0; i < oldPhiCount; i++ {
+		m := b.instructions[i]
+		oldPhiResIdx[m.phiStackIndex] = m.resIdx
+	}
+
+	// Separate non-PHI instructions.
+	nonPhiInstr := make([]*MIR, len(b.instructions)-oldPhiCount)
+	copy(nonPhiInstr, b.instructions[oldPhiCount:])
+
+	// Rebuild entry stack (creates new PHI nodes via getEntryStackForBlock).
+	b.entryStack = nil
+	b.instructions = b.instructions[:0] // clear for PHI creation
+	newStack := c.getEntryStackForBlock(b)
+	_ = newStack
+
+	newEntryStack := b.entryStack
+	if newEntryStack == nil || len(newEntryStack) != oldHeight {
+		// Height changed — need full rebuild. Restore state for caller to handle.
+		b.entryStack = nil
+		b.instructions = nil
+		return false
+	}
+
+	// Count new PHIs.
+	newPhiCount := len(b.instructions)
+
+	// Build resIdx remap: oldResIdx → newResIdx.
+	phiResMap := make(map[int]int, oldPhiCount)
+	for i := 0; i < newPhiCount; i++ {
+		m := b.instructions[i]
+		if m.op != MirPHI {
+			break
+		}
+		if oldIdx, ok := oldPhiResIdx[m.phiStackIndex]; ok && oldIdx != m.resIdx {
+			phiResMap[oldIdx] = m.resIdx
+		}
+	}
+
+	// Append non-PHI instructions back.
+	b.instructions = append(b.instructions, nonPhiInstr...)
+
+	// Remap operands in non-PHI instructions.
+	if len(phiResMap) > 0 {
+		for _, m := range b.instructions[newPhiCount:] {
+			if m == nil {
+				continue
+			}
+			// Remap operand defs.
+			for _, op := range m.operands {
+				if op != nil && op.kind == Variable && op.def != nil {
+					if newIdx, ok := phiResMap[op.def.resIdx]; ok {
+						op.def.resIdx = newIdx
+					}
+				}
+			}
+			// Remap pre-encoded fast-path cache.
+			for i, defIdx := range m.opDefIdx {
+				if newIdx, ok := phiResMap[defIdx]; ok {
+					m.opDefIdx[i] = newIdx
+				}
+			}
+		}
+	}
+
+	// Remap exit stack references.
+	if b.exitStack != nil && len(phiResMap) > 0 {
+		for i := range b.exitStack {
+			v := &b.exitStack[i]
+			if v.kind == Variable && v.def != nil {
+				if newIdx, ok := phiResMap[v.def.resIdx]; ok {
+					v.def.resIdx = newIdx
+				}
+			}
+		}
+	}
+
+	b.built = true
+	return true
+}
+
 func (b *MIRBasicBlock) ResetForRebuild(preserveEntry bool) {
 	// Clear previously generated instructions and iteration cursor
 	b.instructions = nil

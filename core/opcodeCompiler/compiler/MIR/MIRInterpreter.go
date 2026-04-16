@@ -1227,41 +1227,45 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 		// when new incoming edges are discovered at runtime (dynamic jumps): we must never rebuild
 		// a block while it is actively executing, because that can invalidate PHI/results mid-run.
 		if cur != nil && !cur.built {
-			// Save loop-carried results before rebuild: when a new back-edge is
-			// discovered mid-iteration, the current iteration's def results may be
-			// referenced by the next iteration's PHI. Preserve them by (evmPC, op,
-			// phiStackIndex) key and restore to the new resIdx after rebuild.
-			var savedResults map[mirDefKey]uint256.Int
-			if cur.IsLoopHeader || cur.IsInLoop {
-				savedResults = make(map[mirDefKey]uint256.Int, len(cur.instructions))
-				for _, m := range cur.instructions {
-					if m == nil || m.op == MirPHI {
-						continue
-					}
-					if m.resIdx > 0 && m.resIdx < len(it.resultsGen) && it.resultsGen[m.resIdx] == it.gen {
-						savedResults[keyForDef(m)] = it.results[m.resIdx]
+			// Try PHI-only rebuild first: this preserves non-PHI instructions and
+			// their resIdx, avoiding the need to save/restore loop-carried results
+			// and the cascade of invalidated operand references.
+			phiOnly := false
+			if len(cur.instructions) > 0 {
+				phiOnly = cur.RebuildPhiOnly(it.cfg)
+			}
+			if !phiOnly {
+				// PHI-only rebuild not possible (height changed or no existing instructions).
+				// Fall back to full rebuild with loop-carried result preservation.
+				var savedResults map[mirDefKey]uint256.Int
+				if cur.IsLoopHeader || cur.IsInLoop {
+					savedResults = make(map[mirDefKey]uint256.Int, len(cur.instructions))
+					for _, m := range cur.instructions {
+						if m == nil || m.op == MirPHI {
+							continue
+						}
+						if m.resIdx > 0 && m.resIdx < len(it.resultsGen) && it.resultsGen[m.resIdx] == it.gen {
+							savedResults[keyForDef(m)] = it.results[m.resIdx]
+						}
 					}
 				}
-			}
-			if len(cur.instructions) > 0 {
-				it.invalidateBlockResults(cur)
-				// Clear entryStack on runtime rebuild: preserving it can retain stale def pointers
-				// (especially PHIs) after CFG edge updates, leading to "missing result for def" later.
-				cur.ResetForRebuild(false)
-			}
-			if err := it.cfg.buildBasicBlock(cur, it.validJumpDests); err != nil {
-				return it.finishResult(ExecResult{Err: err})
-			}
-			// Restore saved loop-carried results to their new resIdx slots.
-			if savedResults != nil {
-				for _, m := range cur.instructions {
-					if m == nil || m.op == MirPHI {
-						continue
-					}
-					if v, ok := savedResults[keyForDef(m)]; ok {
-						if m.resIdx > 0 && m.resIdx < len(it.results) {
-							it.results[m.resIdx] = v
-							it.resultsGen[m.resIdx] = it.gen
+				if len(cur.instructions) > 0 {
+					it.invalidateBlockResults(cur)
+					cur.ResetForRebuild(false)
+				}
+				if err := it.cfg.buildBasicBlock(cur, it.validJumpDests); err != nil {
+					return it.finishResult(ExecResult{Err: err})
+				}
+				if savedResults != nil {
+					for _, m := range cur.instructions {
+						if m == nil || m.op == MirPHI {
+							continue
+						}
+						if v, ok := savedResults[keyForDef(m)]; ok {
+							if m.resIdx > 0 && m.resIdx < len(it.results) {
+								it.results[m.resIdx] = v
+								it.resultsGen[m.resIdx] = it.gen
+							}
 						}
 					}
 				}
