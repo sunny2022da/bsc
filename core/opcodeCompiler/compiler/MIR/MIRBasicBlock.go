@@ -252,6 +252,12 @@ type MIRBasicBlock struct {
 	// incomingStacksGen tags runtime-recorded incoming snapshots by CFG runtimeEpoch so cached CFGs
 	// can ignore stale snapshots from previous executions (different calldata).
 	incomingStacksGen map[*MIRBasicBlock]uint64
+	// incomingSnapshotEpoch records the CFG.snapshotEpoch when each incoming snapshot was
+	// last written at runtime (after Parse). evalPhi step-2 uses this to detect when a
+	// snapshot-fallback value is from a different execution context (stale) and return
+	// ErrMIRInternal → safe base-EVM fallback. Unlike incomingStacksGen/runtimeEpoch, this
+	// mechanism does NOT trigger any block rebuilds, so it is zero-cost for stable contracts.
+	incomingSnapshotEpoch map[*MIRBasicBlock]uint64
 	// preferredEntryHeight is a runtime hint used to rebuild this block's entry stack to a
 	// specific height when incoming edge stack heights vary. This avoids seeding the entire
 	// entry stack from a single predecessor (which can introduce "future def" self-references

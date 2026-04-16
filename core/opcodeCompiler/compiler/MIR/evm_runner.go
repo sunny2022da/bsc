@@ -389,6 +389,13 @@ func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]b
 	} else {
 		cfg.runtimeEpoch = 0
 	}
+	// Always bump snapshotEpoch unconditionally so evalPhi can detect stale runtime snapshots
+	// even for "simple" CFGs where runtimeEpoch stays 0. Unlike runtimeEpoch, snapshotEpoch
+	// does NOT trigger block rebuilds; it is only checked in evalPhi's snapshot-fallback path.
+	cfg.snapshotEpoch++
+	if cfg.snapshotEpoch == 0 {
+		cfg.snapshotEpoch = 1
+	}
 
 	// Allocate a per-call interpreter from the pool. This supports re-entrant MIR calls
 	// (contract A via MIR calls contract B via MIR) without corrupting the outer frame.

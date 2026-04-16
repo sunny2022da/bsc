@@ -56,6 +56,10 @@ type CFG struct {
 	// Runtime-recorded incoming snapshots are tagged with this epoch so we can ignore
 	// stale snapshots from previous executions (different calldata).
 	runtimeEpoch uint64
+	// snapshotEpoch is always incremented every execution (unconditionally), used by
+	// incomingSnapshotEpoch to detect stale PHI-fallback snapshots without triggering
+	// the rebuild machinery tied to runtimeEpoch. See evalPhi in MIRInterpreter.go.
+	snapshotEpoch uint64
 	// nextResIdx allocates global MIR result slots for this CFG.
 	// Index 0 is reserved for "unassigned".
 	nextResIdx int
@@ -81,6 +85,12 @@ type CFG struct {
 	// needsRuntimeEpochFlag is set if the CFG contains merge points with differing incoming stack heights.
 	// These contracts require runtime-epoch tagging to select the correct entry stack during cached runs.
 	needsRuntimeEpochFlag bool
+
+	// parseDone is set to true after Parse() completes successfully.
+	// connectEdge uses this to distinguish parse-time calls (parseDone=false) from
+	// runtime calls (parseDone=true): only runtime-written snapshots are tagged with
+	// snapshotEpoch in incomingSnapshotEpoch, enabling stale detection in evalPhi.
+	parseDone bool
 
 	// skeletonMode is set during Parse() pass 1. When true, buildBasicBlock
 	// skips MIR instruction emission (appendMIR becomes no-op) and only
@@ -312,6 +322,7 @@ func (c *CFG) Parse() error {
 	// After reaching a parse-time fixpoint, detect whether this CFG needs runtime epoch tagging.
 	// If any merge point has incoming snapshots with differing heights, cached runs must avoid
 	// using a parse-time entry stack specialized to the wrong predecessor height.
+	c.parseDone = false // reset until we finish the epoch analysis below
 	c.needsRuntimeEpochFlag = false
 	rtEpochReason := ""
 	rtEpochBlockPC := uint(0)
@@ -365,6 +376,9 @@ func (c *CFG) Parse() error {
 	// Pre-warm jump tables for unresolvedJump blocks so that runtime resolveBB calls
 	// find pre-created target blocks and can cache results in jumpTable immediately.
 	c.preWarmJumpTables()
+	// Mark parse as complete. connectEdge uses this to detect runtime snapshot changes
+	// that occur without epoch protection and to enable epoch tracking for future runs.
+	c.parseDone = true
 	return nil
 }
 
@@ -884,6 +898,15 @@ func (c *CFG) connectEdge(parent, child *MIRBasicBlock, exitSnapshot []Value) {
 	// make SWAP/DUP become no-ops and corrupt semantics.
 	if c != nil && c.runtimeEpoch != 0 {
 		child.preferredEntryHeight = len(exitSnapshot)
+	}
+	// If this snapshot was written at runtime (after Parse() completed), record its snapshot epoch.
+	// evalPhi uses incomingSnapshotEpoch to detect stale snapshots from a previous execution
+	// without triggering the rebuild machinery used by runtimeEpoch.
+	if c != nil && c.parseDone {
+		if child.incomingSnapshotEpoch == nil {
+			child.incomingSnapshotEpoch = make(map[*MIRBasicBlock]uint64, 4)
+		}
+		child.incomingSnapshotEpoch[parent] = c.snapshotEpoch
 	}
 	// At runtime, do NOT invalidate loop header blocks via existing back-edges.
 	// The parse-time PHIs are correct, and invalidating at runtime triggers

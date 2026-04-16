@@ -4323,6 +4323,16 @@ func (it *MIRInterpreter) evalPhi(cur, prev *MIRBasicBlock, phi *MIR) (*uint256.
 					ErrMIRInternal, cur.FirstPC(), prev.FirstPC(), phi.evmPC, phi.phiStackIndex)
 			}
 		}
+		// Secondary staleness check using snapshotEpoch: catches stale runtime snapshots even
+		// for "simple" CFGs where runtimeEpoch==0 (which bypasses the check above).
+		// incomingSnapshotEpoch is only populated for runtime-written snapshots (parseDone=true),
+		// so parse-time snapshots (no entry) are not rejected and cause no regression.
+		if it.cfg != nil && cur.incomingSnapshotEpoch != nil {
+			if ep, ok := cur.incomingSnapshotEpoch[prev]; ok && ep != it.cfg.snapshotEpoch {
+				return nil, fmt.Errorf("%w: phi eval failed: stale snapshot epoch (curFirstPC=%d prevFirstPC=%d phiPC=%d phiIdx=%d ep=%d cur=%d)",
+					ErrMIRInternal, cur.FirstPC(), prev.FirstPC(), phi.evmPC, phi.phiStackIndex, ep, it.cfg.snapshotEpoch)
+			}
+		}
 		in := cur.incomingStacks[prev]
 		if len(in) > 0 {
 			idx := (len(in) - 1) - phi.phiStackIndex
