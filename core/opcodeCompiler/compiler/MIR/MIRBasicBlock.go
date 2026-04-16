@@ -391,6 +391,14 @@ func (b *MIRBasicBlock) CreateVoidMIR(op MirOperation) (mir *MIR) {
 }
 
 func (b *MIRBasicBlock) appendMIR(mir *MIR) *MIR {
+	// Skeleton mode: skip all MIR emission. Return mir as-is so callers
+	// that use mir.Result() as a stack value still work.
+	if currentCFGBuild != nil && currentCFGBuild.skeletonMode {
+		mir.defBlockNum = b.blockNum
+		mir.evmPC = currentEVMBuildPC
+		mir.evmOp = currentEVMBuildOp
+		return mir
+	}
 	mir.idx = len(b.instructions)
 	mir.defBlockNum = b.blockNum
 	// Attach EVM mapping captured by the CFG builder

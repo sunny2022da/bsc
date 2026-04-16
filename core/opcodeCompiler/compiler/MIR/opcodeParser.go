@@ -13,6 +13,19 @@ import (
 // can identify a non-convergent CFG build without importing extra error types.
 const cfgNonConvergentPrefix = "MIR CFG parse did not converge"
 
+// buildMode controls how much work buildBasicBlock does.
+type buildMode int
+
+const (
+	// skeletonBuild discovers block boundaries, connects edges, and tracks
+	// abstract stack heights. No MIR instructions are emitted; PUSH constants
+	// are preserved on the stack for jump-target resolution.
+	skeletonBuild buildMode = iota
+	// fullBuild generates PHIs via getEntryStackForBlock and emits all MIR
+	// instructions. This is the original single-pass behavior.
+	fullBuild
+)
+
 // CFGNonConvergentError reports that CFG.Parse exceeded its build bound and did not reach a fixpoint.
 // This should be treated as a correctness/debugging failure that must be fixed (not silently ignored).
 type CFGNonConvergentError struct {
@@ -68,6 +81,11 @@ type CFG struct {
 	// needsRuntimeEpochFlag is set if the CFG contains merge points with differing incoming stack heights.
 	// These contracts require runtime-epoch tagging to select the correct entry stack during cached runs.
 	needsRuntimeEpochFlag bool
+
+	// skeletonMode is set during Parse() pass 1. When true, buildBasicBlock
+	// skips MIR instruction emission (appendMIR becomes no-op) and only
+	// discovers block boundaries, edges, and exit stack heights.
+	skeletonMode bool
 
 	// loopInfoValid is true after ComputeLoopInfo has run. Reset to false when
 	// the CFG structure changes (new blocks/edges added at runtime).
@@ -188,6 +206,11 @@ func (c *CFG) scanJumpDests() map[uint]bool {
 }
 
 // Parse builds the Control Flow Graph from the raw EVM code.
+// It runs in two passes:
+//   - Pass 1 (skeleton): discover block boundaries, edges, and exit stack heights.
+//     No MIR instructions are emitted. Tarjan SCC loop analysis runs after this pass.
+//   - Pass 2 (full): on the now-stable CFG, build entry stacks with PHIs and emit
+//     all MIR instructions. Instructions generated here should not need rebuild.
 func (c *CFG) Parse() error {
 	// CFG building uses package-level globals; serialize builds across goroutines.
 	mirBuildMu.Lock()
@@ -197,76 +220,94 @@ func (c *CFG) Parse() error {
 	currentCFGBuild = c
 	defer func() { currentCFGBuild = nil }()
 
-	// 1. Identify all valid JUMPDESTs (critical for security/validity)
-	// You can use a bitset or map for fast lookup.
 	validJumpDests := c.JumpDests()
-
-	// 2. Create the Entry Block (Block 0) at PC 0
 	entryBlock := c.getOrCreateBlock(0)
 
-	// 3. Worklist for processing blocks
-	// Queue stores blocks that need to be built.
-	queue := []*MIRBasicBlock{entryBlock}
-	// Safety valve: in the presence of complex back-edges/dynamic CFG backfill, the iterative
-	// rebuild process should converge quickly. If it doesn't, it's safer to fall back to the
-	// native EVM than to spin indefinitely during block processing.
-	//
-	// The bound is intentionally generous and scales with bytecode size.
 	maxBuilds := 1024 + 64*len(c.rawCode)
-	builds := 0
-
-	// Per-block rebuild limit: non-convergent CFGs (e.g. pre-Solidity-0.5 dynamic function returns
-	// combined with loop back-edges) cause a small set of blocks to oscillate indefinitely. Each
-	// oscillation cycle increments only a few blocks' counts rather than the total, so detecting a
-	// single block exceeding this limit catches the pathology orders-of-magnitude faster than the
-	// global maxBuilds limit. 64 is well above what any normally convergent CFG requires (~3–10
-	// rebuilds even for complex PHI merges), yet far below the thousands of cycles a non-convergent
-	// CFG would need.
 	const maxBuildsPerBlock = 64
-	blockBuilds := make(map[*MIRBasicBlock]int, len(c.basicBlocks)+16)
 
-	for len(queue) > 0 {
-		block := queue[0]
-		queue = queue[1:]
-
-		// If already built and no one invalidated it, skip
-		if block.built {
-			continue
-		}
-
-		// If we're rebuilding, clear previously generated MIR and force entry-stack recompute.
-		// Preserving entryStack is unsafe because it can contain Value.def pointers to
-		// MIR instructions we are about to discard (e.g. PHIs), which leads to
-		// "missing result for def MirPHI" at runtime after rebuild.
-		if len(block.instructions) > 0 {
-			block.ResetForRebuild(false)
-		}
-
-		// Build the block (emit MIR instructions)
-		builds++
-		blockBuilds[block]++
-		if builds > maxBuilds || blockBuilds[block] > maxBuildsPerBlock {
-			return &CFGNonConvergentError{
-				Builds:    builds,
-				MaxBuilds: maxBuilds,
-				CodeHash:  c.codeAddr,
-				CodeLen:   len(c.rawCode),
+	// ── Pass 1: Skeleton ─────────────────────────────────────────────
+	// Discover all basic blocks, edges, and abstract stack heights.
+	// appendMIR is a no-op; no MIR instructions are generated.
+	c.skeletonMode = true
+	{
+		builds := 0
+		blockBuilds := make(map[*MIRBasicBlock]int, 64)
+		queue := []*MIRBasicBlock{entryBlock}
+		for len(queue) > 0 {
+			block := queue[0]
+			queue = queue[1:]
+			if block.built {
+				continue
+			}
+			if len(block.instructions) > 0 {
+				block.ResetForRebuild(false)
+			}
+			builds++
+			blockBuilds[block]++
+			if builds > maxBuilds || blockBuilds[block] > maxBuildsPerBlock {
+				c.skeletonMode = false
+				return &CFGNonConvergentError{Builds: builds, MaxBuilds: maxBuilds, CodeHash: c.codeAddr, CodeLen: len(c.rawCode)}
+			}
+			if err := c.buildBasicBlock(block, validJumpDests); err != nil {
+				c.skeletonMode = false
+				return err
+			}
+			// Force built=true: skeleton build may have set built=false via
+			// self-loop detection in JUMP/JUMPI handlers. In skeleton mode each
+			// block should be built exactly once.
+			block.built = true
+			for _, child := range block.children {
+				if !child.built {
+					queue = append(queue, child)
+				}
 			}
 		}
-		err := c.buildBasicBlock(block, validJumpDests)
-		if err != nil {
-			return err
-		}
-
-		// Add successors (children) to the queue
-		for _, child := range block.children {
-			// Check if child needs processing...
-			queue = append(queue, child)
-		}
 	}
-	// Compute loop analysis now that the CFG structure is stable.
+	c.skeletonMode = false
+
+	// CFG structure is now stable. Compute loop analysis before full build
+	// so that getEntryStackForBlock can use accurate IsLoopHeader/IsInLoop.
 	c.ComputeLoopInfo()
 
+	// ── Pass 2: Full build ───────────────────────────────────────────
+	// Reset block build state while preserving CFG topology and incomingStacks.
+	// incomingStacks from skeleton mode have correct heights (even though values
+	// are Unknown); full build's connectEdge will overwrite them with proper
+	// symbolic snapshots as blocks are built.
+	for _, b := range c.basicBlocks {
+		if b == nil {
+			continue
+		}
+		b.ResetForRebuild(false)
+		b.built = false
+	}
+	{
+		builds := 0
+		blockBuilds := make(map[*MIRBasicBlock]int, len(c.basicBlocks)+16)
+		queue := []*MIRBasicBlock{entryBlock}
+		for len(queue) > 0 {
+			block := queue[0]
+			queue = queue[1:]
+			if block.built {
+				continue
+			}
+			if len(block.instructions) > 0 {
+				block.ResetForRebuild(false)
+			}
+			builds++
+			blockBuilds[block]++
+			if builds > maxBuilds || blockBuilds[block] > maxBuildsPerBlock {
+				return &CFGNonConvergentError{Builds: builds, MaxBuilds: maxBuilds, CodeHash: c.codeAddr, CodeLen: len(c.rawCode)}
+			}
+			if err := c.buildBasicBlock(block, validJumpDests); err != nil {
+				return err
+			}
+			for _, child := range block.children {
+				queue = append(queue, child)
+			}
+		}
+	}
 	// After reaching a parse-time fixpoint, detect whether this CFG needs runtime epoch tagging.
 	// If any merge point has incoming snapshots with differing heights, cached runs must avoid
 	// using a parse-time entry stack specialized to the wrong predecessor height.
@@ -798,6 +839,18 @@ func (c *CFG) connectEdge(parent, child *MIRBasicBlock, exitSnapshot []Value) {
 	if exitSnapshot == nil {
 		exitSnapshot = []Value{}
 	}
+	// Skeleton mode: only record the edge + snapshot. Never invalidate child
+	// or mark descendants for rebuild. Skeleton's purpose is only to discover
+	// block boundaries and edges; each block is built exactly once.
+	if c != nil && c.skeletonMode {
+		if child.incomingStacks == nil {
+			child.incomingStacks = make(map[*MIRBasicBlock][]Value, 4)
+		}
+		if _, exists := child.incomingStacks[parent]; !exists {
+			child.AddIncomingStack(parent, exitSnapshot)
+		}
+		return
+	}
 	// Only invalidate if this parent's incoming snapshot changed.
 	if prev, ok := child.incomingStacks[parent]; ok {
 		if stacksEqual(prev, exitSnapshot) {
@@ -885,6 +938,10 @@ func (c *CFG) markDescendantsForRebuild(start *MIRBasicBlock) {
 }
 
 func (c *CFG) buildBasicBlock(block *MIRBasicBlock, validJumpDests map[uint]bool) error {
+	bm := fullBuild
+	if c.skeletonMode {
+		bm = skeletonBuild
+	}
 	// CFG building uses package-level globals. Serialize builds across goroutines, but avoid
 	// self-deadlock when called from CFG.Parse() (which already holds mirBuildMu).
 	//
@@ -933,7 +990,30 @@ retryBuild:
 	} else {
 		currentEVMBuildOp = 0
 	}
-	stack := c.getEntryStackForBlock(block)
+	var stack *ValueStack
+	if bm == skeletonBuild {
+		// Skeleton mode: seed entry stack with Unknown values matching the
+		// best-known height from predecessors. No PHI creation.
+		stack = new(ValueStack)
+		bestHeight := 0
+		if block.entryStack != nil {
+			bestHeight = len(block.entryStack)
+		} else if block.blockNum == 0 {
+			bestHeight = 0
+		} else {
+			// Use the most common incoming height.
+			for _, s := range block.incomingStacks {
+				if len(s) > bestHeight {
+					bestHeight = len(s)
+				}
+			}
+		}
+		for i := 0; i < bestHeight; i++ {
+			stack.push(&Value{kind: Unknown, liveIn: true, liveInPos: i})
+		}
+	} else {
+		stack = c.getEntryStackForBlock(block)
+	}
 	initHeight := stack.size()
 
 	for pc < codeLen {
@@ -981,6 +1061,17 @@ retryBuild:
 		switch {
 		case isStackOp(op): // PUSH, DUP, SWAP, POP
 			pc, err = c.handleStackOp(block, op, stack, pc)
+			if err != nil && bm == skeletonBuild {
+				// Skeleton mode: stack underflow on DUP/SWAP just means we don't
+				// know the entry height yet. Pad and continue.
+				if _, ok := err.(*errNeedEntryHeight); ok {
+					break
+				}
+				if _, ok := err.(*errNeedPreferredEntryHeight); ok {
+					break
+				}
+				return err
+			}
 			if err != nil {
 				// If this is a runtime rebuild and we can satisfy the required entry height,
 				// retry compilation of this block with the requested height.
@@ -1017,6 +1108,12 @@ retryBuild:
 				return err
 			}
 		case isUnaryOp(op):
+			if bm == skeletonBuild {
+				stack.pop()
+				stack.push(&Value{kind: Unknown})
+				pc++
+				break
+			}
 			// Map EVM unary opcode to MIR op by meaning
 			var mirOp MirOperation
 			switch op {
@@ -1030,6 +1127,12 @@ retryBuild:
 			block.CreateUnaryOpMIR(mirOp, stack)
 			pc++
 		case isTernaryOp(op):
+			if bm == skeletonBuild {
+				stack.pop(); stack.pop(); stack.pop()
+				stack.push(&Value{kind: Unknown})
+				pc++
+				break
+			}
 			var mirOp MirOperation
 			switch op {
 			case compiler.ADDMOD:
@@ -1042,6 +1145,12 @@ retryBuild:
 			block.CreateTernaryOpMIR(mirOp, stack)
 			pc++
 		case isBinaryOp(op):
+			if bm == skeletonBuild {
+				stack.pop(); stack.pop()
+				stack.push(&Value{kind: Unknown})
+				pc++
+				break
+			}
 			// Most binary ops share the same numeric encoding for MIR up to 0x5e.
 			// Map explicitly for clarity and to avoid relying on enum alignment.
 			var mirOp MirOperation
@@ -1096,6 +1205,21 @@ retryBuild:
 			block.CreateBinOpMIR(mirOp, stack)
 			pc++
 		case isMemoryOp(op):
+			if bm == skeletonBuild {
+				switch op {
+				case compiler.MLOAD: // pop 1, push 1
+					stack.pop()
+					stack.push(&Value{kind: Unknown})
+				case compiler.MSTORE, compiler.MSTORE8: // pop 2, push 0
+					stack.pop(); stack.pop()
+				case compiler.MSIZE: // pop 0, push 1
+					stack.push(&Value{kind: Unknown})
+				case compiler.MCOPY: // pop 3, push 0
+					stack.pop(); stack.pop(); stack.pop()
+				}
+				pc++
+				break
+			}
 			switch op {
 			case compiler.MLOAD:
 				// MLOAD pops: offset, pushes: value
@@ -1146,6 +1270,17 @@ retryBuild:
 			}
 			pc++
 		case isStorageOp(op):
+			if bm == skeletonBuild {
+				switch op {
+				case compiler.SLOAD, compiler.TLOAD: // pop 1, push 1
+					stack.pop()
+					stack.push(&Value{kind: Unknown})
+				case compiler.SSTORE, compiler.TSTORE: // pop 2, push 0
+					stack.pop(); stack.pop()
+				}
+				pc++
+				break
+			}
 			switch op {
 			case compiler.SLOAD:
 				// SLOAD pops: key, pushes: value
@@ -1188,17 +1323,76 @@ retryBuild:
 			}
 			pc++
 		case isBlockInfoOp(op):
+			if bm == skeletonBuild {
+				// BlockInfo ops: all push 1 value, pop 0 (ADDRESS, CALLER, CALLVALUE, etc.)
+				// Exception: EXTCODESIZE/EXTCODEHASH pop 1 push 1; BALANCE pop 1 push 1.
+				switch op {
+				case compiler.BALANCE, compiler.EXTCODESIZE, compiler.EXTCODEHASH:
+					stack.pop()
+				}
+				stack.push(&Value{kind: Unknown})
+				pc++
+				break
+			}
 			// Closure/tx/env info ops handled by CreateBlockInfoMIR
 			block.CreateBlockInfoMIR(MirOperation(byte(op)), stack)
 			pc++
 		case isBlockOp(op):
+			if bm == skeletonBuild {
+				// Block context ops: BLOCKHASH pops 1 pushes 1; others push 1 pop 0.
+				if op == compiler.BLOCKHASH {
+					stack.pop()
+				}
+				stack.push(&Value{kind: Unknown})
+				pc++
+				break
+			}
 			// Block ops handled by CreateBlockOpMIR
 			block.CreateBlockOpMIR(MirOperation(byte(op)), stack)
 			pc++
 		case isLogOp(op):
+			if bm == skeletonBuild {
+				// LOGn pops: offset, size, + n topics. No return value.
+				n := int(op - compiler.LOG0)
+				stack.pop(); stack.pop() // offset, size
+				for i := 0; i < n; i++ {
+					stack.pop()
+				}
+				pc++
+				break
+			}
 			block.CreateLogMIR(MirLOG0+MirOperation(op-compiler.LOG0), stack)
 			pc++
 		case isSystemCallOp(op):
+			if bm == skeletonBuild {
+				switch op {
+				case compiler.CALL, compiler.CALLCODE: // pop 7, push 1
+					for i := 0; i < 7; i++ { stack.pop() }
+					stack.push(&Value{kind: Unknown})
+				case compiler.DELEGATECALL, compiler.STATICCALL: // pop 6, push 1
+					for i := 0; i < 6; i++ { stack.pop() }
+					stack.push(&Value{kind: Unknown})
+				case compiler.CREATE: // pop 3, push 1
+					stack.pop(); stack.pop(); stack.pop()
+					stack.push(&Value{kind: Unknown})
+				case compiler.CREATE2: // pop 4, push 1
+					for i := 0; i < 4; i++ { stack.pop() }
+					stack.push(&Value{kind: Unknown})
+				case compiler.SELFDESTRUCT: // pop 1, push 0
+					stack.pop()
+				case compiler.CALLDATALOAD: // pop 1, push 1
+					stack.pop()
+					stack.push(&Value{kind: Unknown})
+				case compiler.CALLDATASIZE, compiler.RETURNDATASIZE, compiler.CODESIZE: // pop 0, push 1
+					stack.push(&Value{kind: Unknown})
+				case compiler.CALLDATACOPY, compiler.CODECOPY, compiler.RETURNDATACOPY: // pop 3, push 0
+					stack.pop(); stack.pop(); stack.pop()
+				case compiler.EXTCODECOPY: // pop 4, push 0
+					for i := 0; i < 4; i++ { stack.pop() }
+				}
+				pc++
+				break
+			}
 			// Implement core CALL/CREATE family with correct stack effects.
 			// Note: opcode values in compiler package differ from MirOperation for some calls.
 			switch op {
