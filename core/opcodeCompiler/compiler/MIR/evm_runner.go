@@ -15,6 +15,7 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
+	"github.com/holiman/uint256"
 )
 
 var mirDebugBlockOnce sync.Once
@@ -139,6 +140,11 @@ type EVMRunner struct {
 	// (e.g., to also sample gasUsed/gasLeft). If set, it takes precedence over mirStepHook.
 	mirStepHookFactory func(it *MIRInterpreter) func(evmPC uint, evmOp byte, op MirOperation)
 
+	// Optional JUMPI hook: called for each MIR JUMPI with (pc, dest, cond, taken).
+	// Used by traceCallTreeBothModes in blockchain.go to identify the first JUMPI that MIR
+	// evaluates differently from the base EVM during a receipt-mismatch replay.
+	mirJumpiHook func(pc, dest uint, cond *uint256.Int, taken bool)
+
 	// fellBack is set to true whenever Run() yields to a fallback interpreter
 	// (base or opt) instead of executing via the MIR engine. Reset at the top
 	// of each Run() call. Readable via FellBack().
@@ -200,6 +206,15 @@ func (r *EVMRunner) SetMIRStepHookFactory(f func(it *MIRInterpreter) func(evmPC 
 		return
 	}
 	r.mirStepHookFactory = f
+}
+
+// SetMIRJumpiHook sets a hook called for each JUMPI executed by the MIR engine,
+// with (pc, dest, cond, taken). Intended for mismatch diagnosis in traceCallTreeBothModes.
+func (r *EVMRunner) SetMIRJumpiHook(h func(pc, dest uint, cond *uint256.Int, taken bool)) {
+	if r == nil {
+		return
+	}
+	r.mirJumpiHook = h
 }
 
 // FellBack reports whether the most recent Run() call used a fallback interpreter
@@ -423,6 +438,7 @@ func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]b
 	} else {
 		it.stepHook = r.mirStepHook
 	}
+	it.jumpiHook = r.mirJumpiHook
 
 	// Fork rules + block context (cached in runner)
 	it.blockNumber = r.blockNumber

@@ -176,6 +176,10 @@ type MIRInterpreter struct {
 
 	// Optional debug hook (used by tests/tools): called for each executed MIR instruction.
 	stepHook func(evmPC uint, evmOp byte, op MirOperation)
+	// Optional debug hook for JUMPI condition values. Called for each JUMPI with the evaluated
+	// destination, condition, and whether the branch was taken. Used by traceCallTreeBothModes in
+	// blockchain.go to compare MIR vs base-EVM JUMPI decisions when a receipt mismatch is detected.
+	jumpiHook func(pc uint, dest uint, cond *uint256.Int, taken bool)
 
 	// Optional debug hook (used by tools): called when resolving a JUMP/JUMPI target PC to a basic block.
 	// existed indicates whether the CFG already had a block entry for targetPC.
@@ -589,6 +593,7 @@ func (it *MIRInterpreter) ResetForRun(cfg *CFG) {
 		it.blockHistory = it.blockHistory[:0]
 	}
 	it.blockHistoryPos = 0
+	it.jumpiHook = nil
 	it.debugOperandHook = nil
 	it.debugOperandHookEx = nil
 	it.debugKeccakHook = nil
@@ -623,6 +628,12 @@ func (it *MIRInterpreter) recordBlockEntry(b *MIRBasicBlock) {
 // SetResolveHook installs an optional hook invoked during JUMP/JUMPI resolution.
 func (it *MIRInterpreter) SetResolveHook(h func(fromFirstPC uint, fromEvmPC uint, targetPC uint, resolvedFirstPC uint, existed bool)) {
 	it.resolveHook = h
+}
+
+// SetJumpiHook sets a hook called for each JUMPI execution with (pc, dest, cond, taken).
+// Used by traceCallTreeBothModes to compare MIR vs base-EVM JUMPI decisions.
+func (it *MIRInterpreter) SetJumpiHook(h func(pc uint, dest uint, cond *uint256.Int, taken bool)) {
+	it.jumpiHook = h
 }
 
 // SetDebugOperandHook registers a hook that receives selected opcode operands during execution.
@@ -2458,6 +2469,9 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 					return it.finishResult(ExecResult{Err: err})
 				}
 				target := uint(dest.Uint64())
+				if it.jumpiHook != nil {
+					it.jumpiHook(m.evmPC, target, cond, !cond.IsZero())
+				}
 				if mirDebugBlock != 0 && it.blockNumber == mirDebugBlock {
 					log.Warn("MIR JUMPI", "addr", it.contractAddr, "pc", m.evmPC, "target", target, "cond", cond.Uint64(), "taken", !cond.IsZero())
 				}

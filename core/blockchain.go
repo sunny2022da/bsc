@@ -31,6 +31,7 @@ import (
 
 	mapset "github.com/deckarep/golang-set/v2"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/holiman/uint256"
 	"github.com/ethereum/go-ethereum/common/lru"
 	"github.com/ethereum/go-ethereum/common/mclock"
 	"github.com/ethereum/go-ethereum/common/prque"
@@ -3562,6 +3563,8 @@ func (bc *BlockChain) replayBlockWithoutMIRAndCompare(parentRoot common.Hash, bl
 // once without — each on a fresh statedb fast-forwarded to just before txIdx,
 // attaching OnEnter/OnExit hooks to log every call frame's gas-in / gas-out /
 // error so the call trees can be compared side by side in the log.
+// It also captures per-JUMPI condition values for both modes and logs the first
+// diverging JUMPI to identify the root cause of control-flow mismatches.
 func (bc *BlockChain) traceCallTreeBothModes(parentRoot common.Hash, block *types.Block, blockCtx vm.BlockContext, header *types.Header, tx *types.Transaction, msg *Message, txIdx int) {
 	type callFrame struct {
 		callIdx int
@@ -3612,15 +3615,24 @@ func (bc *BlockChain) traceCallTreeBothModes(parentRoot common.Hash, block *type
 		return db
 	}
 
-	runWithTracer := func(label string, enableMIR bool) []callFrame {
+	// jumpiRecord captures one JUMPI execution for cross-mode comparison.
+	type jumpiRecord struct {
+		pc    uint64
+		dest  uint64
+		cond  uint256.Int
+		taken bool
+	}
+
+	runWithTracer := func(label string, enableMIR bool) ([]callFrame, []jumpiRecord) {
 		statedb := buildStateAt()
 		if statedb == nil {
 			log.Error("MIR calltree: failed to build pre-tx state", "mode", label, "txIdx", txIdx)
-			return nil
+			return nil, nil
 		}
 		statedb.SetTxContext(tx.Hash(), txIdx)
 
 		frames := make([]callFrame, 0, 16)
+		jumpis := make([]jumpiRecord, 0, 64)
 		idx := 0
 		stack := make([]int, 0, 8) // indices into frames for open calls
 
@@ -3645,6 +3657,22 @@ func (bc *BlockChain) traceCallTreeBothModes(parentRoot common.Hash, block *type
 				stack = stack[:len(stack)-1]
 				frames[top].gasUsed = gasUsed
 				frames[top].err = err
+			},
+			// Capture JUMPI conditions for the base EVM mode (OnOpcode fires for stock EVM only).
+			OnOpcode: func(pc uint64, op byte, gas, cost uint64, scope tracing.OpContext, rData []byte, depth int, err error) {
+				if vm.OpCode(op) == vm.JUMPI {
+					stackData := scope.StackData()
+					if len(stackData) >= 2 {
+						dest := stackData[len(stackData)-1]
+						cond := stackData[len(stackData)-2]
+						jumpis = append(jumpis, jumpiRecord{
+							pc:    pc,
+							dest:  dest.Uint64(),
+							cond:  cond,
+							taken: !cond.IsZero(),
+						})
+					}
+				}
 			},
 		}
 
@@ -3675,7 +3703,17 @@ func (bc *BlockChain) traceCallTreeBothModes(parentRoot common.Hash, block *type
 		tracingDB := state.NewHookedState(statedb, hooks)
 		evm := vm.NewEVM(blockCtx, vm.StateDB(tracingDB), bc.chainConfig, cfg)
 		if enableMIR {
-			evm.SetMIRRunner(mir.NewEVMRunner(evm))
+			runner := mir.NewEVMRunner(evm)
+			// For MIR mode: OnOpcode does not fire (MIR bypasses the stock EVM interpreter).
+			// Use the JUMPI hook instead to capture MIR's JUMPI decisions.
+			runner.SetMIRJumpiHook(func(pc, dest uint, cond *uint256.Int, taken bool) {
+				rec := jumpiRecord{pc: uint64(pc), dest: uint64(dest), taken: taken}
+				if cond != nil {
+					rec.cond.Set(cond)
+				}
+				jumpis = append(jumpis, rec)
+			})
+			evm.SetMIRRunner(runner)
 		}
 		gp := new(GasPool).AddGas(header.GasLimit)
 		traceResult, _ := ApplyMessage(evm, msg, gp)
@@ -3703,11 +3741,11 @@ func (bc *BlockChain) traceCallTreeBothModes(parentRoot common.Hash, block *type
 				"gasOverflow", overflow,
 			)
 		}
-		return frames
+		return frames, jumpis
 	}
 
-	mirFrames := runWithTracer("MIR", true)
-	baseFrames := runWithTracer("base", false)
+	mirFrames, mirJumpis := runWithTracer("MIR", true)
+	baseFrames, baseJumpis := runWithTracer("base", false)
 
 	// Diff: find first callIdx where gasUsed or err diverges.
 	n := len(mirFrames)
@@ -3732,6 +3770,49 @@ func (bc *BlockChain) traceCallTreeBothModes(parentRoot common.Hash, block *type
 	if len(mirFrames) != len(baseFrames) {
 		log.Error("MIR calltree: call count differs",
 			"mir.calls", len(mirFrames), "base.calls", len(baseFrames))
+	}
+
+	// JUMPI comparison: find the first JUMPI where MIR and base EVM disagreed.
+	// MIR JUMPIs are captured via SetMIRJumpiHook; base JUMPIs via OnOpcode.
+	// Note: MIR sub-calls that fall back to the stock EVM will produce JUMPI records
+	// via both hooks — this is acceptable since the divergence is usually in the outer frame.
+	nj := len(mirJumpis)
+	if len(baseJumpis) < nj {
+		nj = len(baseJumpis)
+	}
+	firstDivJumpi := -1
+	for i := 0; i < nj; i++ {
+		mj, bj := mirJumpis[i], baseJumpis[i]
+		if mj.pc != bj.pc || mj.taken != bj.taken {
+			firstDivJumpi = i
+			log.Error("MIR calltree: first diverging JUMPI",
+				"jumpiIdx", i,
+				"mir.pc", mj.pc, "base.pc", bj.pc,
+				"mir.dest", mj.dest, "base.dest", bj.dest,
+				"mir.cond", mj.cond.Hex(), "base.cond", bj.cond.Hex(),
+				"mir.taken", mj.taken, "base.taken", bj.taken,
+			)
+			break
+		}
+	}
+	if firstDivJumpi < 0 && len(mirJumpis) != len(baseJumpis) {
+		log.Error("MIR calltree: JUMPI count differs (no pc/taken divergence in common prefix)",
+			"mir.jumpis", len(mirJumpis), "base.jumpis", len(baseJumpis))
+	}
+	if firstDivJumpi < 0 && len(mirJumpis) == len(baseJumpis) && len(mirJumpis) > 0 {
+		// Same count, same pc+taken — divergence is in condition value only (shouldn't matter for control flow).
+		for i := 0; i < nj; i++ {
+			mj, bj := mirJumpis[i], baseJumpis[i]
+			if mj.cond.Cmp(&bj.cond) != 0 {
+				log.Error("MIR calltree: JUMPI cond differs (control-flow matched)",
+					"jumpiIdx", i,
+					"pc", mj.pc,
+					"mir.cond", mj.cond.Hex(), "base.cond", bj.cond.Hex(),
+					"taken", mj.taken,
+				)
+				break
+			}
+		}
 	}
 }
 
