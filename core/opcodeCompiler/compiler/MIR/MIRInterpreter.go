@@ -1254,7 +1254,7 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 					cur.ResetForRebuild(false)
 				}
 				if err := it.cfg.buildBasicBlock(cur, it.validJumpDests); err != nil {
-					return it.finishResult(ExecResult{Err: err})
+					return it.finishResult(ExecResult{Err: fmt.Errorf("%w: runtime rebuild failed: %v", ErrMIRInternal, err)})
 				}
 				if savedResults != nil {
 					for _, m := range cur.instructions {
@@ -2967,6 +2967,12 @@ func (it *MIRInterpreter) finishResult(r ExecResult) ExecResult {
 			it.refundApplied = true
 		}
 	}
+	// If the error is not a known EVM semantic error and not already tagged as
+	// ErrMIRInternal, wrap it so the runner can detect MIR-specific failures
+	// and fall back to the stock EVM (instead of consuming all gas silently).
+	if r.Err != nil && !isEVMSemanticError(r.Err) && !errors.Is(r.Err, ErrMIRInternal) {
+		r.Err = fmt.Errorf("%w: %v", ErrMIRInternal, r.Err)
+	}
 	// Fatal errors consume all gas, matching geth (except REVERT which keeps gas-left).
 	if r.Err != nil && !errors.Is(r.Err, vm.ErrExecutionReverted) && it.gasLimit > 0 {
 		it.gasUsed = it.gasLimit
@@ -2980,6 +2986,27 @@ func (it *MIRInterpreter) finishResult(r ExecResult) ExecResult {
 		}
 	}
 	return r
+}
+
+// isEVMSemanticError returns true if err is a legitimate EVM execution error
+// (not an MIR internal failure). These errors should propagate normally and
+// not trigger a fallback to the stock EVM interpreter.
+func isEVMSemanticError(err error) bool {
+	if errors.Is(err, vm.ErrOutOfGas) ||
+		errors.Is(err, vm.ErrExecutionReverted) ||
+		errors.Is(err, vm.ErrWriteProtection) ||
+		errors.Is(err, vm.ErrReturnDataOutOfBounds) ||
+		errors.Is(err, vm.ErrGasUintOverflow) ||
+		errors.Is(err, vm.ErrInvalidJump) {
+		return true
+	}
+	// ErrStackOverflow/ErrStackUnderflow are struct types, not sentinel values.
+	var sof *vm.ErrStackOverflow
+	var suf *vm.ErrStackUnderflow
+	if errors.As(err, &sof) || errors.As(err, &suf) {
+		return true
+	}
+	return false
 }
 
 func (it *MIRInterpreter) applyRefundCap() uint64 {
