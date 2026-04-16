@@ -454,6 +454,9 @@ func (b *MIRBasicBlock) appendMIR(mir *MIR) *MIR {
 				} else {
 					mir.opDefIdx[i] = -1
 				}
+			case RuntimeVal:
+				// RuntimeVal must be resolved at execution time; mark as slow-path.
+				mir.opKinds[i] = 2
 			default:
 				mir.opKinds[i] = 2
 			}
@@ -1080,6 +1083,8 @@ func equalValueForFlow(a, b *Value) bool {
 			da.evmPC == db.evmPC &&
 			da.op == db.op &&
 			da.phiStackIndex == db.phiStackIndex
+	case RuntimeVal:
+		return a.rtSourceBlockPC == b.rtSourceBlockPC && a.rtStackPos == b.rtStackPos
 	case Arguments, Unknown:
 		return true
 	default:

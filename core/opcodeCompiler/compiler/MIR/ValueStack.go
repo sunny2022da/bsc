@@ -9,10 +9,11 @@ import (
 type ValueKind int
 
 const (
-	Konst     ValueKind = 0 + iota
-	Arguments           // The input argument
-	Variable            // The runtime determined
-	Unknown             // Illegal
+	Konst      ValueKind = 0 + iota
+	Arguments            // The input argument
+	Variable             // The runtime determined
+	Unknown              // Illegal
+	RuntimeVal           // Value exists at runtime but MIR couldn't trace its def statically
 )
 
 type Value struct {
@@ -30,6 +31,11 @@ type Value struct {
 	//
 	// Only meaningful when liveIn==true; -1 means "unknown/unset".
 	liveInPos int
+
+	// RuntimeVal fields: when kind==RuntimeVal, these record where the value
+	// came from so it can be resolved at runtime from the execution history.
+	rtSourceBlockPC uint // firstPC of the block whose exit stack contains this value
+	rtStackPos      int  // depth from top in that block's exit stack
 }
 
 type ValueStack struct {

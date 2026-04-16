@@ -4424,6 +4424,37 @@ func (it *MIRInterpreter) evalPhi(cur, prev *MIRBasicBlock, phi *MIR) (*uint256.
 // exit stack corresponds to that entry slot (accounting for the block's
 // net stack effect), then recurse. We stop when we find a concrete value
 // (Konst, or a Variable with an executed def in the result table).
+// resolveRuntimeValue tries to resolve a RuntimeVal by computing the source
+// block's exit stack from actual runtime results and reading the value at the
+// specified depth-from-top. This is O(1) when the source block's exit stack
+// snapshot is available (the common case: the source block was just executed).
+func (it *MIRInterpreter) resolveRuntimeValue(sourceBlockPC uint, stackDepthFromTop int) (*uint256.Int, bool) {
+	if it.cfg == nil {
+		return nil, false
+	}
+	srcBlock := it.cfg.pcToBlock[sourceBlockPC]
+	if srcBlock == nil || srcBlock.ExitStack() == nil {
+		return nil, false
+	}
+	exitSnap := it.computeExitSnapshotForEdge(nil, srcBlock)
+	if exitSnap == nil {
+		return nil, false
+	}
+	idx := (len(exitSnap) - 1) - stackDepthFromTop
+	if idx < 0 || idx >= len(exitSnap) {
+		return nil, false
+	}
+	v := exitSnap[idx]
+	if v.kind == Unknown || v.kind == RuntimeVal {
+		return nil, false
+	}
+	val, err := it.evalValue(&v)
+	if err != nil || val == nil {
+		return nil, false
+	}
+	return val, true
+}
+
 func (it *MIRInterpreter) resolveViaHistory(startBlock *MIRBasicBlock, stackDepthFromTop int) (*uint256.Int, bool) {
 	if startBlock == nil || len(it.blockHistory) == 0 {
 		return nil, false
@@ -4575,20 +4606,28 @@ func (it *MIRInterpreter) evalValue(v *Value) (*uint256.Int, error) {
 		}
 		return nil, fmt.Errorf("%w: missing result for def op=%s defPC=%d defBlock=%d phiIdx=%d defResIdx=%d mappedResIdx=%d mappedOk=%v (curFirstPC=%d curEvmPC=%d)",
 			ErrMIRInternal, def.op.String(), def.evmPC, def.defBlockNum, def.phiStackIndex, def.resIdx, mapped, mappedOk, curFirstPC, it.curEvmPC)
+	case RuntimeVal:
+		// Value that MIR couldn't trace statically but exists at runtime.
+		// Resolve from the source block's exit stack via execution history.
+		if val, ok := it.resolveRuntimeValue(v.rtSourceBlockPC, v.rtStackPos); ok {
+			return val, nil
+		}
+		// If the source block wasn't in our history, try the full history walk.
+		if it.cfg != nil {
+			if srcBlock := it.cfg.pcToBlock[v.rtSourceBlockPC]; srcBlock != nil {
+				if val, ok := it.resolveViaHistory(srcBlock, v.rtStackPos); ok {
+					return val, nil
+				}
+			}
+		}
+		return nil, fmt.Errorf("%w: unresolved RuntimeVal (sourcePC=%d stackPos=%d) at evmPC=%d",
+			ErrMIRInternal, v.rtSourceBlockPC, v.rtStackPos, it.curEvmPC)
 	default:
-		// Unknown value with liveIn==false is created exclusively by ValueStack.pop() on an
-		// empty stack during CFG construction (see ValueStack.go). At execution time this means
-		// the EVM operand stack was empty when this instruction consumed an operand — a stack
-		// underflow. Return the error so the caller aborts execution, consuming all gas, exactly
-		// as the base EVM does (via vm.ErrStackUnderflow in EVMInterpreter.Run).
-		//
-		// Unknown with liveIn==false: stack underflow (ValueStack.pop on empty stack).
+		// Unknown value with liveIn==false: stack underflow (ValueStack.pop on empty stack).
 		if !v.liveIn {
 			return nil, fmt.Errorf("stack underflow (0 <=> 1)")
 		}
-		// Unknown with liveIn==true: placeholder from padBottomTo or a PHI slot
-		// when a parent's incoming snapshot was missing. At runtime this means
-		// the CFG is incomplete — return error to trigger fallback.
+		// Unknown with liveIn==true: legacy placeholder — return error to trigger fallback.
 		return nil, fmt.Errorf("%w: unresolved Unknown live-in at evmPC=%d", ErrMIRInternal, it.curEvmPC)
 	}
 }

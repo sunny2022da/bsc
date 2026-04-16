@@ -690,7 +690,22 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 						vv := v
 						ops[j] = &vv
 					} else {
-						vv := Value{kind: Unknown, liveIn: true, liveInPos: i}
+						// Parent's stack is too short for this depth. Instead of
+						// Unknown (which would be unresolvable at runtime), create
+						// a RuntimeVal that records where this value should come
+						// from: the parent's exit stack at the requested depth.
+						p := block.parents[j]
+						rtPC := uint(0)
+						if p != nil {
+							rtPC = p.firstPC
+						}
+						vv := Value{
+							kind:            RuntimeVal,
+							liveIn:          true,
+							liveInPos:       i,
+							rtSourceBlockPC: rtPC,
+							rtStackPos:      distFromTop,
+						}
 						ops[j] = &vv
 					}
 				}
