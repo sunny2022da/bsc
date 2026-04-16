@@ -85,6 +85,7 @@ type CFG struct {
 	// skeletonMode is set during Parse() pass 1. When true, buildBasicBlock
 	// skips MIR instruction emission (appendMIR becomes no-op) and only
 	// discovers block boundaries, edges, and exit stack heights.
+	// Thread safety: protected by mirBuildMu (held during all Parse/build calls).
 	skeletonMode bool
 
 	// loopInfoValid is true after ComputeLoopInfo has run. Reset to false when

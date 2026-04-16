@@ -28,13 +28,19 @@ MIR（Medium-level Intermediate Representation）是一个将 EVM 字节码翻�
 EVM 字节码
     │
     ▼
-CFG.Parse()          ← 静态构建：遍历字节码、建 BasicBlock、连边、插 PHI
-    │
-    ▼
-CFG（已缓存）
-    │
-    ▼
-MIRInterpreter.Run() ← 运行时执行：按 CFG 拓扑执行、遇到动态 JUMP 时回填
+CFG.Parse()
+    ├─ Pass 1 (Skeleton)   ← 发现块边界、边、抽象栈高度（不生成 MIR）
+    │       │
+    │       ▼
+    │  ComputeLoopInfo()   ← Tarjan SCC 循环分析（CFG 已稳定）
+    │       │
+    └─ Pass 2 (Full)       ← 在稳定 CFG 上生成 PHI + MIR 指令
+            │
+            ▼
+      CFG（已缓存）
+            │
+            ▼
+      MIRInterpreter.Run() ← 运行时执行、动态 JUMP 回填、PHI/RuntimeVal 解析
 ```
 
 ---
@@ -74,16 +80,23 @@ type CFG struct {
 | `fixedEntryHeight` | Parse 阶段确定的入口栈高度（-1 表示未知） |
 | `preferredEntryHeight` | 运行时重建时希望使用的栈高度（-1 表示无偏好）|
 | `blockNum` | 全局唯一块编号，用于 `mirDefKey` |
+| `IsInLoop` | Tarjan SCC 标记：块是否在某个循环中 |
+| `IsLoopHeader` | Tarjan SCC 标记：块是否是循环头（有 back-edge 指向它） |
+| `LoopDepth` | 循环嵌套深度（0 = 不在循环中） |
+| `backEdgeParents` | `map[*MIRBasicBlock]struct{}`，该循环头的所有 back-edge 来源 |
 
 ### 2.3 Value（符号栈元素）
 
 ```
-kind = Konst    → 编译期常数（payload 为大端字节）
-kind = Variable → 指向某条 MIR 指令的结果（def 指针 + resIdx）
-kind = Unknown  → 未知值（PHI 缺少某分支时的占位）
+kind = Konst      → 编译期常数（payload 为大端字节）
+kind = Variable   → 指向某条 MIR 指令的结果（def 指针 + resIdx）
+kind = Unknown    → 未知值（栈下溢时的占位）
+kind = RuntimeVal → Parse 时无法追踪的值，运行时从来源块的 exit stack 解析
 ```
 
 `liveIn = true` 表示该值是从入口栈（PHI 或透传）继承的，`liveInPos` 是在 entryStack 中的位置。
+
+RuntimeVal 额外携带 `rtSourceBlockPC`（来源块 firstPC）和 `rtStackPos`（在来源块 exit stack 中的深度），运行时 `evalValue` 通过 `resolveRuntimeValue` 直接从来源块的运行时结果中取值（O(1)）。
 
 ### 2.4 MIR 指令
 
@@ -104,26 +117,38 @@ type MIR struct {
 
 ## 3. CFG 静态构建（Parse 阶段）
 
-### 3.1 主流程
+### 3.1 主流程（两遍 Parse）
 
 ```
 Parse()
  ├─ 计算合法 JUMPDEST 集合
- ├─ 创建 pc=0 的入口块，入队
- └─ 工作表循环（worklist）
-     ├─ 取出块 B
-     ├─ 若 B.built=true，跳过
-     ├─ ResetForRebuild（清空旧 MIR，entryStack=nil）
-     ├─ buildBasicBlock(B)
-     │    ├─ 计算 entryStack（从 incomingStacks 合并，插 PHI）
-     │    ├─ 逐条翻译 EVM 指令 → MIR
-     │    └─ 遇到 JUMP/JUMPI → connectEdge(B, child, exitSnapshot)
-     └─ 子块入队
+ │
+ ├─ Pass 1: Skeleton（skeletonMode=true）
+ │   ├─ 工作表循环
+ │   │    ├─ buildBasicBlock(B)
+ │   │    │    ├─ 入口栈用 Unknown 填充（不创建 PHI）
+ │   │    │    ├─ 各 opcode 只做 pop/push（不生成 MIR）
+ │   │    │    ├─ appendMIR 为 no-op
+ │   │    │    └─ JUMP/JUMPI → connectEdge（只记录边，不 invalidate）
+ │   │    └─ 强制 block.built=true，每个块只 build 一次
+ │   └─ CFG 结构完整
+ │
+ ├─ ComputeLoopInfo()  ← Tarjan SCC，标记 IsLoopHeader/IsInLoop
+ │
+ ├─ Pass 2: Full Build
+ │   ├─ ResetForRebuild 所有块
+ │   └─ 工作表循环
+ │        ├─ buildBasicBlock(B)
+ │        │    ├─ getEntryStackForBlock → PHI 创建
+ │        │    ├─ 逐条翻译 EVM 指令 → MIR
+ │        │    └─ connectEdge → 更新 incomingStacks
+ │        └─ 子块入队
+ │
  ├─ 检测是否需要 needsRuntimeEpochFlag
- └─ preWarmJumpTables()（为 unresolvedJump 块预建 jumpTable 条目）
+ └─ preWarmJumpTables()
 ```
 
-**安全上限**：`maxBuilds = 1024 + 64 × len(code)`，超出返回 `CFGNonConvergentError`。
+**安全上限**：每个 pass 独立计数，`maxBuilds = 1024 + 64 × len(code)`，超出返回 `CFGNonConvergentError`。
 
 ### 3.2 connectEdge
 
@@ -157,17 +182,21 @@ for i in 0..height-1:
 
 PHI 操作数顺序 **严格对齐 `block.parents` 下标**，这是 `evalPhi` 在运行时通过 `prev` 在 `parents` 中的位置选取操作数的前提。
 
-### 4.2 PHI 求值（运行时）
+### 4.2 PHI 求值（运行时，5 层 fallback）
 
-```go
-func (it *MIRInterpreter) evalPhi(cur *MIRBasicBlock, phi *MIR) Value {
-    for i, p := range cur.parents {
-        if p == it.prev { // 找到当前来源块的下标 i
-            return eval(phi.operands[i])
-        }
-    }
-    // 兜底：用 Unknown
-}
+```text
+evalPhi(cur, prev, phi):
+  1. 按 prev 在 cur.parents 中的下标选 phi.operands[i] → evalValue
+     ↓ 失败（Unknown / future-def / missing result）
+  2. cur.incomingStacks[prev] 按 phiStackIndex 定位 → evalValue
+     ↓ 失败（snapshot 中也是 Unknown）
+  3. 若 snapshot 位置是 Unknown → 从 prev 的 runtime exit stack 替换
+     ↓ 失败
+  4. 从 prev 的 exit stack 物化 → evalValue
+     ↓ 失败
+  5. resolveViaHistory：沿 block 执行历史回溯 live-in 链
+     ↓ 失败
+  → 返回 ErrMIRInternal → runner fallback 到 stock EVM
 ```
 
 ### 4.3 跨重建的稳定性
@@ -232,9 +261,18 @@ if ch, ok := cur.jumpTable[ftPC]; ok && ch != nil {
 
 ## 6. 反向边与循环处理
 
-### 6.1 反向边定义
+### 6.1 循环检测（Tarjan SCC）
 
-`to.firstPC <= from.firstPC` 即为反向边（循环跳转）。
+Parse Pass 1 完成后调用 `ComputeLoopInfo()`，使用迭代式 Tarjan SCC 算法：
+
+- 非平凡 SCC（size > 1 或有自环）→ 所有成员标记 `IsInLoop=true`
+- SCC 中有外部前驱的块 → 标记 `IsLoopHeader=true`
+- SCC 内部指向循环头的边 → 记入 `backEdgeParents`
+- `IsBackEdgeFrom(parent)` 提供 O(1) 查询
+
+运行时 `connectEdge` 添加新边时设 `loopInfoValid=false`，`EnsureLoopInfo()` 在需要时增量重算。
+
+**替代了旧的启发式**（`blockInLoop` 只检测 1-2 节点环、`firstPC` 比较），能正确处理任意长度的多块循环。
 
 ### 6.2 物化（materialization）与反向边守卫
 
@@ -262,16 +300,21 @@ if ch, ok := cur.jumpTable[ftPC]; ok && ch != nil {
 
 ## 7. 运行时执行流程
 
-```
+```text
 MIRInterpreter.Run():
   cur = entry block
   loop:
-    if cur.built == false 或 entryStack 陈旧:
-        重建 cur（buildBasicBlock）
+    recordBlockEntry(cur)                  ← 记录到 block history（ring buffer, cap 256）
+    EnsureLoopInfo()                       ← 若有新边则重算 Tarjan SCC
+    if cur.built == false:
+        尝试 RebuildPhiOnly(cur)           ← 只重建 PHI，重映射 operand resIdx
+        若失败（高度变化）→ 全量重建（保存/恢复 loop-carried 值）
     if 需要刷新入边快照（refreshEdgeIfNeeded）:
         更新 cur.incomingStacks[prev]，重建 cur
     执行 cur.instructions 逐条 MIR：
         结果写入 results[resIdx]
+        遇到 RuntimeVal → resolveRuntimeValue（O(1) 从来源块取值）
+        遇到 ErrMIRInternal → runner revert StateDB + fallback stock EVM
     根据末尾指令决定下一块：
         MirJUMP  → 查 jumpTable[target] 或 resolveBB
         MirJUMPI → 查 jumpTable[target/fallthrough]
@@ -455,22 +498,68 @@ if it.cfg.runtimeEpoch != 0 && it.cfg.runtimeBecameDynamic {
 
 ---
 
+### Fix 6：统一 Tarjan SCC 循环分析
+
+**文件**：`loop_analysis.go`、`MIRBasicBlock.go`、`opcodeParser.go`、`MIRInterpreter.go`
+
+**问题**：旧代码用 4 种独立启发式检测循环（`blockInLoop` 1-2 节点环、`firstPC` 比较、BFS depth-12、raw `firstPC<=` guard），互不一致，导致多块循环检测不到 → 常量折叠消灭计数器 → 无限循环。
+
+**修复**：Parse Pass 1 后运行 Tarjan SCC，标记 `IsInLoop`/`IsLoopHeader`/`backEdgeParents`。所有 16 个调用点改用统一查询。运行时 `EnsureLoopInfo()` 在新边发现后增量重算。
+
+### Fix 7：RuntimeVal 替代 Unknown
+
+**文件**：`ValueStack.go`、`opcodeParser.go`、`MIRInterpreter.go`
+
+**问题**：Parse 时 PHI 的缺失分支填 Unknown → 运行时静默返回 0 或报错。
+
+**修复**：新增 `RuntimeVal` kind，记录 `{rtSourceBlockPC, rtStackPos}`。运行时 `evalValue` 通过 `resolveRuntimeValue`（O(1) 从来源块 exit stack 取值）或 `resolveViaHistory`（block history 回溯）解析。
+
+### Fix 8：PHI-only rebuild
+
+**文件**：`MIRBasicBlock.go`、`MIRInterpreter.go`
+
+**问题**：运行时 rebuild 清空所有 instructions → resIdx 失效 → loop-carried 值丢失。
+
+**修复**：新增 `RebuildPhiOnly()`：当 entry stack 高度不变时，只重建 PHI 前缀并重映射非 PHI 指令的 operand resIdx。全量 rebuild 仅在高度变化时发生。
+
+### Fix 9：ErrMIRInternal + StateDB 回滚 fallback
+
+**文件**：`MIRInterpreter.go`、`evm_runner.go`
+
+**问题**：MIR 内部分析失败时直接消耗所有 gas → 嵌套 CALL 帧整体失败。
+
+**修复**：引入 `ErrMIRInternal` sentinel。runner 在 MIR Run 前 snapshot StateDB，遇到 ErrMIRInternal 时 revert + 恢复 refund counter + 用 stock EVM 重跑。合约 codeHash 加入 denylist（cap 10000），后续调用直接走 stock EVM。
+
+### Fix 10：两遍 Parse（skeleton + full）
+
+**文件**：`opcodeParser.go`、`MIRBasicBlock.go`
+
+**问题**：单遍 Parse 中循环检测和 MIR 生成耦合 → 循环头 PHI 在 loop 分析前生成 → 常量折叠误消灭循环变量。
+
+**修复**：Pass 1 (skeleton) 只发现 CFG 结构，appendMIR 为 no-op。Pass 1 后 Tarjan SCC 分析。Pass 2 在稳定 CFG 上生成 PHI + MIR 指令。
+
+---
+
 ## 附：关键函数速查
 
 | 函数 | 文件 | 职责 |
-|------|------|------|
-| `CFG.Parse()` | opcodeParser.go | 静态 CFG 构建主入口，worklist 驱动 |
-| `buildBasicBlock()` | opcodeParser.go | 构建单个块：计算 entryStack、翻译 EVM→MIR |
-| `connectEdge()` | opcodeParser.go | 连接 parent→child 边，更新 incomingStacks 和 jumpTable |
-| `markDescendantsForRebuild()` | opcodeParser.go | 广度优先标记下游块为 built=false |
-| `traceJumpDestCandidates()` | opcodeParser.go | 静态追踪动态 JUMP 的 PHI 操作数，解析 N→M 跳转表 |
-| `preWarmJumpTables()` | opcodeParser.go | Parse 后为 unresolvedJump 块预建 jumpTable |
-| `MIRInterpreter.Run()` | MIRInterpreter.go | 运行时执行主循环 |
+| --- | --- | --- |
+| `CFG.Parse()` | opcodeParser.go | 两遍 Parse：skeleton CFG 发现 + full MIR 生成 |
+| `buildBasicBlock()` | opcodeParser.go | 构建单个块；skeleton 模式只做栈模拟 |
+| `connectEdge()` | opcodeParser.go | 连接边，skeleton 模式只记录不 invalidate |
+| `ComputeLoopInfo()` | loop_analysis.go | Tarjan SCC 循环分析 |
+| `EnsureLoopInfo()` | loop_analysis.go | 惰性重算（loopInfoValid guard） |
+| `IsBackEdgeFrom()` | MIRBasicBlock.go | O(1) back-edge 查询 |
+| `RebuildPhiOnly()` | MIRBasicBlock.go | 只重建 PHI + 重映射 non-PHI operands |
+| `traceJumpDestCandidates()` | opcodeParser.go | 静态追踪动态 JUMP 目标 |
+| `preWarmJumpTables()` | opcodeParser.go | Parse 后预建 jumpTable |
+| `MIRInterpreter.Run()` | MIRInterpreter.go | 运行时主循环，含 block history 记录 |
+| `evalPhi()` | MIRInterpreter.go | 5 层 fallback PHI 解析 |
+| `evalValue()` | MIRInterpreter.go | 值求值，含 RuntimeVal 分支 |
+| `resolveRuntimeValue()` | MIRInterpreter.go | O(1) 从来源块 exit stack 取值 |
+| `resolveViaHistory()` | MIRInterpreter.go | 沿 block history 回溯 live-in 链 |
 | `refreshEdgeIfNeeded()` | MIRInterpreter.go | 动态 CFG 下刷新入边快照 |
 | `resolveBB()` | MIRInterpreter.go | 运行时发现新 JUMP 目标，回填 CFG 边 |
-| `computeExitSnapshotForEdgeTo()` | MIRInterpreter.go | 计算 parent→child 出口快照，含反向边处理 |
-| `materializeSnapshotTopK()` | MIRInterpreter.go | 将符号栈顶 K 个值固化为运行时常数 |
-| `materializeSnapshotProducedOnly()` | MIRInterpreter.go | 仅固化块内产生值（非 liveIn），用于静态反向边 |
-| `evalPhi()` | MIRInterpreter.go | 运行时按 prev 在 parents 中的下标选取 PHI 操作数 |
-| `equalValueForFlow()` | opcodeParser.go | 按稳定 resIdx/payload 比较两个 Value，用于 fixpoint 检测 |
-| `stacksEqual()` | opcodeParser.go | 比较两个快照切片是否相等 |
+| `computeExitSnapshotForEdgeTo()` | MIRInterpreter.go | 计算出口快照，含 back-edge 守卫 |
+| `mirDenylistContract()` | evm_runner.go | 将失败合约加入 process-wide denylist |
+| `equalValueForFlow()` | MIRBasicBlock.go | 按稳定 resIdx 比较 Value（含 RuntimeVal） |

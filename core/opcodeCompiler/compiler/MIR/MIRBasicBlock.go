@@ -1147,9 +1147,11 @@ func (b *MIRBasicBlock) RebuildPhiOnly(c *CFG) bool {
 
 	newEntryStack := b.entryStack
 	if newEntryStack == nil || len(newEntryStack) != oldHeight {
-		// Height changed — need full rebuild. Restore state for caller to handle.
+		// Height changed — PHI-only rebuild not possible.
+		// Clear state; caller will do full ResetForRebuild + buildBasicBlock.
 		b.entryStack = nil
 		b.instructions = nil
+		b.built = false
 		return false
 	}
 

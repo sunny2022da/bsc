@@ -63,6 +63,12 @@ func mirIsContractDenylisted(h common.Hash) bool {
 
 func mirDenylistContract(h common.Hash) {
 	mirContractDenylistMu.Lock()
+	// Cap the denylist to prevent unbounded memory growth on long-running nodes.
+	// When full, clear and start fresh — previously denylisted contracts will be
+	// re-attempted once, re-denylisted on failure (self-healing).
+	if len(mirContractDenylist) >= 10000 {
+		mirContractDenylist = make(map[common.Hash]struct{}, 64)
+	}
 	mirContractDenylist[h] = struct{}{}
 	mirContractDenylistMu.Unlock()
 }
