@@ -734,14 +734,30 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 				ops = make([]*Value, len(block.parents))
 				for j := range block.parents {
 					p := block.parents[j]
-					// For loop back-edge operands, the static incoming snapshot references
-					// outer-block PHIs that only compute once per call, producing
-					// iteration-invariant values. Instead, store a RuntimeVal placeholder so
-					// evalPhi resolves the value at runtime by walking the execution history
-					// to find the actual previous-iteration body output. This is the only
-					// correct model for shift-register loops: the "back-jump input" cannot
-					// be determined at parse time.
-					if hasBackEdge && block.IsLoopHeader && p != nil && block.IsBackEdgeFrom(p) {
+					s := incomingsByParent[j]
+					// Align from stack TOP: index into this parent's stack at (len(s)-1-distFromTop).
+					// Parents whose stacks are too short for this depth get Unknown.
+					idx := -1
+					if s != nil {
+						idx = len(s) - 1 - distFromTop
+					}
+
+					// Detect the shift-register problem: for a loop back-edge operand, if
+					// the static snapshot value points to a PHI in an OUTER block (not the
+					// current loop header and not in the loop body), that PHI only executes
+					// once per call and produces iteration-invariant values — wrong for
+					// shift-register loops. Use a RuntimeVal placeholder so evalPhi resolves
+					// the actual previous-iteration body output via block-history walk.
+					useRuntimeVal := false
+					if hasBackEdge && block.IsLoopHeader && p != nil && block.IsBackEdgeFrom(p) &&
+						idx >= 0 && idx < len(s) {
+						v := s[idx]
+						if v.kind == Variable && v.def != nil && v.def.op == MirPHI &&
+							v.def.defBlockNum != block.blockNum {
+							useRuntimeVal = true
+						}
+					}
+					if useRuntimeVal {
 						vv := Value{
 							kind:            RuntimeVal,
 							liveIn:          true,
@@ -752,13 +768,7 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 						ops[j] = &vv
 						continue
 					}
-					s := incomingsByParent[j]
-					// Align from stack TOP: index into this parent's stack at (len(s)-1-distFromTop).
-					// Parents whose stacks are too short for this depth get Unknown.
-					idx := -1
-					if s != nil {
-						idx = len(s) - 1 - distFromTop
-					}
+
 					if idx >= 0 && idx < len(s) {
 						v := s[idx]
 						v.liveIn = true
