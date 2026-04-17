@@ -818,12 +818,23 @@ func (it *MIRInterpreter) refreshEdgeIfNeeded(prev, from, to *MIRBasicBlock) {
 	if it.cfg == nil {
 		return
 	}
-	// Genuine loop back-edges: if the target is a loop header with a built entry stack,
-	// skip refresh entirely. Calling connectEdge on a loop back-edge can trigger
-	// rebuild → invalidateBlockResults, destroying loop-carried values mid-iteration.
-	// IMPORTANT: only skip for genuine loop headers (blockInLoop), not all high→low PC edges.
+	// Genuine loop back-edges: materialize the predecessor's exit stack into concrete
+	// constants (using the current-iteration result cache) and update the loop header's
+	// incoming snapshot. This is critical for "shift register" style loops where MIR's
+	// static PHI operands reference outer-block PHIs with iteration-invariant values;
+	// without refresh, evalPhi returns the same value every iteration. Materialization
+	// captures the actual body-computed values at the moment the back-edge is traversed.
+	//
+	// connectEdge has an existing guard (see opcodeParser.go) that skips the usual
+	// entry-stack invalidation for existing back-edges, so this refresh is safe:
+	// it updates incomingStacks without triggering rebuild / invalidateBlockResults.
 	it.cfg.EnsureLoopInfo()
 	if to.IsLoopHeader && to.IsBackEdgeFrom(from) && to.entryStack != nil && to.built {
+		snap := it.computeExitSnapshotForEdge(prev, from)
+		if snap != nil {
+			snap = it.materializeSnapshot(snap)
+			it.cfg.connectEdge(from, to, snap)
+		}
 		return
 	}
 	isBackEdge := to.IsLoopHeader && to.IsBackEdgeFrom(from)

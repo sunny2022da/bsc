@@ -916,7 +916,11 @@ func (c *CFG) connectEdge(parent, child *MIRBasicBlock, exitSnapshot []Value) {
 	// A newly discovered back-edge (newParent=true) means the entry stack was
 	// built without this parent's incoming snapshot, so PHIs have UNK operands
 	// for this edge. We MUST invalidate and rebuild to add the new operand.
-	if c != nil && c.runtimeEpoch != 0 && !newParent {
+	//
+	// Gate by c.parseDone (not runtimeEpoch != 0): simple CFGs (runtimeEpoch==0)
+	// also rely on this skip when refreshEdgeIfNeeded materializes shift-register
+	// snapshots for loop-back edges at runtime.
+	if c != nil && c.parseDone && !newParent {
 		c.EnsureLoopInfo()
 		if child.IsLoopHeader && child.IsBackEdgeFrom(parent) {
 			return
