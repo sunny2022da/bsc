@@ -466,6 +466,18 @@ func constSnapToPC(v *Value) uint {
 // getEntryStackForBlock determines the initial stack state for a block.
 func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 	stack := new(ValueStack)
+	if block != nil && block.firstPC == 3762 {
+		entryNil := block.entryStack == nil
+		phiCount := 0
+		for _, m := range block.instructions {
+			if m != nil && m.op == MirPHI {
+				phiCount++
+			}
+		}
+		log.Warn("MIR getEntryStackForBlock called on block@3762",
+			"entryNil", entryNil, "parents", len(block.parents),
+			"phiCount", phiCount, "built", block.built, "parseDone", c.parseDone)
+	}
 
 	// Case 1: Entry block (true entry, no predecessors).
 	//
