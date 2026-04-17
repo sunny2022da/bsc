@@ -842,11 +842,23 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 					rewrites++
 				}
 			}
-			if rewrites > 0 {
-				log.Warn("MIR SSA loop-header fixup: rewrote back-edge operands",
+			if block.firstPC == 3762 || rewrites > 0 {
+				phiCount := 0
+				for _, m := range block.instructions {
+					if m != nil && m.op == MirPHI {
+						phiCount++
+					}
+				}
+				log.Warn("MIR SSA loop-header fixup attempted",
 					"block", block.firstPC, "height", height, "rewrites", rewrites,
-					"parents", len(block.parents))
+					"parents", len(block.parents), "phiCount", phiCount,
+					"isLoopHeader", block.IsLoopHeader, "parseDone", c.parseDone)
 			}
+		} else if block.firstPC == 3762 {
+			log.Warn("MIR SSA loop-header fixup SKIPPED: no back-edge",
+				"block", block.firstPC, "height", height,
+				"parents", len(block.parents),
+				"isLoopHeader", block.IsLoopHeader, "parseDone", c.parseDone)
 		}
 
 		// IMPORTANT: distinguish "computed empty entry stack" from "unknown/uncomputed".
