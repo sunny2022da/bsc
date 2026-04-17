@@ -8,22 +8,33 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 )
 
-// DumpMIRForCodeHash looks up a cached CFG by code hash and dumps MIR instructions
-// around the given EVM PC (pc-window, pc+window). Returns empty string if the CFG
-// is not in the cache. Intended for diagnostic use in receipt-mismatch replays.
-func DumpMIRForCodeHash(codeHash common.Hash, pc, window uint) string {
-	globalCFGCacheMu.RLock()
-	entry, ok := getGlobalCFGCache().Get(codeHash)
-	globalCFGCacheMu.RUnlock()
-	if !ok || entry == nil || entry.cfg == nil {
-		return fmt.Sprintf("<no cached CFG for codeHash %s>\n", codeHash.Hex())
-	}
+// DumpMIRForCodeHash dumps MIR instructions around the given EVM PC. It first tries
+// the cached CFG; if that misses (e.g. CFG was evicted due to runtimeBecameDynamic),
+// it falls back to parsing a fresh throwaway CFG from the provided code bytes so the
+// dump is still available. Intended for diagnostic use in receipt-mismatch replays.
+func DumpMIRForCodeHash(codeHash common.Hash, code []byte, pc, window uint) string {
 	start := uint(0)
 	if pc > window {
 		start = pc - window
 	}
 	end := pc + window
-	return DebugDumpMIRForEvmPCRange(entry.cfg, start, end)
+
+	globalCFGCacheMu.RLock()
+	entry, ok := getGlobalCFGCache().Get(codeHash)
+	globalCFGCacheMu.RUnlock()
+	if ok && entry != nil && entry.cfg != nil {
+		return DebugDumpMIRForEvmPCRange(entry.cfg, start, end)
+	}
+
+	// Cache miss: parse a throwaway CFG (not stored in cache) to produce the dump.
+	if len(code) == 0 {
+		return fmt.Sprintf("<no cached CFG for codeHash %s and no code provided>\n", codeHash.Hex())
+	}
+	tmp := NewCFG(codeHash, code)
+	if err := tmp.Parse(); err != nil {
+		return fmt.Sprintf("<cache miss and throwaway Parse failed for codeHash %s: %v>\n", codeHash.Hex(), err)
+	}
+	return "[throwaway CFG, cache miss]\n" + DebugDumpMIRForEvmPCRange(tmp, start, end)
 }
 
 // DebugDumpMIRForEvmPCRange dumps MIR instructions whose originating EVM PC is within [start,end]

@@ -3800,9 +3800,10 @@ func (bc *BlockChain) traceCallTreeBothModes(parentRoot common.Hash, block *type
 			if firstDivCallTo != nil {
 				if db, derr := state.New(parentRoot, bc.statedb); derr == nil {
 					codeHash := db.GetCodeHash(*firstDivCallTo)
-					dump := mir.DumpMIRForCodeHash(codeHash, uint(mj.pc), 96)
-					log.Error(fmt.Sprintf("MIR calltree: CFG dump near diverging JUMPI (addr=%s codeHash=%s pc=%d):\n%s",
-						firstDivCallTo.Hex(), codeHash.Hex(), mj.pc, dump))
+					code := db.GetCode(*firstDivCallTo)
+					dump := mir.DumpMIRForCodeHash(codeHash, code, uint(mj.pc), 96)
+					log.Error(fmt.Sprintf("MIR calltree: CFG dump near diverging JUMPI (addr=%s codeHash=%s pc=%d codeLen=%d):\n%s",
+						firstDivCallTo.Hex(), codeHash.Hex(), mj.pc, len(code), dump))
 				} else {
 					log.Error("MIR calltree: failed to build statedb for CFG dump", "err", derr)
 				}
