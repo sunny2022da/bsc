@@ -37,6 +37,55 @@ func DumpMIRForCodeHash(codeHash common.Hash, code []byte, pc, window uint) stri
 	return "[throwaway CFG, cache miss]\n" + DebugDumpMIRForEvmPCRange(tmp, start, end)
 }
 
+// addPCsOfMatchingMSTOREs scans all MSTORE instructions in cfg and appends the PCs
+// of those that could write to the memory slot read by an MLOAD with offset `loadOff`.
+//
+// Matching rules (over-approximating on purpose — this is a diagnostic dump):
+//   - If loadOff is Konst: match MSTOREs whose offset is Konst and equal. Also match
+//     MSTOREs whose offset is a Variable (dynamic — may or may not alias).
+//   - If loadOff is Variable: match all MSTOREs (can't resolve statically).
+//
+// We always accept a bounded number of matches to avoid dump-size explosions on
+// contracts with hundreds of MSTOREs.
+func addPCsOfMatchingMSTOREs(cfg *CFG, loadOff *Value, visited map[uint]bool, out *[]uint) {
+	if cfg == nil || loadOff == nil {
+		return
+	}
+	const maxMatches = 32
+	matches := 0
+	for _, b := range cfg.basicBlocks {
+		if b == nil {
+			continue
+		}
+		for _, m := range b.instructions {
+			if m == nil || m.op != MirMSTORE || len(m.operands) == 0 || m.operands[0] == nil {
+				continue
+			}
+			storeOff := m.operands[0]
+			include := false
+			switch {
+			case loadOff.kind == Konst && storeOff.kind == Konst:
+				if loadOff.u != nil && storeOff.u != nil && loadOff.u.Cmp(storeOff.u) == 0 {
+					include = true
+				}
+			case loadOff.kind == Konst && storeOff.kind == Variable:
+				// Dynamic MSTORE offset — might alias with the constant load offset.
+				include = true
+			case loadOff.kind == Variable:
+				// Dynamic MLOAD offset — conservatively include any MSTORE.
+				include = true
+			}
+			if include && !visited[m.evmPC] {
+				*out = append(*out, m.evmPC)
+				matches++
+				if matches >= maxMatches {
+					return
+				}
+			}
+		}
+	}
+}
+
 // DumpMIRWithOperandTraces dumps MIR instructions in a window around anchorPC and then
 // recursively dumps windows around each operand's defPC (up to maxDepth levels), so the
 // full data-flow feeding a diverging JUMPI can be inspected in one log entry.
@@ -89,8 +138,8 @@ func DumpMIRWithOperandTraces(cfg *CFG, anchorPC uint, maxDepth int, window uint
 							nextQueue = append(nextQueue, v.def.evmPC)
 						}
 					}
-					// For PHI nodes, also follow the parents' exit edges so we can see
-					// where the incoming values come from.
+					// PHI nodes: follow the parents' exit edges so we can see where the
+					// incoming values come from (across block boundaries).
 					if m.op == MirPHI {
 						for _, parent := range b.parents {
 							if parent == nil || len(parent.instructions) == 0 {
@@ -101,6 +150,13 @@ func DumpMIRWithOperandTraces(cfg *CFG, anchorPC uint, maxDepth int, window uint
 								nextQueue = append(nextQueue, lastPC)
 							}
 						}
+					}
+					// MLOAD: memory-flow dependency. Find MSTOREs that could write to the
+					// same offset (direct Konst match, or dynamic offset we can't resolve
+					// statically). Follow both so the upstream value chain appears in dump.
+					if m.op == MirMLOAD && len(m.operands) > 0 && m.operands[0] != nil {
+						loadOff := m.operands[0]
+						addPCsOfMatchingMSTOREs(cfg, loadOff, visited, &nextQueue)
 					}
 				}
 			}
