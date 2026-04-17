@@ -779,38 +779,55 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 			block.CreatePhiMIR(ops, stack, phiStackIndex)
 		}
 
-		// SSA loop-header fixup: for each back-edge parent, rewrite PHI operands to
-		// reference SAME-BLOCK sibling PHIs (standard SSA loop form). The static
-		// back-edge snapshot's Values track ORIGINAL defs from outer blocks; those
-		// defs only execute once per call and are iteration-invariant, breaking
-		// shift-register loops. The correct SSA operand for a slot-N back-edge
-		// operand is the PHI at the slot indicated by the snapshot Value's
-		// liveInPos (the entry-stack slot the value was preserved from through the
-		// loop body's net stack effect).
+		// SSA loop-header fixup: rewrite back-edge PHI operands that reference an
+		// OUTER-block PHI into same-block sibling-PHI references (standard SSA loop
+		// form). Shift-register patterns encode the shift through the operand
+		// resIdx: for slot N, op_back.resIdx matches some sibling slot M's
+		// op_entry.resIdx, meaning "loop-back value at slot N" = "initial value at
+		// slot M" — which in SSA is the sibling PHI's output.
 		//
-		// This is what textbook SSA construction does for loops; parse-time snapshot
-		// propagation can't produce it directly because the PHIs don't exist until
-		// rebuild-time.
+		// After this rewrite, evalPhi's parallel-copy snapshot (phiParallelSnap)
+		// supplies the previous-iteration sibling value and the register shifts
+		// correctly across iterations.
 		//
 		// We gate only on `hasBackEdge` (not block.IsLoopHeader) because IsLoopHeader
 		// is set by Tarjan SCC which may not have run yet during this parse. Any
 		// parent with firstPC >= block.firstPC is a textual back-edge and eligible
 		// for the rewrite.
 		if hasBackEdge {
-			// Build lookup: phiStackIndex -> PHI MIR
-			phiByIdx := make(map[int]*MIR, height)
+			// Build lookup from outer-PHI resIdx (as appears in op_entry) to the
+			// sibling PHI that carries that value at block entry.
+			entryDefToSibling := make(map[int]*MIR, height)
 			for _, m := range block.instructions {
 				if m == nil || m.op != MirPHI {
 					continue
 				}
-				phiByIdx[m.phiStackIndex] = m
+				for j, p := range block.parents {
+					if p == nil {
+						continue
+					}
+					isBackEdgeParent := block.IsBackEdgeFrom(p) || p.firstPC >= block.firstPC
+					if isBackEdgeParent {
+						continue // only entry-edge operands
+					}
+					if j >= len(m.operands) || m.operands[j] == nil {
+						continue
+					}
+					v := m.operands[j]
+					if v.kind != Variable || v.def == nil || v.def.op != MirPHI {
+						continue
+					}
+					// Only register the first entry-edge slot we find (simple case).
+					if _, exists := entryDefToSibling[v.def.resIdx]; !exists {
+						entryDefToSibling[v.def.resIdx] = m
+					}
+				}
 			}
+
 			for j, p := range block.parents {
 				if p == nil {
 					continue
 				}
-				// Back-edge identification: use the same textual heuristic as
-				// hasBackEdge above — parent's firstPC is at or beyond this block.
 				isBackEdgeParent := block.IsBackEdgeFrom(p) || p.firstPC >= block.firstPC
 				if !isBackEdgeParent {
 					continue
@@ -823,16 +840,17 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 						continue
 					}
 					v := m.operands[j]
-					if !v.liveIn || v.liveInPos < 0 || v.liveInPos >= height {
+					if v.kind != Variable || v.def == nil || v.def.op != MirPHI {
 						continue
 					}
-					// Body-produced defs (non-PHI defined in this block) represent
-					// genuine new computations and must not be rewritten.
-					if v.kind == Variable && v.def != nil && v.def.defBlockNum == block.blockNum && v.def.op != MirPHI {
+					// Skip if operand already references a same-block PHI (nothing to do).
+					if v.def.defBlockNum == block.blockNum {
 						continue
 					}
-					targetPhiIdx := (height - 1) - v.liveInPos
-					sibling, ok := phiByIdx[targetPhiIdx]
+					// Look up the sibling PHI whose entry-edge operand references the
+					// same outer PHI resIdx. That sibling IS the "previous-iteration
+					// value" this back-edge operand wants (shift-register semantics).
+					sibling, ok := entryDefToSibling[v.def.resIdx]
 					if !ok || sibling == m {
 						continue
 					}
