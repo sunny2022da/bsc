@@ -4320,6 +4320,14 @@ func (it *MIRInterpreter) evalPhi(cur, prev *MIRBasicBlock, phi *MIR) (result *u
 		return u256Zero, nil
 	}
 
+	// Loop-back edges: skip operand-by-predecessor resolution entirely. Static PHI
+	// operands for loop-back edges reference outer-block PHIs that only compute once
+	// per call, producing iteration-invariant values (wrong for shift-register loops).
+	// Instead, drop straight through to the incomingStacks snapshot path below;
+	// refreshEdgeIfNeeded materializes these snapshots with current-iteration body
+	// values at each back-edge traversal, so step 2 returns the correct shifted value.
+	isLoopBack := cur.IsLoopHeader && cur.IsBackEdgeFrom(prev)
+
 	// Prefer selecting the PHI operand corresponding to the actual predecessor edge.
 	// This is stable and avoids requiring runtime per-edge snapshotting on every run.
 	//
@@ -4332,7 +4340,7 @@ func (it *MIRInterpreter) evalPhi(cur, prev *MIRBasicBlock, phi *MIR) (result *u
 	//
 	// By selecting the operand by predecessor identity (same ordering as build), we keep
 	// PHI resolution stable and avoid depending on snapshot length.
-	if len(phi.operands) > 0 && len(cur.parents) > 0 {
+	if !isLoopBack && len(phi.operands) > 0 && len(cur.parents) > 0 {
 		foundPrev := false
 		for opIdx, p := range cur.parents {
 			if p != prev {
