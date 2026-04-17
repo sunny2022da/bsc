@@ -733,6 +733,25 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 			if incomingsByParent != nil && len(incomingsByParent) == len(block.parents) && len(block.parents) > 0 {
 				ops = make([]*Value, len(block.parents))
 				for j := range block.parents {
+					p := block.parents[j]
+					// For loop back-edge operands, the static incoming snapshot references
+					// outer-block PHIs that only compute once per call, producing
+					// iteration-invariant values. Instead, store a RuntimeVal placeholder so
+					// evalPhi resolves the value at runtime by walking the execution history
+					// to find the actual previous-iteration body output. This is the only
+					// correct model for shift-register loops: the "back-jump input" cannot
+					// be determined at parse time.
+					if hasBackEdge && block.IsLoopHeader && p != nil && block.IsBackEdgeFrom(p) {
+						vv := Value{
+							kind:            RuntimeVal,
+							liveIn:          true,
+							liveInPos:       i,
+							rtSourceBlockPC: p.firstPC,
+							rtStackPos:      distFromTop,
+						}
+						ops[j] = &vv
+						continue
+					}
 					s := incomingsByParent[j]
 					// Align from stack TOP: index into this parent's stack at (len(s)-1-distFromTop).
 					// Parents whose stacks are too short for this depth get Unknown.
@@ -750,7 +769,6 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 						// Unknown (which would be unresolvable at runtime), create
 						// a RuntimeVal that records where this value should come
 						// from: the parent's exit stack at the requested depth.
-						p := block.parents[j]
 						rtPC := uint(0)
 						if p != nil {
 							rtPC = p.firstPC

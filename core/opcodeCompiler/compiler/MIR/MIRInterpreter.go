@@ -4320,16 +4320,11 @@ func (it *MIRInterpreter) evalPhi(cur, prev *MIRBasicBlock, phi *MIR) (result *u
 		return u256Zero, nil
 	}
 
-	// Loop-back edges: skip operand-by-predecessor resolution entirely. Static PHI
-	// operands for loop-back edges reference outer-block PHIs that only compute once
-	// per call, producing iteration-invariant values (wrong for shift-register loops).
-	// Instead, drop straight through to the incomingStacks snapshot path below;
-	// refreshEdgeIfNeeded materializes these snapshots with current-iteration body
-	// values at each back-edge traversal, so step 2 returns the correct shifted value.
-	isLoopBack := cur.IsLoopHeader && cur.IsBackEdgeFrom(prev)
-
 	// Prefer selecting the PHI operand corresponding to the actual predecessor edge.
-	// This is stable and avoids requiring runtime per-edge snapshotting on every run.
+	// For loop back-edges the operand is a RuntimeVal (set during CFG construction)
+	// that evalValue resolves by walking the block history and reading the actual
+	// previous-iteration body output — so shift-register loops work correctly
+	// without needing any static analysis of loop depth or per-iteration snapshots.
 	//
 	// Rationale: our PHI nodes are created during CFG build by iterating incoming stacks
 	// in parent order. In real EVM control-flow, all predecessors reaching a join must
@@ -4340,7 +4335,7 @@ func (it *MIRInterpreter) evalPhi(cur, prev *MIRBasicBlock, phi *MIR) (result *u
 	//
 	// By selecting the operand by predecessor identity (same ordering as build), we keep
 	// PHI resolution stable and avoid depending on snapshot length.
-	if !isLoopBack && len(phi.operands) > 0 && len(cur.parents) > 0 {
+	if len(phi.operands) > 0 && len(cur.parents) > 0 {
 		foundPrev := false
 		for opIdx, p := range cur.parents {
 			if p != prev {
@@ -4565,26 +4560,14 @@ func (it *MIRInterpreter) resolveRuntimeValue(sourceBlockPC uint, stackDepthFrom
 		return nil, false
 	}
 	srcBlock := it.cfg.pcToBlock[sourceBlockPC]
-	if srcBlock == nil || srcBlock.ExitStack() == nil {
+	if srcBlock == nil {
 		return nil, false
 	}
-	exitSnap := it.computeExitSnapshotForEdge(nil, srcBlock)
-	if exitSnap == nil {
-		return nil, false
-	}
-	idx := (len(exitSnap) - 1) - stackDepthFromTop
-	if idx < 0 || idx >= len(exitSnap) {
-		return nil, false
-	}
-	v := exitSnap[idx]
-	if v.kind == Unknown || v.kind == RuntimeVal {
-		return nil, false
-	}
-	val, err := it.evalValue(&v)
-	if err != nil || val == nil {
-		return nil, false
-	}
-	return val, true
+	// Walk the execution history to find srcBlock's most recent execution and
+	// resolve its exit-stack value at the requested depth using current runtime
+	// results. This returns the actual body-computed value from the previous
+	// iteration (for loop back-edges) rather than a static parse-time snapshot.
+	return it.resolveViaHistory(srcBlock, stackDepthFromTop)
 }
 
 func (it *MIRInterpreter) resolveViaHistory(startBlock *MIRBasicBlock, stackDepthFromTop int) (*uint256.Int, bool) {
