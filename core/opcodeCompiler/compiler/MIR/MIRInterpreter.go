@@ -220,6 +220,17 @@ type MIRInterpreter struct {
 	curEvmPC uint
 	curEvmOp byte
 
+	// phiParallelSnap stores the previous-iteration PHI results for the current
+	// basic block. It exists to provide parallel-copy semantics required for
+	// loop-header PHIs that reference sibling PHIs in the same block. When
+	// evalPhi evaluates an operand whose def is a same-block PHI, it reads from
+	// this snapshot (previous iteration's value) rather than the live results
+	// cache (which may already reflect the current iteration's update).
+	//
+	// Keyed by PHI result's resIdx. Populated on block entry (before any PHI of
+	// that block is evaluated) and consulted only during that block's PHI phase.
+	phiParallelSnap map[int]uint256.Int
+
 	// blockHistory tracks the sequence of basic blocks executed in this frame.
 	// Used by evalPhi's Unknown-resolution fallback: when a PHI operand traces
 	// to a live-in that MIR couldn't resolve at Parse time, walk back through
@@ -590,6 +601,11 @@ func (it *MIRInterpreter) ResetForRun(cfg *CFG) {
 	it.refundApplied = false
 	it.lastEvmPC = 0
 	it.curBlock = nil
+	if it.phiParallelSnap != nil {
+		for k := range it.phiParallelSnap {
+			delete(it.phiParallelSnap, k)
+		}
+	}
 	it.curEvmPC = 0
 	it.curEvmOp = 0
 	it.curBlockConstPrefix = nil
@@ -1313,6 +1329,31 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 		it.curEvmOpIndex = -1
 		it.curBlockConstPrefix = it.ensureBlockConstPrefix(cur)
 		it.curBlockConstDelta, it.curBlockConstTail = it.ensureBlockConstDelta(cur)
+
+		// Parallel-copy snapshot for loop-header PHIs: capture the previous-iteration
+		// result of every PHI in this block BEFORE any of them is updated in the
+		// current iteration. evalPhi reads this snapshot for same-block PHI operands
+		// so sibling references produce shift-register semantics correctly
+		// (otherwise evaluation order would read a mix of old and new values).
+		// Non-loop blocks pay zero cost: their PHIs' operands don't reference
+		// same-block PHIs, so the snapshot is never consulted.
+		if it.phiParallelSnap == nil {
+			it.phiParallelSnap = make(map[int]uint256.Int, 16)
+		} else {
+			for k := range it.phiParallelSnap {
+				delete(it.phiParallelSnap, k)
+			}
+		}
+		if cur != nil {
+			for _, m := range cur.instructions {
+				if m == nil || m.op != MirPHI {
+					break
+				}
+				if m.resIdx > 0 && m.resIdx < len(it.resultsGen) && it.resultsGen[m.resIdx] == it.gen {
+					it.phiParallelSnap[m.resIdx] = it.results[m.resIdx]
+				}
+			}
+		}
 
 		// NOTE: EVM can reach the same JUMPDEST with different stack heights via dynamic jumps.
 		// MIR must tolerate this at runtime. PHI evaluation uses per-edge incoming snapshots,
@@ -4369,6 +4410,23 @@ func (it *MIRInterpreter) evalPhi(cur, prev *MIRBasicBlock, phi *MIR) (result *u
 					}
 					break // fall to snapshot indexing below
 				}
+				// Parallel-copy semantics for loop-header PHIs: if the operand references
+				// a sibling PHI in the SAME block, read the previous-iteration value from
+				// the parallel snapshot (taken before any PHI in this block was updated
+				// this iteration) rather than the live result cache (which may already
+				// hold this iteration's update from a preceding sibling PHI).
+				if ov := phi.operands[opIdx]; ov != nil && ov.kind == Variable && ov.def != nil &&
+					ov.def.op == MirPHI && ov.def.defBlockNum == cur.blockNum {
+					if snap, ok := it.phiParallelSnap[ov.def.resIdx]; ok {
+						snapCopy := snap
+						phiPath = 1
+						return &snapCopy, nil
+					}
+					// No snapshot entry: previous iteration never wrote this PHI's result
+					// (shouldn't happen once the loop is running, but we guard anyway).
+					// Fall through to default evalValue, which may return an error; that
+					// triggers the snapshot-fallback path below.
+				}
 				val, err := it.evalValue(phi.operands[opIdx])
 				if err != nil {
 					// Operand-based PHI selection can become temporarily stale across rebuilds when
@@ -4560,14 +4618,26 @@ func (it *MIRInterpreter) resolveRuntimeValue(sourceBlockPC uint, stackDepthFrom
 		return nil, false
 	}
 	srcBlock := it.cfg.pcToBlock[sourceBlockPC]
-	if srcBlock == nil {
+	if srcBlock == nil || srcBlock.ExitStack() == nil {
 		return nil, false
 	}
-	// Walk the execution history to find srcBlock's most recent execution and
-	// resolve its exit-stack value at the requested depth using current runtime
-	// results. This returns the actual body-computed value from the previous
-	// iteration (for loop back-edges) rather than a static parse-time snapshot.
-	return it.resolveViaHistory(srcBlock, stackDepthFromTop)
+	exitSnap := it.computeExitSnapshotForEdge(nil, srcBlock)
+	if exitSnap == nil {
+		return nil, false
+	}
+	idx := (len(exitSnap) - 1) - stackDepthFromTop
+	if idx < 0 || idx >= len(exitSnap) {
+		return nil, false
+	}
+	v := exitSnap[idx]
+	if v.kind == Unknown || v.kind == RuntimeVal {
+		return nil, false
+	}
+	val, err := it.evalValue(&v)
+	if err != nil || val == nil {
+		return nil, false
+	}
+	return val, true
 }
 
 func (it *MIRInterpreter) resolveViaHistory(startBlock *MIRBasicBlock, stackDepthFromTop int) (*uint256.Int, bool) {

@@ -733,7 +733,6 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 			if incomingsByParent != nil && len(incomingsByParent) == len(block.parents) && len(block.parents) > 0 {
 				ops = make([]*Value, len(block.parents))
 				for j := range block.parents {
-					p := block.parents[j]
 					s := incomingsByParent[j]
 					// Align from stack TOP: index into this parent's stack at (len(s)-1-distFromTop).
 					// Parents whose stacks are too short for this depth get Unknown.
@@ -741,34 +740,6 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 					if s != nil {
 						idx = len(s) - 1 - distFromTop
 					}
-
-					// Detect the shift-register problem: for a loop back-edge operand, if
-					// the static snapshot value points to a PHI in an OUTER block (not the
-					// current loop header and not in the loop body), that PHI only executes
-					// once per call and produces iteration-invariant values — wrong for
-					// shift-register loops. Use a RuntimeVal placeholder so evalPhi resolves
-					// the actual previous-iteration body output via block-history walk.
-					useRuntimeVal := false
-					if hasBackEdge && block.IsLoopHeader && p != nil && block.IsBackEdgeFrom(p) &&
-						idx >= 0 && idx < len(s) {
-						v := s[idx]
-						if v.kind == Variable && v.def != nil && v.def.op == MirPHI &&
-							v.def.defBlockNum != block.blockNum {
-							useRuntimeVal = true
-						}
-					}
-					if useRuntimeVal {
-						vv := Value{
-							kind:            RuntimeVal,
-							liveIn:          true,
-							liveInPos:       i,
-							rtSourceBlockPC: p.firstPC,
-							rtStackPos:      distFromTop,
-						}
-						ops[j] = &vv
-						continue
-					}
-
 					if idx >= 0 && idx < len(s) {
 						v := s[idx]
 						v.liveIn = true
@@ -779,6 +750,7 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 						// Unknown (which would be unresolvable at runtime), create
 						// a RuntimeVal that records where this value should come
 						// from: the parent's exit stack at the requested depth.
+						p := block.parents[j]
 						rtPC := uint(0)
 						if p != nil {
 							rtPC = p.firstPC
@@ -806,6 +778,58 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 			phiStackIndex := (height - 1) - i
 			block.CreatePhiMIR(ops, stack, phiStackIndex)
 		}
+
+		// SSA loop-header fixup: for each back-edge parent, rewrite PHI operands to
+		// reference SAME-BLOCK sibling PHIs (standard SSA loop form). The static
+		// back-edge snapshot's Values track ORIGINAL defs from outer blocks; those
+		// defs only execute once per call and are iteration-invariant, breaking
+		// shift-register loops. The correct SSA operand for a slot-N back-edge
+		// operand is the PHI at the slot indicated by the snapshot Value's
+		// liveInPos (the entry-stack slot the value was preserved from through the
+		// loop body's net stack effect).
+		//
+		// This is what textbook SSA construction does for loops; parse-time snapshot
+		// propagation can't produce it directly because the PHIs don't exist until
+		// rebuild-time.
+		if hasBackEdge && block.IsLoopHeader {
+			// Build lookup: phiStackIndex -> PHI MIR
+			phiByIdx := make(map[int]*MIR, height)
+			for _, m := range block.instructions {
+				if m == nil || m.op != MirPHI {
+					continue
+				}
+				phiByIdx[m.phiStackIndex] = m
+			}
+			for j, p := range block.parents {
+				if p == nil || !block.IsBackEdgeFrom(p) {
+					continue
+				}
+				for _, m := range block.instructions {
+					if m == nil || m.op != MirPHI {
+						continue
+					}
+					if j >= len(m.operands) || m.operands[j] == nil {
+						continue
+					}
+					v := m.operands[j]
+					if !v.liveIn || v.liveInPos < 0 || v.liveInPos >= height {
+						continue
+					}
+					// Body-produced defs (non-PHI defined in this block) represent
+					// genuine new computations and must not be rewritten.
+					if v.kind == Variable && v.def != nil && v.def.defBlockNum == block.blockNum && v.def.op != MirPHI {
+						continue
+					}
+					targetPhiIdx := (height - 1) - v.liveInPos
+					sibling, ok := phiByIdx[targetPhiIdx]
+					if !ok || sibling == m {
+						continue
+					}
+					m.operands[j] = newValue(Variable, sibling, nil, nil)
+				}
+			}
+		}
+
 		// IMPORTANT: distinguish "computed empty entry stack" from "unknown/uncomputed".
 		// ValueStack.data is nil for height=0, but we use nil entryStack as an invalidation marker.
 		// Use an explicit empty slice so callers/tools (e.g., mir_visualizer) don't treat it as unknown.
