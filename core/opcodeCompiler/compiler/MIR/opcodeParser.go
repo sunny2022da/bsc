@@ -6,7 +6,6 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/opcodeCompiler/compiler"
-	"github.com/ethereum/go-ethereum/log"
 	"github.com/holiman/uint256"
 )
 
@@ -466,18 +465,6 @@ func constSnapToPC(v *Value) uint {
 // getEntryStackForBlock determines the initial stack state for a block.
 func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 	stack := new(ValueStack)
-	if block != nil && block.firstPC == 3762 {
-		entryNil := block.entryStack == nil
-		phiCount := 0
-		for _, m := range block.instructions {
-			if m != nil && m.op == MirPHI {
-				phiCount++
-			}
-		}
-		log.Warn("MIR getEntryStackForBlock called on block@3762",
-			"entryNil", entryNil, "parents", len(block.parents),
-			"phiCount", phiCount, "built", block.built, "parseDone", c.parseDone)
-	}
 
 	// Case 1: Entry block (true entry, no predecessors).
 	//
@@ -637,16 +624,7 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 			}
 		}
 		if len(valid) == 0 {
-			if block.firstPC == 3762 {
-				log.Warn("MIR block@3762 early return: valid empty",
-					"parents", len(block.parents),
-					"incomingCount", len(block.incomingStacks))
-			}
 			return stack
-		}
-		if block.firstPC == 3762 {
-			log.Warn("MIR block@3762 proceeding to PHI creation",
-				"validCount", len(valid), "parents", len(block.parents))
 		}
 		// EVM requires identical stack height at merge points. During dynamic CFG expansion we can
 		// temporarily record infeasible edges with a different stack height; padding them with
@@ -827,8 +805,6 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 				}
 				phiByIdx[m.phiStackIndex] = m
 			}
-			rewrites := 0
-			debugHere := block.firstPC == 3762
 			for j, p := range block.parents {
 				if p == nil {
 					continue
@@ -836,12 +812,6 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 				// Back-edge identification: use the same textual heuristic as
 				// hasBackEdge above — parent's firstPC is at or beyond this block.
 				isBackEdgeParent := block.IsBackEdgeFrom(p) || p.firstPC >= block.firstPC
-				if debugHere {
-					log.Warn("MIR block@3762 fixup parent check",
-						"j", j, "parent.firstPC", p.firstPC,
-						"isBackEdgeFrom", block.IsBackEdgeFrom(p),
-						"isBackEdgeParent", isBackEdgeParent)
-				}
 				if !isBackEdgeParent {
 					continue
 				}
@@ -853,57 +823,22 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 						continue
 					}
 					v := m.operands[j]
-					reason := ""
-					if !v.liveIn {
-						reason = "liveIn=false"
-					} else if v.liveInPos < 0 {
-						reason = fmt.Sprintf("liveInPos<0(%d)", v.liveInPos)
-					} else if v.liveInPos >= height {
-						reason = fmt.Sprintf("liveInPos>=height(%d>=%d)", v.liveInPos, height)
-					} else if v.kind == Variable && v.def != nil && v.def.defBlockNum == block.blockNum && v.def.op != MirPHI {
-						reason = "body-def"
+					if !v.liveIn || v.liveInPos < 0 || v.liveInPos >= height {
+						continue
 					}
-					if reason != "" {
-						if debugHere {
-							log.Warn("MIR block@3762 fixup operand rejected",
-								"phiIdx", m.phiStackIndex, "j", j,
-								"reason", reason,
-								"v.kind", v.kind, "v.liveIn", v.liveIn, "v.liveInPos", v.liveInPos)
-						}
+					// Body-produced defs (non-PHI defined in this block) represent
+					// genuine new computations and must not be rewritten.
+					if v.kind == Variable && v.def != nil && v.def.defBlockNum == block.blockNum && v.def.op != MirPHI {
 						continue
 					}
 					targetPhiIdx := (height - 1) - v.liveInPos
 					sibling, ok := phiByIdx[targetPhiIdx]
 					if !ok || sibling == m {
-						if debugHere {
-							log.Warn("MIR block@3762 fixup no sibling",
-								"phiIdx", m.phiStackIndex, "j", j,
-								"targetPhiIdx", targetPhiIdx,
-								"sibling_nil", !ok, "sibling_self", ok && sibling == m)
-						}
 						continue
 					}
 					m.operands[j] = newValue(Variable, sibling, nil, nil)
-					rewrites++
 				}
 			}
-			if block.firstPC == 3762 || rewrites > 0 {
-				phiCount := 0
-				for _, m := range block.instructions {
-					if m != nil && m.op == MirPHI {
-						phiCount++
-					}
-				}
-				log.Warn("MIR SSA loop-header fixup attempted",
-					"block", block.firstPC, "height", height, "rewrites", rewrites,
-					"parents", len(block.parents), "phiCount", phiCount,
-					"isLoopHeader", block.IsLoopHeader, "parseDone", c.parseDone)
-			}
-		} else if block.firstPC == 3762 {
-			log.Warn("MIR SSA loop-header fixup SKIPPED: no back-edge",
-				"block", block.firstPC, "height", height,
-				"parents", len(block.parents),
-				"isLoopHeader", block.IsLoopHeader, "parseDone", c.parseDone)
 		}
 
 		// IMPORTANT: distinguish "computed empty entry stack" from "unknown/uncomputed".

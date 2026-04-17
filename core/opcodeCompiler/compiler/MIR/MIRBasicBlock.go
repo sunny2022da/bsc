@@ -1,7 +1,6 @@
 package MIR
 
 import (
-	"github.com/ethereum/go-ethereum/log"
 	"github.com/holiman/uint256"
 )
 
@@ -766,10 +765,6 @@ func (b *MIRBasicBlock) CreatePhiMIR(ops []*Value, stack *ValueStack, phiStackIn
 	stack.push(mir.Result())
 	mir = b.appendMIR(mir)
 	mir.genStackDepth = stack.size()
-	if b != nil && b.firstPC == 3762 {
-		log.Warn("MIR CreatePhiMIR for block@3762",
-			"phiStackIndex", phiStackIndex, "numOps", len(ops))
-	}
 	return mir
 }
 
