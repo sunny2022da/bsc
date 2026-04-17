@@ -4,7 +4,27 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+
+	"github.com/ethereum/go-ethereum/common"
 )
+
+// DumpMIRForCodeHash looks up a cached CFG by code hash and dumps MIR instructions
+// around the given EVM PC (pc-window, pc+window). Returns empty string if the CFG
+// is not in the cache. Intended for diagnostic use in receipt-mismatch replays.
+func DumpMIRForCodeHash(codeHash common.Hash, pc, window uint) string {
+	globalCFGCacheMu.RLock()
+	entry, ok := getGlobalCFGCache().Get(codeHash)
+	globalCFGCacheMu.RUnlock()
+	if !ok || entry == nil || entry.cfg == nil {
+		return fmt.Sprintf("<no cached CFG for codeHash %s>\n", codeHash.Hex())
+	}
+	start := uint(0)
+	if pc > window {
+		start = pc - window
+	}
+	end := pc + window
+	return DebugDumpMIRForEvmPCRange(entry.cfg, start, end)
+}
 
 // DebugDumpMIRForEvmPCRange dumps MIR instructions whose originating EVM PC is within [start,end]
 // (inclusive). This is intended for debugging consensus divergences and should not be used in

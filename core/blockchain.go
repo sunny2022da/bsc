@@ -3752,6 +3752,7 @@ func (bc *BlockChain) traceCallTreeBothModes(parentRoot common.Hash, block *type
 	if len(baseFrames) < n {
 		n = len(baseFrames)
 	}
+	var firstDivCallTo *common.Address
 	for i := 0; i < n; i++ {
 		m, b := mirFrames[i], baseFrames[i]
 		if m.gasUsed != b.gasUsed || m.err != b.err {
@@ -3764,6 +3765,8 @@ func (bc *BlockChain) traceCallTreeBothModes(parentRoot common.Hash, block *type
 				"mir.gasUsed", m.gasUsed, "base.gasUsed", b.gasUsed,
 				"mir.err", m.err, "base.err", b.err,
 			)
+			to := m.to
+			firstDivCallTo = &to
 			break
 		}
 	}
@@ -3792,6 +3795,18 @@ func (bc *BlockChain) traceCallTreeBothModes(parentRoot common.Hash, block *type
 				"mir.cond", mj.cond.Hex(), "base.cond", bj.cond.Hex(),
 				"mir.taken", mj.taken, "base.taken", bj.taken,
 			)
+			// Dump MIR around the diverging JUMPI PC for root-cause analysis.
+			// The contract executing this JUMPI is almost always the first diverging call's target.
+			if firstDivCallTo != nil {
+				if db, derr := state.New(parentRoot, bc.statedb); derr == nil {
+					codeHash := db.GetCodeHash(*firstDivCallTo)
+					dump := mir.DumpMIRForCodeHash(codeHash, uint(mj.pc), 96)
+					log.Error(fmt.Sprintf("MIR calltree: CFG dump near diverging JUMPI (addr=%s codeHash=%s pc=%d):\n%s",
+						firstDivCallTo.Hex(), codeHash.Hex(), mj.pc, dump))
+				} else {
+					log.Error("MIR calltree: failed to build statedb for CFG dump", "err", derr)
+				}
+			}
 			break
 		}
 	}
