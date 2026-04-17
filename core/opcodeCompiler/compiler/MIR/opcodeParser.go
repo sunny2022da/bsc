@@ -231,6 +231,9 @@ func (c *CFG) Parse() error {
 	currentCFGBuild = c
 	defer func() { currentCFGBuild = nil }()
 
+	fmt.Fprintf(os.Stderr, "[MIR B2] Parse() ENTER codeAddr=%s codeLen=%d\n",
+		c.codeAddr, len(c.rawCode))
+
 	validJumpDests := c.JumpDests()
 	entryBlock := c.getOrCreateBlock(0)
 
