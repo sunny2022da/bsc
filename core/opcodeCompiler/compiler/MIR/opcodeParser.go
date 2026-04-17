@@ -6,6 +6,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/opcodeCompiler/compiler"
+	"github.com/ethereum/go-ethereum/log"
 	"github.com/holiman/uint256"
 )
 
@@ -791,7 +792,12 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 		// This is what textbook SSA construction does for loops; parse-time snapshot
 		// propagation can't produce it directly because the PHIs don't exist until
 		// rebuild-time.
-		if hasBackEdge && block.IsLoopHeader {
+		//
+		// We gate only on `hasBackEdge` (not block.IsLoopHeader) because IsLoopHeader
+		// is set by Tarjan SCC which may not have run yet during this parse. Any
+		// parent with firstPC >= block.firstPC is a textual back-edge and eligible
+		// for the rewrite.
+		if hasBackEdge {
 			// Build lookup: phiStackIndex -> PHI MIR
 			phiByIdx := make(map[int]*MIR, height)
 			for _, m := range block.instructions {
@@ -800,8 +806,15 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 				}
 				phiByIdx[m.phiStackIndex] = m
 			}
+			rewrites := 0
 			for j, p := range block.parents {
-				if p == nil || !block.IsBackEdgeFrom(p) {
+				if p == nil {
+					continue
+				}
+				// Back-edge identification: use the same textual heuristic as
+				// hasBackEdge above — parent's firstPC is at or beyond this block.
+				isBackEdgeParent := block.IsBackEdgeFrom(p) || p.firstPC >= block.firstPC
+				if !isBackEdgeParent {
 					continue
 				}
 				for _, m := range block.instructions {
@@ -826,7 +839,13 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 						continue
 					}
 					m.operands[j] = newValue(Variable, sibling, nil, nil)
+					rewrites++
 				}
+			}
+			if rewrites > 0 {
+				log.Warn("MIR SSA loop-header fixup: rewrote back-edge operands",
+					"block", block.firstPC, "height", height, "rewrites", rewrites,
+					"parents", len(block.parents))
 			}
 		}
 
