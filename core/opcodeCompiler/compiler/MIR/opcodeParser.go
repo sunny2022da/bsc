@@ -466,6 +466,16 @@ func constSnapToPC(v *Value) uint {
 func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 	stack := new(ValueStack)
 
+	if block != nil && block.firstPC == 3762 {
+		epoch := uint64(0)
+		if c != nil {
+			epoch = c.runtimeEpoch
+		}
+		hasEntry := block.entryStack != nil
+		fmt.Fprintf(os.Stderr, "[MIR B2] block=3762 getEntryStackForBlock ENTER runtimeEpoch=%d entryStack_nil=%v parents=%d incomingStacks=%d built=%v\n",
+			epoch, !hasEntry, len(block.parents), len(block.incomingStacks), block.built)
+	}
+
 	// Case 1: Entry block (true entry, no predecessors).
 	//
 	// IMPORTANT: the entry block can still gain predecessors later (e.g. due to a back-edge/self-loop
@@ -702,6 +712,18 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 				}
 			}
 		}
+		if block.firstPC == 3762 {
+			parentPCs := make([]uint, 0, len(block.parents))
+			for _, p := range block.parents {
+				if p != nil {
+					parentPCs = append(parentPCs, p.firstPC)
+				} else {
+					parentPCs = append(parentPCs, 0)
+				}
+			}
+			fmt.Fprintf(os.Stderr, "[MIR B2] block=3762 PHI-parse reached: hasBackEdge=%v IsLoopHeader=%v IsInLoop=%v height=%d parents=%v valid_snapshots=%d\n",
+				hasBackEdge, block.IsLoopHeader, block.IsInLoop, height, parentPCs, len(valid))
+		}
 
 		for i := 0; i < height; i++ {
 			base := valid[0][i]
@@ -909,6 +931,10 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 
 	// Case 3: Re-visit (Block already has an entry stack snapshot)
 	// We instantiate a working stack from the snapshot.
+	if block.firstPC == 3762 {
+		fmt.Fprintf(os.Stderr, "[MIR B2] block=3762 Case3 REVISIT entryStack_len=%d (PHI creation skipped)\n",
+			len(block.entryStack))
+	}
 	for _, val := range block.entryStack {
 		stack.push(&val)
 	}
