@@ -3616,11 +3616,14 @@ func (bc *BlockChain) traceCallTreeBothModes(parentRoot common.Hash, block *type
 	}
 
 	// jumpiRecord captures one JUMPI execution for cross-mode comparison.
+	// cfg is only populated for MIR mode — it holds a live reference to the executing
+	// CFG so we can dump it even after runtime eviction removes it from the cache.
 	type jumpiRecord struct {
 		pc    uint64
 		dest  uint64
 		cond  uint256.Int
 		taken bool
+		cfg   *mir.CFG
 	}
 
 	runWithTracer := func(label string, enableMIR bool) ([]callFrame, []jumpiRecord) {
@@ -3706,8 +3709,8 @@ func (bc *BlockChain) traceCallTreeBothModes(parentRoot common.Hash, block *type
 			runner := mir.NewEVMRunner(evm)
 			// For MIR mode: OnOpcode does not fire (MIR bypasses the stock EVM interpreter).
 			// Use the JUMPI hook instead to capture MIR's JUMPI decisions.
-			runner.SetMIRJumpiHook(func(pc, dest uint, cond *uint256.Int, taken bool) {
-				rec := jumpiRecord{pc: uint64(pc), dest: uint64(dest), taken: taken}
+			runner.SetMIRJumpiHook(func(pc, dest uint, cond *uint256.Int, taken bool, cfg *mir.CFG) {
+				rec := jumpiRecord{pc: uint64(pc), dest: uint64(dest), taken: taken, cfg: cfg}
 				if cond != nil {
 					rec.cond.Set(cond)
 				}
@@ -3796,12 +3799,23 @@ func (bc *BlockChain) traceCallTreeBothModes(parentRoot common.Hash, block *type
 				"mir.taken", mj.taken, "base.taken", bj.taken,
 			)
 			// Dump MIR around the diverging JUMPI PC for root-cause analysis.
-			// The contract executing this JUMPI is almost always the first diverging call's target.
-			if firstDivCallTo != nil {
+			// Prefer the live CFG captured in the jumpi record (includes runtime-discovered
+			// blocks that static Parse misses and that cache eviction removes). Fall back to
+			// cache / throwaway Parse by code hash only when the live CFG is unavailable.
+			window := uint(96)
+			pcStart := uint(0)
+			if uint(mj.pc) > window {
+				pcStart = uint(mj.pc) - window
+			}
+			if mj.cfg != nil {
+				dump := mir.DebugDumpMIRForEvmPCRange(mj.cfg, pcStart, uint(mj.pc)+window)
+				log.Error(fmt.Sprintf("MIR calltree: CFG dump near diverging JUMPI (live CFG, pc=%d):\n%s",
+					mj.pc, dump))
+			} else if firstDivCallTo != nil {
 				if db, derr := state.New(parentRoot, bc.statedb); derr == nil {
 					codeHash := db.GetCodeHash(*firstDivCallTo)
 					code := db.GetCode(*firstDivCallTo)
-					dump := mir.DumpMIRForCodeHash(codeHash, code, uint(mj.pc), 96)
+					dump := mir.DumpMIRForCodeHash(codeHash, code, uint(mj.pc), window)
 					log.Error(fmt.Sprintf("MIR calltree: CFG dump near diverging JUMPI (addr=%s codeHash=%s pc=%d codeLen=%d):\n%s",
 						firstDivCallTo.Hex(), codeHash.Hex(), mj.pc, len(code), dump))
 				} else {

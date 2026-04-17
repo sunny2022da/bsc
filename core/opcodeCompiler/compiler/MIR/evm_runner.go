@@ -140,10 +140,11 @@ type EVMRunner struct {
 	// (e.g., to also sample gasUsed/gasLeft). If set, it takes precedence over mirStepHook.
 	mirStepHookFactory func(it *MIRInterpreter) func(evmPC uint, evmOp byte, op MirOperation)
 
-	// Optional JUMPI hook: called for each MIR JUMPI with (pc, dest, cond, taken).
+	// Optional JUMPI hook: called for each MIR JUMPI with (pc, dest, cond, taken, cfg).
 	// Used by traceCallTreeBothModes in blockchain.go to identify the first JUMPI that MIR
-	// evaluates differently from the base EVM during a receipt-mismatch replay.
-	mirJumpiHook func(pc, dest uint, cond *uint256.Int, taken bool)
+	// evaluates differently from the base EVM during a receipt-mismatch replay. The cfg
+	// reference lets callers dump the live CFG before runtime eviction removes it from cache.
+	mirJumpiHook func(pc, dest uint, cond *uint256.Int, taken bool, cfg *CFG)
 
 	// fellBack is set to true whenever Run() yields to a fallback interpreter
 	// (base or opt) instead of executing via the MIR engine. Reset at the top
@@ -209,8 +210,10 @@ func (r *EVMRunner) SetMIRStepHookFactory(f func(it *MIRInterpreter) func(evmPC 
 }
 
 // SetMIRJumpiHook sets a hook called for each JUMPI executed by the MIR engine,
-// with (pc, dest, cond, taken). Intended for mismatch diagnosis in traceCallTreeBothModes.
-func (r *EVMRunner) SetMIRJumpiHook(h func(pc, dest uint, cond *uint256.Int, taken bool)) {
+// with (pc, dest, cond, taken, cfg). Intended for mismatch diagnosis in traceCallTreeBothModes.
+// The cfg parameter is a live reference to the executing CFG so callers can dump it before
+// runtime eviction (runtimeBecameDynamic) removes it from the global cache.
+func (r *EVMRunner) SetMIRJumpiHook(h func(pc, dest uint, cond *uint256.Int, taken bool, cfg *CFG)) {
 	if r == nil {
 		return
 	}

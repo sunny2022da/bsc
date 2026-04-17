@@ -179,7 +179,9 @@ type MIRInterpreter struct {
 	// Optional debug hook for JUMPI condition values. Called for each JUMPI with the evaluated
 	// destination, condition, and whether the branch was taken. Used by traceCallTreeBothModes in
 	// blockchain.go to compare MIR vs base-EVM JUMPI decisions when a receipt mismatch is detected.
-	jumpiHook func(pc uint, dest uint, cond *uint256.Int, taken bool)
+	// The cfg parameter is a live reference to the executing CFG so callers can dump it before
+	// runtime eviction (runtimeBecameDynamic) removes it from the global cache.
+	jumpiHook func(pc uint, dest uint, cond *uint256.Int, taken bool, cfg *CFG)
 
 	// Optional debug hook (used by tools): called when resolving a JUMP/JUMPI target PC to a basic block.
 	// existed indicates whether the CFG already had a block entry for targetPC.
@@ -630,9 +632,10 @@ func (it *MIRInterpreter) SetResolveHook(h func(fromFirstPC uint, fromEvmPC uint
 	it.resolveHook = h
 }
 
-// SetJumpiHook sets a hook called for each JUMPI execution with (pc, dest, cond, taken).
-// Used by traceCallTreeBothModes to compare MIR vs base-EVM JUMPI decisions.
-func (it *MIRInterpreter) SetJumpiHook(h func(pc uint, dest uint, cond *uint256.Int, taken bool)) {
+// SetJumpiHook sets a hook called for each JUMPI execution with (pc, dest, cond, taken, cfg).
+// Used by traceCallTreeBothModes to compare MIR vs base-EVM JUMPI decisions and to dump the
+// live CFG (which may later be evicted via runtimeBecameDynamic).
+func (it *MIRInterpreter) SetJumpiHook(h func(pc uint, dest uint, cond *uint256.Int, taken bool, cfg *CFG)) {
 	it.jumpiHook = h
 }
 
@@ -2470,7 +2473,7 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 				}
 				target := uint(dest.Uint64())
 				if it.jumpiHook != nil {
-					it.jumpiHook(m.evmPC, target, cond, !cond.IsZero())
+					it.jumpiHook(m.evmPC, target, cond, !cond.IsZero(), it.cfg)
 				}
 				if mirDebugBlock != 0 && it.blockNumber == mirDebugBlock {
 					log.Warn("MIR JUMPI", "addr", it.contractAddr, "pc", m.evmPC, "target", target, "cond", cond.Uint64(), "taken", !cond.IsZero())
