@@ -37,22 +37,22 @@ func DumpMIRForCodeHash(codeHash common.Hash, code []byte, pc, window uint) stri
 	return "[throwaway CFG, cache miss]\n" + DebugDumpMIRForEvmPCRange(tmp, start, end)
 }
 
-// addPCsOfMatchingMSTOREs scans all MSTORE instructions in cfg and appends the PCs
-// of those that could write to the memory slot read by an MLOAD with offset `loadOff`.
+// collectMatchingMSTOREs returns the PCs of MSTORE instructions that could write
+// to the memory slot read by an MLOAD with offset `loadOff`.
 //
 // Matching rules (over-approximating on purpose — this is a diagnostic dump):
 //   - If loadOff is Konst: match MSTOREs whose offset is Konst and equal. Also match
 //     MSTOREs whose offset is a Variable (dynamic — may or may not alias).
 //   - If loadOff is Variable: match all MSTOREs (can't resolve statically).
 //
-// We always accept a bounded number of matches to avoid dump-size explosions on
+// Capped at a bounded number of matches to avoid dump-size explosions on
 // contracts with hundreds of MSTOREs.
-func addPCsOfMatchingMSTOREs(cfg *CFG, loadOff *Value, visited map[uint]bool, out *[]uint) {
+func collectMatchingMSTOREs(cfg *CFG, loadOff *Value) []uint {
 	if cfg == nil || loadOff == nil {
-		return
+		return nil
 	}
 	const maxMatches = 32
-	matches := 0
+	out := make([]uint, 0, 8)
 	for _, b := range cfg.basicBlocks {
 		if b == nil {
 			continue
@@ -75,15 +75,15 @@ func addPCsOfMatchingMSTOREs(cfg *CFG, loadOff *Value, visited map[uint]bool, ou
 				// Dynamic MLOAD offset — conservatively include any MSTORE.
 				include = true
 			}
-			if include && !visited[m.evmPC] {
-				*out = append(*out, m.evmPC)
-				matches++
-				if matches >= maxMatches {
-					return
+			if include {
+				out = append(out, m.evmPC)
+				if len(out) >= maxMatches {
+					return out
 				}
 			}
 		}
 	}
+	return out
 }
 
 // DumpMIRWithOperandTraces dumps MIR instructions in a window around anchorPC and then
@@ -96,32 +96,30 @@ func DumpMIRWithOperandTraces(cfg *CFG, anchorPC uint, maxDepth int, window uint
 	if cfg == nil {
 		return "<nil cfg>\n"
 	}
-	// Map evmPC -> instruction (take the first one we find; multiple PHIs at the same PC
-	// will be covered by the range dump below).
 	type pcWindow struct{ start, end uint }
-	windows := make([]pcWindow, 0, 8)
-	visited := make(map[uint]bool, 32)
+
+	// toDump is the final set of PCs whose windows we will emit. Populated as
+	// soon as a PC is discovered (including PCs reached at the max-depth frontier
+	// that we will NOT expand further).
+	toDump := make(map[uint]bool, 32)
+	expanded := make(map[uint]bool, 32)
+
+	toDump[anchorPC] = true
 	queue := []uint{anchorPC}
 	level := 0
 
-	addWindow := func(pc uint) {
-		s := uint(0)
-		if pc > window {
-			s = pc - window
-		}
-		windows = append(windows, pcWindow{start: s, end: pc + window})
-	}
-
-	for level <= maxDepth && len(queue) > 0 {
+	for len(queue) > 0 && level <= maxDepth {
 		nextQueue := []uint{}
 		for _, pc := range queue {
-			if visited[pc] {
+			if expanded[pc] {
 				continue
 			}
-			visited[pc] = true
-			addWindow(pc)
-
-			// Walk instructions at this PC and follow operand defPCs.
+			expanded[pc] = true
+			// Only expand when we have budget left for another level.
+			if level >= maxDepth {
+				continue
+			}
+			// Walk instructions at this PC and follow dependencies.
 			for _, b := range cfg.basicBlocks {
 				if b == nil {
 					continue
@@ -130,13 +128,19 @@ func DumpMIRWithOperandTraces(cfg *CFG, anchorPC uint, maxDepth int, window uint
 					if m == nil || m.evmPC != pc {
 						continue
 					}
+					enqueue := func(newPC uint) {
+						if !toDump[newPC] {
+							toDump[newPC] = true
+							nextQueue = append(nextQueue, newPC)
+						} else if !expanded[newPC] {
+							nextQueue = append(nextQueue, newPC)
+						}
+					}
 					for _, v := range m.operands {
 						if v == nil || v.kind != Variable || v.def == nil {
 							continue
 						}
-						if !visited[v.def.evmPC] {
-							nextQueue = append(nextQueue, v.def.evmPC)
-						}
+						enqueue(v.def.evmPC)
 					}
 					// PHI nodes: follow the parents' exit edges so we can see where the
 					// incoming values come from (across block boundaries).
@@ -145,10 +149,7 @@ func DumpMIRWithOperandTraces(cfg *CFG, anchorPC uint, maxDepth int, window uint
 							if parent == nil || len(parent.instructions) == 0 {
 								continue
 							}
-							lastPC := parent.instructions[len(parent.instructions)-1].evmPC
-							if !visited[lastPC] {
-								nextQueue = append(nextQueue, lastPC)
-							}
+							enqueue(parent.instructions[len(parent.instructions)-1].evmPC)
 						}
 					}
 					// MLOAD: memory-flow dependency. Find MSTOREs that could write to the
@@ -156,13 +157,26 @@ func DumpMIRWithOperandTraces(cfg *CFG, anchorPC uint, maxDepth int, window uint
 					// statically). Follow both so the upstream value chain appears in dump.
 					if m.op == MirMLOAD && len(m.operands) > 0 && m.operands[0] != nil {
 						loadOff := m.operands[0]
-						addPCsOfMatchingMSTOREs(cfg, loadOff, visited, &nextQueue)
+						mstPCs := collectMatchingMSTOREs(cfg, loadOff)
+						for _, p := range mstPCs {
+							enqueue(p)
+						}
 					}
 				}
 			}
 		}
 		queue = nextQueue
 		level++
+	}
+
+	// Build windows from all discovered PCs.
+	windows := make([]pcWindow, 0, len(toDump))
+	for pc := range toDump {
+		s := uint(0)
+		if pc > window {
+			s = pc - window
+		}
+		windows = append(windows, pcWindow{start: s, end: pc + window})
 	}
 
 	// Merge overlapping windows.

@@ -3804,9 +3804,10 @@ func (bc *BlockChain) traceCallTreeBothModes(parentRoot common.Hash, block *type
 			// cache / throwaway Parse by code hash only when the live CFG is unavailable.
 			window := uint(96)
 			if mj.cfg != nil {
-				// Walk operand defPCs up to 3 levels so we capture the full data-flow feeding
-				// the JUMPI condition (MLOAD sources, upstream PHIs, memory stores, etc.).
-				dump := mir.DumpMIRWithOperandTraces(mj.cfg, uint(mj.pc), 3, window)
+				// Walk operand defPCs up to 6 levels. JUMPI → ISZERO → XOR → MLOAD →
+				// MSTORE (memory-flow) → stored PHI value → upstream PHI chain typically
+				// needs 5-6 hops to reach the PHI definitions in the outer loop header.
+				dump := mir.DumpMIRWithOperandTraces(mj.cfg, uint(mj.pc), 6, window)
 				log.Error(fmt.Sprintf("MIR calltree: CFG dump near diverging JUMPI (live CFG, pc=%d):\n%s",
 					mj.pc, dump))
 			} else if firstDivCallTo != nil {
