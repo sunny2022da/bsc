@@ -183,6 +183,11 @@ type MIRInterpreter struct {
 	// runtime eviction (runtimeBecameDynamic) removes it from the global cache.
 	jumpiHook func(pc uint, dest uint, cond *uint256.Int, taken bool, cfg *CFG)
 
+	// tracePhi: when true, evalPhi logs every resolution with the chosen path id,
+	// cur/prev block PCs, phi stack index, and resolved value. Used to locate the
+	// first PHI whose output diverges between MIR and base EVM.
+	tracePhi bool
+
 	// Optional debug hook (used by tools): called when resolving a JUMP/JUMPI target PC to a basic block.
 	// existed indicates whether the CFG already had a block entry for targetPC.
 	resolveHook func(fromFirstPC uint, fromEvmPC uint, targetPC uint, resolvedFirstPC uint, existed bool)
@@ -637,6 +642,12 @@ func (it *MIRInterpreter) SetResolveHook(h func(fromFirstPC uint, fromEvmPC uint
 // live CFG (which may later be evicted via runtimeBecameDynamic).
 func (it *MIRInterpreter) SetJumpiHook(h func(pc uint, dest uint, cond *uint256.Int, taken bool, cfg *CFG)) {
 	it.jumpiHook = h
+}
+
+// SetTracePhi enables or disables PHI resolution tracing. When enabled, evalPhi
+// logs every resolution with the chosen path id. Used for diagnostic replays only.
+func (it *MIRInterpreter) SetTracePhi(on bool) {
+	it.tracePhi = on
 }
 
 // SetDebugOperandHook registers a hook that receives selected opcode operands during execution.
@@ -4248,7 +4259,48 @@ func (it *MIRInterpreter) chargeSStoreEIP2929(slot common.Hash, newVal common.Ha
 	return it.chargeGas(cost + params.WarmStorageReadCostEIP2929)
 }
 
-func (it *MIRInterpreter) evalPhi(cur, prev *MIRBasicBlock, phi *MIR) (*uint256.Int, error) {
+func (it *MIRInterpreter) evalPhi(cur, prev *MIRBasicBlock, phi *MIR) (result *uint256.Int, retErr error) {
+	// phiPath tags which branch of evalPhi produced the result. Logged when it.tracePhi
+	// is on so an operator can see exactly which fallback path a divergent PHI took:
+	//   1 = step 1 operand-by-predecessor success
+	//   2 = step 2 incoming-stack snapshot (direct value)
+	//   3 = step 2 loop-carried via getResult
+	//   4 = step 2 loop-carried via defKeyToResIdx
+	//   5 = step 2 loop-carried returned 0 (no previous iteration)
+	//   6 = step 3 computeExitSnapshotForEdge
+	//   7 = step 4 resolveViaHistory
+	//   0 = error path
+	phiPath := 0
+	if it != nil && it.tracePhi {
+		defer func() {
+			valHex := "<nil>"
+			if result != nil {
+				valHex = result.Hex()
+			}
+			errStr := "<nil>"
+			if retErr != nil {
+				errStr = retErr.Error()
+			}
+			curPC := uint(0)
+			prevPC := uint(0)
+			if cur != nil {
+				curPC = cur.FirstPC()
+			}
+			if prev != nil {
+				prevPC = prev.FirstPC()
+			}
+			phiPC := uint(0)
+			phiIdx := 0
+			if phi != nil {
+				phiPC = phi.evmPC
+				phiIdx = phi.phiStackIndex
+			}
+			log.Warn("MIR PHI trace",
+				"curPC", curPC, "prevPC", prevPC,
+				"phiPC", phiPC, "phiIdx", phiIdx,
+				"path", phiPath, "val", valHex, "err", errStr)
+		}()
+	}
 	if cur == nil || phi == nil {
 		return nil, errors.New("nil phi context")
 	}
@@ -4319,6 +4371,7 @@ func (it *MIRInterpreter) evalPhi(cur, prev *MIRBasicBlock, phi *MIR) (*uint256.
 					}
 					it.debugPhiHook(cur.FirstPC(), prev.FirstPC(), phi.evmPC, phi.phiStackIndex, inLen, inIdx, *val)
 				}
+				phiPath = 1
 				return val, nil
 			}
 			break
@@ -4374,6 +4427,7 @@ func (it *MIRInterpreter) evalPhi(cur, prev *MIRBasicBlock, phi *MIR) (*uint256.
 					// loop iteration, use the cached result as the live-in value.
 					if v.kind == Variable && v.def != nil && v.def.defBlockNum == cur.blockNum {
 						if r, ok := it.getResult(v.def); ok && r != nil {
+							phiPath = 3
 							return r, nil
 						}
 						// After a CFG rebuild the snapshot still holds stale *MIR pointers whose
@@ -4384,6 +4438,7 @@ func (it *MIRInterpreter) evalPhi(cur, prev *MIRBasicBlock, phi *MIR) (*uint256.
 						if it.cfg != nil && it.cfg.defKeyToResIdx != nil {
 							if ridx, ok2 := it.cfg.defKeyToResIdx[keyForDef(v.def)]; ok2 && ridx > 0 {
 								if ridx < len(it.resultsGen) && it.resultsGen[ridx] == it.gen {
+									phiPath = 4
 									return &it.results[ridx], nil
 								}
 							}
@@ -4425,9 +4480,11 @@ func (it *MIRInterpreter) evalPhi(cur, prev *MIRBasicBlock, phi *MIR) (*uint256.
 								"curBuilt", cur.built,
 							)
 						}
+						phiPath = 5
 						return u256Zero, nil
 					}
 					v.liveIn = true
+					phiPath = 2
 					return it.evalValue(&v)
 				}
 			}
@@ -4449,6 +4506,7 @@ func (it *MIRInterpreter) evalPhi(cur, prev *MIRBasicBlock, phi *MIR) (*uint256.
 				if v.kind != Unknown {
 					val, err := it.evalValue(&v)
 					if err == nil && val != nil {
+						phiPath = 6
 						return val, nil
 					}
 				}
@@ -4462,6 +4520,7 @@ func (it *MIRInterpreter) evalPhi(cur, prev *MIRBasicBlock, phi *MIR) (*uint256.
 	// time, but the values themselves exist in runtime — they flowed through
 	// earlier blocks' exit stacks and are captured in the result table.
 	if val, ok := it.resolveViaHistory(prev, phi.phiStackIndex); ok {
+		phiPath = 7
 		return val, nil
 	}
 

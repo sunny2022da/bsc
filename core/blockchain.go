@@ -3716,6 +3716,10 @@ func (bc *BlockChain) traceCallTreeBothModes(parentRoot common.Hash, block *type
 				}
 				jumpis = append(jumpis, rec)
 			})
+			// Enable PHI resolution tracing so we can see which PHI fallback path
+			// each evaluation took and the resolved value. Written as log.Warn
+			// lines with a stable "MIR PHI trace" prefix so operators can grep.
+			runner.SetTracePhi(true)
 			evm.SetMIRRunner(runner)
 		}
 		gp := new(GasPool).AddGas(header.GasLimit)

@@ -146,6 +146,11 @@ type EVMRunner struct {
 	// reference lets callers dump the live CFG before runtime eviction removes it from cache.
 	mirJumpiHook func(pc, dest uint, cond *uint256.Int, taken bool, cfg *CFG)
 
+	// tracePhi: when true, the per-run interpreter logs every PHI resolution
+	// (path id + resolved value) so operators can correlate PHI outputs with
+	// the diverging JUMPI.
+	tracePhi bool
+
 	// fellBack is set to true whenever Run() yields to a fallback interpreter
 	// (base or opt) instead of executing via the MIR engine. Reset at the top
 	// of each Run() call. Readable via FellBack().
@@ -218,6 +223,15 @@ func (r *EVMRunner) SetMIRJumpiHook(h func(pc, dest uint, cond *uint256.Int, tak
 		return
 	}
 	r.mirJumpiHook = h
+}
+
+// SetTracePhi enables or disables PHI resolution tracing for this runner's
+// interpreter. Intended for mismatch diagnosis in traceCallTreeBothModes only.
+func (r *EVMRunner) SetTracePhi(on bool) {
+	if r == nil {
+		return
+	}
+	r.tracePhi = on
 }
 
 // FellBack reports whether the most recent Run() call used a fallback interpreter
@@ -442,6 +456,7 @@ func (r *EVMRunner) Run(contract *vm.Contract, input []byte, readOnly bool) ([]b
 		it.stepHook = r.mirStepHook
 	}
 	it.jumpiHook = r.mirJumpiHook
+	it.tracePhi = r.tracePhi
 
 	// Fork rules + block context (cached in runner)
 	it.blockNumber = r.blockNumber
