@@ -637,7 +637,16 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 			}
 		}
 		if len(valid) == 0 {
+			if block.firstPC == 3762 {
+				log.Warn("MIR block@3762 early return: valid empty",
+					"parents", len(block.parents),
+					"incomingCount", len(block.incomingStacks))
+			}
 			return stack
+		}
+		if block.firstPC == 3762 {
+			log.Warn("MIR block@3762 proceeding to PHI creation",
+				"validCount", len(valid), "parents", len(block.parents))
 		}
 		// EVM requires identical stack height at merge points. During dynamic CFG expansion we can
 		// temporarily record infeasible edges with a different stack height; padding them with
