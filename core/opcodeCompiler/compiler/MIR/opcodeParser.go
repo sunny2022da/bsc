@@ -6,6 +6,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/opcodeCompiler/compiler"
+	"github.com/ethereum/go-ethereum/log"
 	"github.com/holiman/uint256"
 )
 
@@ -231,8 +232,7 @@ func (c *CFG) Parse() error {
 	currentCFGBuild = c
 	defer func() { currentCFGBuild = nil }()
 
-	fmt.Fprintf(os.Stderr, "[MIR B2] Parse() ENTER codeAddr=%s codeLen=%d\n",
-		c.codeAddr, len(c.rawCode))
+	log.Info("[MIR B2] Parse() ENTER", "codeAddr", c.codeAddr, "codeLen", len(c.rawCode))
 
 	validJumpDests := c.JumpDests()
 	entryBlock := c.getOrCreateBlock(0)
@@ -475,8 +475,10 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 			epoch = c.runtimeEpoch
 		}
 		hasEntry := block.entryStack != nil
-		fmt.Fprintf(os.Stderr, "[MIR B2] block=3762 getEntryStackForBlock ENTER runtimeEpoch=%d entryStack_nil=%v parents=%d incomingStacks=%d built=%v\n",
-			epoch, !hasEntry, len(block.parents), len(block.incomingStacks), block.built)
+		log.Info("[MIR B2] block=3762 getEntryStackForBlock ENTER",
+			"runtimeEpoch", epoch, "entryStack_nil", !hasEntry,
+			"parents", len(block.parents), "incomingStacks", len(block.incomingStacks),
+			"built", block.built)
 	}
 
 	// Case 1: Entry block (true entry, no predecessors).
@@ -724,8 +726,10 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 					parentPCs = append(parentPCs, 0)
 				}
 			}
-			fmt.Fprintf(os.Stderr, "[MIR B2] block=3762 PHI-parse reached: hasBackEdge=%v IsLoopHeader=%v IsInLoop=%v height=%d parents=%v valid_snapshots=%d\n",
-				hasBackEdge, block.IsLoopHeader, block.IsInLoop, height, parentPCs, len(valid))
+			log.Info("[MIR B2] block=3762 PHI-parse reached",
+				"hasBackEdge", hasBackEdge, "IsLoopHeader", block.IsLoopHeader,
+				"IsInLoop", block.IsInLoop, "height", height,
+				"parents", fmt.Sprintf("%v", parentPCs), "valid_snapshots", len(valid))
 		}
 
 		for i := 0; i < height; i++ {
@@ -850,8 +854,8 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 				}
 			}
 			if dbg3762 {
-				fmt.Fprintf(os.Stderr, "[MIR B2] block=3762 entryDefToSibling_size=%d parents=%d\n",
-					len(entryDefToSibling), len(block.parents))
+				log.Info("[MIR B2] block=3762 entryDefToSibling built",
+					"size", len(entryDefToSibling), "parents", len(block.parents))
 			}
 
 			rewriteCount := 0
@@ -892,8 +896,10 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 					if !ok {
 						if dbg3762 {
 							skipNoSibling++
-							fmt.Fprintf(os.Stderr, "[MIR B2] block=3762 NO_SIBLING slot=%d phi.resIdx=%d op_back.def.resIdx=%d op_back.def.block=%d\n",
-								m.resIdx, m.resIdx, v.def.resIdx, v.def.defBlockNum)
+							log.Info("[MIR B2] block=3762 NO_SIBLING",
+								"phi.resIdx", m.resIdx,
+								"op_back.def.resIdx", v.def.resIdx,
+								"op_back.def.block", v.def.defBlockNum)
 						}
 						continue
 					}
@@ -904,16 +910,23 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 						continue
 					}
 					if dbg3762 {
-						fmt.Fprintf(os.Stderr, "[MIR B2] block=3762 REWRITE slot=%d phi.resIdx=%d -> sibling.resIdx=%d (was op_back.def.resIdx=%d block=%d)\n",
-							m.resIdx, m.resIdx, sibling.resIdx, v.def.resIdx, v.def.defBlockNum)
+						log.Info("[MIR B2] block=3762 REWRITE",
+							"phi.resIdx", m.resIdx,
+							"sibling.resIdx", sibling.resIdx,
+							"was.op_back.def.resIdx", v.def.resIdx,
+							"was.op_back.def.block", v.def.defBlockNum)
 					}
 					m.operands[j] = newValue(Variable, sibling, nil, nil)
 					rewriteCount++
 				}
 			}
 			if dbg3762 {
-				fmt.Fprintf(os.Stderr, "[MIR B2] block=3762 DONE rewrites=%d skip_same_block=%d skip_no_sibling=%d skip_sibling_self=%d skip_non_phi_op=%d\n",
-					rewriteCount, skipSameBlock, skipNoSibling, skipSiblingSelf, skipNonPhiOperand)
+				log.Info("[MIR B2] block=3762 DONE",
+					"rewrites", rewriteCount,
+					"skip_same_block", skipSameBlock,
+					"skip_no_sibling", skipNoSibling,
+					"skip_sibling_self", skipSiblingSelf,
+					"skip_non_phi_op", skipNonPhiOperand)
 			}
 		}
 
@@ -935,8 +948,8 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 	// Case 3: Re-visit (Block already has an entry stack snapshot)
 	// We instantiate a working stack from the snapshot.
 	if block.firstPC == 3762 {
-		fmt.Fprintf(os.Stderr, "[MIR B2] block=3762 Case3 REVISIT entryStack_len=%d (PHI creation skipped)\n",
-			len(block.entryStack))
+		log.Info("[MIR B2] block=3762 Case3 REVISIT (PHI creation skipped)",
+			"entryStack_len", len(block.entryStack))
 	}
 	for _, val := range block.entryStack {
 		stack.push(&val)
