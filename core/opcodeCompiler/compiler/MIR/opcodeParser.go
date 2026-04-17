@@ -828,6 +828,7 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 				phiByIdx[m.phiStackIndex] = m
 			}
 			rewrites := 0
+			debugHere := block.firstPC == 3762
 			for j, p := range block.parents {
 				if p == nil {
 					continue
@@ -835,6 +836,12 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 				// Back-edge identification: use the same textual heuristic as
 				// hasBackEdge above — parent's firstPC is at or beyond this block.
 				isBackEdgeParent := block.IsBackEdgeFrom(p) || p.firstPC >= block.firstPC
+				if debugHere {
+					log.Warn("MIR block@3762 fixup parent check",
+						"j", j, "parent.firstPC", p.firstPC,
+						"isBackEdgeFrom", block.IsBackEdgeFrom(p),
+						"isBackEdgeParent", isBackEdgeParent)
+				}
 				if !isBackEdgeParent {
 					continue
 				}
@@ -846,17 +853,34 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 						continue
 					}
 					v := m.operands[j]
-					if !v.liveIn || v.liveInPos < 0 || v.liveInPos >= height {
-						continue
+					reason := ""
+					if !v.liveIn {
+						reason = "liveIn=false"
+					} else if v.liveInPos < 0 {
+						reason = fmt.Sprintf("liveInPos<0(%d)", v.liveInPos)
+					} else if v.liveInPos >= height {
+						reason = fmt.Sprintf("liveInPos>=height(%d>=%d)", v.liveInPos, height)
+					} else if v.kind == Variable && v.def != nil && v.def.defBlockNum == block.blockNum && v.def.op != MirPHI {
+						reason = "body-def"
 					}
-					// Body-produced defs (non-PHI defined in this block) represent
-					// genuine new computations and must not be rewritten.
-					if v.kind == Variable && v.def != nil && v.def.defBlockNum == block.blockNum && v.def.op != MirPHI {
+					if reason != "" {
+						if debugHere {
+							log.Warn("MIR block@3762 fixup operand rejected",
+								"phiIdx", m.phiStackIndex, "j", j,
+								"reason", reason,
+								"v.kind", v.kind, "v.liveIn", v.liveIn, "v.liveInPos", v.liveInPos)
+						}
 						continue
 					}
 					targetPhiIdx := (height - 1) - v.liveInPos
 					sibling, ok := phiByIdx[targetPhiIdx]
 					if !ok || sibling == m {
+						if debugHere {
+							log.Warn("MIR block@3762 fixup no sibling",
+								"phiIdx", m.phiStackIndex, "j", j,
+								"targetPhiIdx", targetPhiIdx,
+								"sibling_nil", !ok, "sibling_self", ok && sibling == m)
+						}
 						continue
 					}
 					m.operands[j] = newValue(Variable, sibling, nil, nil)
