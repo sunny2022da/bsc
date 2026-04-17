@@ -795,6 +795,7 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 		// parent with firstPC >= block.firstPC is a textual back-edge and eligible
 		// for the rewrite.
 		if hasBackEdge {
+			dbg3762 := block.firstPC == 3762
 			// Build lookup from outer-PHI resIdx (as appears in op_entry) to the
 			// sibling PHI that carries that value at block entry.
 			entryDefToSibling := make(map[int]*MIR, height)
@@ -823,7 +824,13 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 					}
 				}
 			}
+			if dbg3762 {
+				fmt.Fprintf(os.Stderr, "[MIR B2] block=3762 entryDefToSibling_size=%d parents=%d\n",
+					len(entryDefToSibling), len(block.parents))
+			}
 
+			rewriteCount := 0
+			skipSameBlock, skipNoSibling, skipSiblingSelf, skipNonPhiOperand := 0, 0, 0, 0
 			for j, p := range block.parents {
 				if p == nil {
 					continue
@@ -841,21 +848,47 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 					}
 					v := m.operands[j]
 					if v.kind != Variable || v.def == nil || v.def.op != MirPHI {
+						if dbg3762 {
+							skipNonPhiOperand++
+						}
 						continue
 					}
 					// Skip if operand already references a same-block PHI (nothing to do).
 					if v.def.defBlockNum == block.blockNum {
+						if dbg3762 {
+							skipSameBlock++
+						}
 						continue
 					}
 					// Look up the sibling PHI whose entry-edge operand references the
 					// same outer PHI resIdx. That sibling IS the "previous-iteration
 					// value" this back-edge operand wants (shift-register semantics).
 					sibling, ok := entryDefToSibling[v.def.resIdx]
-					if !ok || sibling == m {
+					if !ok {
+						if dbg3762 {
+							skipNoSibling++
+							fmt.Fprintf(os.Stderr, "[MIR B2] block=3762 NO_SIBLING slot=%d phi.resIdx=%d op_back.def.resIdx=%d op_back.def.block=%d\n",
+								m.resIdx, m.resIdx, v.def.resIdx, v.def.defBlockNum)
+						}
 						continue
 					}
+					if sibling == m {
+						if dbg3762 {
+							skipSiblingSelf++
+						}
+						continue
+					}
+					if dbg3762 {
+						fmt.Fprintf(os.Stderr, "[MIR B2] block=3762 REWRITE slot=%d phi.resIdx=%d -> sibling.resIdx=%d (was op_back.def.resIdx=%d block=%d)\n",
+							m.resIdx, m.resIdx, sibling.resIdx, v.def.resIdx, v.def.defBlockNum)
+					}
 					m.operands[j] = newValue(Variable, sibling, nil, nil)
+					rewriteCount++
 				}
+			}
+			if dbg3762 {
+				fmt.Fprintf(os.Stderr, "[MIR B2] block=3762 DONE rewrites=%d skip_same_block=%d skip_no_sibling=%d skip_sibling_self=%d skip_non_phi_op=%d\n",
+					rewriteCount, skipSameBlock, skipNoSibling, skipSiblingSelf, skipNonPhiOperand)
 			}
 		}
 
