@@ -3803,12 +3803,10 @@ func (bc *BlockChain) traceCallTreeBothModes(parentRoot common.Hash, block *type
 			// blocks that static Parse misses and that cache eviction removes). Fall back to
 			// cache / throwaway Parse by code hash only when the live CFG is unavailable.
 			window := uint(96)
-			pcStart := uint(0)
-			if uint(mj.pc) > window {
-				pcStart = uint(mj.pc) - window
-			}
 			if mj.cfg != nil {
-				dump := mir.DebugDumpMIRForEvmPCRange(mj.cfg, pcStart, uint(mj.pc)+window)
+				// Walk operand defPCs up to 3 levels so we capture the full data-flow feeding
+				// the JUMPI condition (MLOAD sources, upstream PHIs, memory stores, etc.).
+				dump := mir.DumpMIRWithOperandTraces(mj.cfg, uint(mj.pc), 3, window)
 				log.Error(fmt.Sprintf("MIR calltree: CFG dump near diverging JUMPI (live CFG, pc=%d):\n%s",
 					mj.pc, dump))
 			} else if firstDivCallTo != nil {

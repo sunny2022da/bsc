@@ -37,6 +37,100 @@ func DumpMIRForCodeHash(codeHash common.Hash, code []byte, pc, window uint) stri
 	return "[throwaway CFG, cache miss]\n" + DebugDumpMIRForEvmPCRange(tmp, start, end)
 }
 
+// DumpMIRWithOperandTraces dumps MIR instructions in a window around anchorPC and then
+// recursively dumps windows around each operand's defPC (up to maxDepth levels), so the
+// full data-flow feeding a diverging JUMPI can be inspected in one log entry.
+//
+// For PHI operands, the enclosing basic block's parents are also followed so we can see
+// where the PHI's incoming values come from.
+func DumpMIRWithOperandTraces(cfg *CFG, anchorPC uint, maxDepth int, window uint) string {
+	if cfg == nil {
+		return "<nil cfg>\n"
+	}
+	// Map evmPC -> instruction (take the first one we find; multiple PHIs at the same PC
+	// will be covered by the range dump below).
+	type pcWindow struct{ start, end uint }
+	windows := make([]pcWindow, 0, 8)
+	visited := make(map[uint]bool, 32)
+	queue := []uint{anchorPC}
+	level := 0
+
+	addWindow := func(pc uint) {
+		s := uint(0)
+		if pc > window {
+			s = pc - window
+		}
+		windows = append(windows, pcWindow{start: s, end: pc + window})
+	}
+
+	for level <= maxDepth && len(queue) > 0 {
+		nextQueue := []uint{}
+		for _, pc := range queue {
+			if visited[pc] {
+				continue
+			}
+			visited[pc] = true
+			addWindow(pc)
+
+			// Walk instructions at this PC and follow operand defPCs.
+			for _, b := range cfg.basicBlocks {
+				if b == nil {
+					continue
+				}
+				for _, m := range b.instructions {
+					if m == nil || m.evmPC != pc {
+						continue
+					}
+					for _, v := range m.operands {
+						if v == nil || v.kind != Variable || v.def == nil {
+							continue
+						}
+						if !visited[v.def.evmPC] {
+							nextQueue = append(nextQueue, v.def.evmPC)
+						}
+					}
+					// For PHI nodes, also follow the parents' exit edges so we can see
+					// where the incoming values come from.
+					if m.op == MirPHI {
+						for _, parent := range b.parents {
+							if parent == nil || len(parent.instructions) == 0 {
+								continue
+							}
+							lastPC := parent.instructions[len(parent.instructions)-1].evmPC
+							if !visited[lastPC] {
+								nextQueue = append(nextQueue, lastPC)
+							}
+						}
+					}
+				}
+			}
+		}
+		queue = nextQueue
+		level++
+	}
+
+	// Merge overlapping windows.
+	sort.Slice(windows, func(i, j int) bool { return windows[i].start < windows[j].start })
+	merged := make([]pcWindow, 0, len(windows))
+	for _, w := range windows {
+		if len(merged) > 0 && w.start <= merged[len(merged)-1].end+1 {
+			if w.end > merged[len(merged)-1].end {
+				merged[len(merged)-1].end = w.end
+			}
+			continue
+		}
+		merged = append(merged, w)
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("MIR operand-trace dump anchored at evmPC=%d (maxDepth=%d window=%d, %d windows):\n",
+		anchorPC, maxDepth, window, len(merged)))
+	for _, w := range merged {
+		sb.WriteString(DebugDumpMIRForEvmPCRange(cfg, w.start, w.end))
+	}
+	return sb.String()
+}
+
 // DebugDumpMIRForEvmPCRange dumps MIR instructions whose originating EVM PC is within [start,end]
 // (inclusive). This is intended for debugging consensus divergences and should not be used in
 // hot production paths.
