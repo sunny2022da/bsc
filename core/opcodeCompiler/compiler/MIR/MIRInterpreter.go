@@ -4376,6 +4376,7 @@ func (it *MIRInterpreter) evalPhi(cur, prev *MIRBasicBlock, phi *MIR) (result *u
 	//
 	// By selecting the operand by predecessor identity (same ordering as build), we keep
 	// PHI resolution stable and avoid depending on snapshot length.
+	dbgBlock3762 := cur != nil && cur.FirstPC() == 3762
 	if len(phi.operands) > 0 && len(cur.parents) > 0 {
 		foundPrev := false
 		for opIdx, p := range cur.parents {
@@ -4384,12 +4385,62 @@ func (it *MIRInterpreter) evalPhi(cur, prev *MIRBasicBlock, phi *MIR) (result *u
 			}
 			foundPrev = true
 			if opIdx >= 0 && opIdx < len(phi.operands) && phi.operands[opIdx] != nil {
-				// Guard: the operand must not be a PHI defined in this same join block.
-				// That would be a "future def" at block entry (usually caused by a stale/incorrect
-				// incoming snapshot being specialized into the entry stack).
+				if dbgBlock3762 {
+					ov := phi.operands[opIdx]
+					opKind := "?"
+					opDefBlk := uint(0)
+					opDefResIdx := -1
+					opDefOp := -1
+					if ov != nil {
+						opKind = fmt.Sprintf("%d", ov.kind)
+						if ov.def != nil {
+							opDefBlk = ov.def.defBlockNum
+							opDefResIdx = ov.def.resIdx
+							opDefOp = int(ov.def.op)
+						}
+					}
+					snapLen := len(it.phiParallelSnap)
+					snapHas := false
+					if ov != nil && ov.def != nil {
+						_, snapHas = it.phiParallelSnap[ov.def.resIdx]
+					}
+					log.Info("[MIR B2] evalPhi block=3762 operand-select",
+						"prevPC", prev.FirstPC(),
+						"opIdx", opIdx,
+						"phi.resIdx", phi.resIdx,
+						"phi.phiStackIndex", phi.phiStackIndex,
+						"op.kind", opKind,
+						"op.def.block", opDefBlk,
+						"op.def.resIdx", opDefResIdx,
+						"op.def.op", opDefOp,
+						"snap.len", snapLen,
+						"snap.has", snapHas)
+				}
+				// Same-block PHI operand handling. This arises from two distinct sources:
+				//
+				// (1) Shift-register loop pattern: B2 parse-time fixup rewrites a
+				//     loop-header's back-edge operand to reference a sibling PHI in the
+				//     same block when the original operand was an outer-block PHI matching
+				//     some sibling's entry-edge operand resIdx. At runtime we read the
+				//     previous-iteration value from phiParallelSnap (captured at block
+				//     entry before any same-block PHI was updated this iteration) so
+				//     parallel-copy semantics hold across the iteration boundary.
+				//
+				// (2) "Future def" artifacts from stale/incorrect incoming snapshots
+				//     being specialized into the entry stack. These pre-date B2 and
+				//     were previously handled by breaking out to the snapshot-indexing
+				//     path below.
+				//
+				// Unified handling: if phiParallelSnap has an entry (case 1), use it;
+				// otherwise fall back to the snapshot-indexing path (case 2 legacy).
 				if ov := phi.operands[opIdx]; ov != nil && ov.kind == Variable && ov.def != nil &&
 					ov.def.op == MirPHI && ov.def.defBlockNum == cur.blockNum {
-					// fall back to snapshot indexing below
+					if snap, ok := it.phiParallelSnap[ov.def.resIdx]; ok {
+						snapCopy := snap
+						phiPath = 1
+						return &snapCopy, nil
+					}
+					// No snap entry: treat as legacy "future def" and fall back.
 					break
 				}
 				// Guard 2: Unknown live-in operands are placeholders inserted during PHI build
@@ -4409,23 +4460,6 @@ func (it *MIRInterpreter) evalPhi(cur, prev *MIRBasicBlock, phi *MIR) (result *u
 						)
 					}
 					break // fall to snapshot indexing below
-				}
-				// Parallel-copy semantics for loop-header PHIs: if the operand references
-				// a sibling PHI in the SAME block, read the previous-iteration value from
-				// the parallel snapshot (taken before any PHI in this block was updated
-				// this iteration) rather than the live result cache (which may already
-				// hold this iteration's update from a preceding sibling PHI).
-				if ov := phi.operands[opIdx]; ov != nil && ov.kind == Variable && ov.def != nil &&
-					ov.def.op == MirPHI && ov.def.defBlockNum == cur.blockNum {
-					if snap, ok := it.phiParallelSnap[ov.def.resIdx]; ok {
-						snapCopy := snap
-						phiPath = 1
-						return &snapCopy, nil
-					}
-					// No snapshot entry: previous iteration never wrote this PHI's result
-					// (shouldn't happen once the loop is running, but we guard anyway).
-					// Fall through to default evalValue, which may return an error; that
-					// triggers the snapshot-fallback path below.
 				}
 				val, err := it.evalValue(phi.operands[opIdx])
 				if err != nil {
