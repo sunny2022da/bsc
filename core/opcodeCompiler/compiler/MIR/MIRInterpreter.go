@@ -4440,7 +4440,32 @@ func (it *MIRInterpreter) evalPhi(cur, prev *MIRBasicBlock, phi *MIR) (result *u
 						phiPath = 1
 						return &snapCopy, nil
 					}
-					// No snap entry: treat as legacy "future def" and fall back.
+					// Snap missing: first back-edge iteration where the sibling PHI
+					// didn't exist during the initial entry-edge execution (block was
+					// rebuilt to insert loop-header PHIs after the back-edge was
+					// discovered). Fall back to the sibling's entry-edge operand,
+					// which represents the iteration-1 equivalent value for this
+					// shift-register slot.
+					siblingPhi := ov.def
+					for j, pp := range cur.parents {
+						if pp == nil || pp == prev {
+							continue
+						}
+						if j < len(siblingPhi.operands) && siblingPhi.operands[j] != nil {
+							val, err := it.evalValue(siblingPhi.operands[j])
+							if err == nil && val != nil {
+								if dbgBlock3762 {
+									log.Info("[MIR B2] evalPhi block=3762 snap-miss fallback to sibling.entry",
+										"phi.resIdx", phi.resIdx,
+										"sibling.resIdx", siblingPhi.resIdx,
+										"entry.parent.j", j)
+								}
+								phiPath = 1
+								return val, nil
+							}
+						}
+					}
+					// Couldn't locate entry-edge operand — treat as legacy "future def".
 					break
 				}
 				// Guard 2: Unknown live-in operands are placeholders inserted during PHI build
