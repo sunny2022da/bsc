@@ -1335,6 +1335,28 @@ retryBuild:
 			// Record exit stack snapshot (used by later PHI/merge logic)
 			exitSnap := stack.clone()
 			block.SetExitStack(exitSnap)
+			if traceStack {
+				for i, v := range exitSnap {
+					var dStr string
+					switch v.kind {
+					case Konst:
+						dStr = fmt.Sprintf("K(%x)", v.payload)
+					case Variable:
+						if v.def != nil {
+							dStr = fmt.Sprintf("V(defPC=%d defOp=%d defBlk=%d defResIdx=%d)", v.def.evmPC, v.def.op, v.def.defBlockNum, v.def.resIdx)
+						} else {
+							dStr = "V(nil)"
+						}
+					case Unknown:
+						dStr = fmt.Sprintf("UNK(liveInPos=%d)", v.liveInPos)
+					default:
+						dStr = "?"
+					}
+					log.Info("[MIR B2] STACK-TRACE exit-slot",
+						"block.firstPC", block.firstPC,
+						"slot", i, "val", dStr)
+				}
+			}
 			// Link to next block and record incoming snapshot
 			nextBlock := c.getOrCreateBlock(pc)
 			c.connectEdge(block, nextBlock, exitSnap)
