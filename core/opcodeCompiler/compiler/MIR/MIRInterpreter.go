@@ -1717,6 +1717,17 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 					return it.finishResult(ExecResult{Err: err})
 				}
 				it.setResult(m, v)
+				if cur != nil && cur.FirstPC() == 3762 && v != nil {
+					prevPC := uint(0)
+					if prev != nil {
+						prevPC = prev.FirstPC()
+					}
+					log.Info("[MIR B2] evalPhi block=3762 RESULT",
+						"prevPC", prevPC,
+						"phi.resIdx", m.resIdx,
+						"phi.phiStackIndex", m.phiStackIndex,
+						"val", v.Hex())
+				}
 
 			case MirPOP:
 				// effect already modeled by IR; no runtime action needed here
@@ -4474,13 +4485,28 @@ func (it *MIRInterpreter) evalPhi(cur, prev *MIRBasicBlock, phi *MIR) (result *u
 							continue
 						}
 						if j < len(siblingPhi.operands) && siblingPhi.operands[j] != nil {
+							sibOp := siblingPhi.operands[j]
+							sibOpDefBlk := uint(0)
+							sibOpDefResIdx := -1
+							sibOpKind := -1
+							if sibOp != nil {
+								sibOpKind = int(sibOp.kind)
+								if sibOp.def != nil {
+									sibOpDefBlk = sibOp.def.defBlockNum
+									sibOpDefResIdx = sibOp.def.resIdx
+								}
+							}
 							val, err := it.evalValue(siblingPhi.operands[j])
 							if err == nil && val != nil {
 								if dbgBlock3762 {
 									log.Info("[MIR B2] evalPhi block=3762 snap-miss fallback to sibling.entry",
 										"phi.resIdx", phi.resIdx,
 										"sibling.resIdx", siblingPhi.resIdx,
-										"entry.parent.j", j)
+										"entry.parent.j", j,
+										"sib.op.kind", sibOpKind,
+										"sib.op.def.block", sibOpDefBlk,
+										"sib.op.def.resIdx", sibOpDefResIdx,
+										"val", val.Hex())
 								}
 								phiPath = 1
 								return val, nil
