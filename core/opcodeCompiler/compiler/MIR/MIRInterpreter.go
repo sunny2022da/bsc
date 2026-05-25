@@ -4312,6 +4312,28 @@ func (it *MIRInterpreter) chargeSStoreEIP2929(slot common.Hash, newVal common.Ha
 }
 
 func (it *MIRInterpreter) evalPhi(cur, prev *MIRBasicBlock, phi *MIR) (result *uint256.Int, retErr error) {
+	if cur != nil && cur.FirstPC() == 3762 {
+		prevPC := uint(0)
+		if prev != nil {
+			prevPC = prev.FirstPC()
+		}
+		parentPCs := make([]uint, 0, len(cur.parents))
+		for _, p := range cur.parents {
+			if p != nil {
+				parentPCs = append(parentPCs, p.FirstPC())
+			} else {
+				parentPCs = append(parentPCs, 0)
+			}
+		}
+		var phiResIdx int
+		if phi != nil {
+			phiResIdx = phi.resIdx
+		}
+		log.Info("[MIR B2] evalPhi block=3762 INVOKED",
+			"prevPC", prevPC, "phi.resIdx", phiResIdx,
+			"cur.parents", fmt.Sprintf("%v", parentPCs),
+			"cur.built", cur.built)
+	}
 	// phiPath tags which branch of evalPhi produced the result. Logged when it.tracePhi
 	// is on so an operator can see exactly which fallback path a divergent PHI took:
 	//   1 = step 1 operand-by-predecessor success
