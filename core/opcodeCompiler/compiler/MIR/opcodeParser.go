@@ -3,6 +3,7 @@ package MIR
 import (
 	"fmt"
 	"os"
+	"sort"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/opcodeCompiler/compiler"
@@ -402,11 +403,20 @@ func (c *CFG) Parse() error {
 	log.Info("[MIR B2] BLOCK-DUMP pcToBlock summary",
 		"pcToBlock.size", len(c.pcToBlock),
 		"basicBlocks.size", len(c.basicBlocks))
-	// Show a few specific PCs near 3754/3762/3793.
-	for pc := uint(3700); pc < 3900; pc++ {
-		if b, ok := c.pcToBlock[pc]; ok && b != nil {
-			log.Info("[MIR B2] BLOCK-DUMP nearby", "pc", pc, "blockNum", b.blockNum)
+	// Sort and print all firstPCs to see the actual block boundaries.
+	sortedPCs := make([]int, 0, len(c.pcToBlock))
+	for pc := range c.pcToBlock {
+		sortedPCs = append(sortedPCs, int(pc))
+	}
+	sort.Ints(sortedPCs)
+	for _, pc := range sortedPCs {
+		if pc < 3500 || pc > 4000 {
+			continue
 		}
+		b := c.pcToBlock[uint(pc)]
+		log.Info("[MIR B2] BLOCK-DUMP nearby", "pc", pc, "blockNum", b.blockNum,
+			"built", b.built, "instructions.len", len(b.instructions),
+			"parents.len", len(b.parents))
 	}
 	_ = allPCs
 	for _, pc := range []uint{3754, 3762, 3793} {
