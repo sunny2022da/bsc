@@ -384,13 +384,24 @@ func (c *CFG) Parse() error {
 	c.parseDone = true
 
 	// One-shot dump of block@3754/3762/3793 instructions for shift-register debugging.
-	for _, b := range c.basicBlocks {
+	for _, pc := range []uint{3754, 3762, 3793} {
+		b := c.pcToBlock[pc]
 		if b == nil {
+			log.Info("[MIR B2] BLOCK-DUMP missing", "pc", pc)
 			continue
 		}
-		if b.firstPC != 3754 && b.firstPC != 3762 && b.firstPC != 3793 {
-			continue
+		parentPCs := make([]uint, 0, len(b.parents))
+		for _, p := range b.parents {
+			if p != nil {
+				parentPCs = append(parentPCs, p.firstPC)
+			}
 		}
+		log.Info("[MIR B2] BLOCK-DUMP header",
+			"firstPC", b.firstPC, "blockNum", b.blockNum,
+			"instructions.len", len(b.instructions),
+			"built", b.built,
+			"entryStack.nil", b.entryStack == nil,
+			"parents", fmt.Sprintf("%v", parentPCs))
 		for i, m := range b.instructions {
 			if m == nil {
 				continue
