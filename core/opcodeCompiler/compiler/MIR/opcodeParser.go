@@ -382,6 +382,54 @@ func (c *CFG) Parse() error {
 	// Mark parse as complete. connectEdge uses this to detect runtime snapshot changes
 	// that occur without epoch protection and to enable epoch tracking for future runs.
 	c.parseDone = true
+
+	// One-shot dump of block@3754/3762/3793 instructions for shift-register debugging.
+	for _, b := range c.basicBlocks {
+		if b == nil {
+			continue
+		}
+		if b.firstPC != 3754 && b.firstPC != 3762 && b.firstPC != 3793 {
+			continue
+		}
+		for i, m := range b.instructions {
+			if m == nil {
+				continue
+			}
+			opStr := ""
+			for k, o := range m.operands {
+				if o == nil {
+					opStr += fmt.Sprintf(" op%d=nil", k)
+					continue
+				}
+				switch o.kind {
+				case Konst:
+					opStr += fmt.Sprintf(" op%d=K(%x)", k, o.payload)
+				case Variable:
+					if o.def != nil {
+						opStr += fmt.Sprintf(" op%d=V(defPC=%d defOp=%d defBlk=%d defResIdx=%d)",
+							k, o.def.evmPC, o.def.op, o.def.defBlockNum, o.def.resIdx)
+					} else {
+						opStr += fmt.Sprintf(" op%d=V(nil)", k)
+					}
+				case Unknown:
+					opStr += fmt.Sprintf(" op%d=UNK(liveInPos=%d)", k, o.liveInPos)
+				case RuntimeVal:
+					opStr += fmt.Sprintf(" op%d=RT(srcBlkPC=%d stackPos=%d)", k, o.rtSourceBlockPC, o.rtStackPos)
+				default:
+					opStr += fmt.Sprintf(" op%d=?", k)
+				}
+			}
+			log.Info("[MIR B2] BLOCK-DUMP",
+				"block.firstPC", b.firstPC,
+				"idx", i,
+				"evmPC", m.evmPC,
+				"mirOp", m.op,
+				"resIdx", m.resIdx,
+				"phiStackIndex", m.phiStackIndex,
+				"ops", opStr)
+		}
+	}
+
 	return nil
 }
 
