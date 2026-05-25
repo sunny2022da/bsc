@@ -394,6 +394,21 @@ func (c *CFG) Parse() error {
 	if c.codeAddr != targetHash {
 		return nil
 	}
+	// Dump pcToBlock summary first.
+	allPCs := make([]uint, 0, len(c.pcToBlock))
+	for pc := range c.pcToBlock {
+		allPCs = append(allPCs, pc)
+	}
+	log.Info("[MIR B2] BLOCK-DUMP pcToBlock summary",
+		"pcToBlock.size", len(c.pcToBlock),
+		"basicBlocks.size", len(c.basicBlocks))
+	// Show a few specific PCs near 3754/3762/3793.
+	for pc := uint(3700); pc < 3900; pc++ {
+		if b, ok := c.pcToBlock[pc]; ok && b != nil {
+			log.Info("[MIR B2] BLOCK-DUMP nearby", "pc", pc, "blockNum", b.blockNum)
+		}
+	}
+	_ = allPCs
 	for _, pc := range []uint{3754, 3762, 3793} {
 		b := c.pcToBlock[pc]
 		if b == nil {
