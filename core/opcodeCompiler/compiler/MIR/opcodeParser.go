@@ -1302,12 +1302,29 @@ retryBuild:
 	}
 	initHeight := stack.size()
 
+	traceStack := c.codeAddr == common.HexToHash("0xeb7764bd977fcb339cd6e661713f4aa19e5365c98c3ea788fcea59abca46e838") &&
+		(block.firstPC == 3754 || block.firstPC == 3762 || block.firstPC == 3793)
+	if traceStack {
+		log.Info("[MIR B2] STACK-TRACE start",
+			"block.firstPC", block.firstPC,
+			"initHeight", initHeight,
+			"bm", bm)
+	}
+
 	for pc < codeLen {
 		op := compiler.ByteCode(c.rawCode[pc])
 
 		// Global tracking for MIR generation
 		currentEVMBuildPC = pc
 		currentEVMBuildOp = byte(op)
+
+		if traceStack {
+			log.Info("[MIR B2] STACK-TRACE step",
+				"block.firstPC", block.firstPC,
+				"pc", pc,
+				"op", fmt.Sprintf("0x%02x", byte(op)),
+				"stackHeight.before", stack.size())
+		}
 
 		// 2. Check for Basic Block Boundaries (Implicit)
 		// If we are NOT at the start of the block, but we hit a JUMPDEST,
