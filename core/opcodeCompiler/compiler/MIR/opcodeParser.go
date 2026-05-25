@@ -386,9 +386,12 @@ func (c *CFG) Parse() error {
 	// One-shot dump of block@3754/3762/3793 instructions for shift-register debugging.
 	// Only dump for the contract we're chasing (0x2E90F2eB46ee35Bb179C10513D3F7fE8b0693254
 	// → codeHash 0xeb7764bd977fcb339cd6e661713f4aa19e5365c98c3ea788fcea59abca46e838).
-	if c.codeAddr != (common.Hash{0xeb, 0x77, 0x64, 0xbd, 0x97, 0x7f, 0xcb, 0x33,
-		0x9c, 0xd6, 0xe6, 0x61, 0x71, 0x3f, 0x4a, 0xa1, 0x9e, 0x53, 0x65, 0xc9,
-		0x8c, 0x3e, 0xa7, 0x88, 0xfc, 0xea, 0x59, 0xab, 0xca, 0x46, 0xe8, 0x38}) {
+	targetHash := common.HexToHash("0xeb7764bd977fcb339cd6e661713f4aa19e5365c98c3ea788fcea59abca46e838")
+	log.Info("[MIR B2] BLOCK-DUMP filter check",
+		"c.codeAddr", c.codeAddr,
+		"target", targetHash,
+		"match", c.codeAddr == targetHash)
+	if c.codeAddr != targetHash {
 		return nil
 	}
 	for _, pc := range []uint{3754, 3762, 3793} {
