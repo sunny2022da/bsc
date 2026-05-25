@@ -4340,10 +4340,15 @@ func (it *MIRInterpreter) evalPhi(cur, prev *MIRBasicBlock, phi *MIR) (result *u
 		if phi != nil {
 			phiResIdx = phi.resIdx
 		}
+		cfgHash := "<nil>"
+		if it.cfg != nil {
+			cfgHash = it.cfg.codeAddr.Hex()
+		}
 		log.Info("[MIR B2] evalPhi block=3762 INVOKED",
 			"prevPC", prevPC, "phi.resIdx", phiResIdx,
 			"cur.parents", fmt.Sprintf("%v", parentPCs),
-			"cur.built", cur.built)
+			"cur.built", cur.built,
+			"cfg.codeAddr", cfgHash)
 	}
 	// phiPath tags which branch of evalPhi produced the result. Logged when it.tracePhi
 	// is on so an operator can see exactly which fallback path a divergent PHI took:
