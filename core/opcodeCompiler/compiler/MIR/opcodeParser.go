@@ -395,6 +395,68 @@ func (c *CFG) Parse() error {
 	if c.codeAddr != targetHash {
 		return nil
 	}
+	// Find and dump blocks containing PHIs with resIdx in [2804, 2809] (outer
+	// PHIs that feed block@3762's entry-edge operands).
+	for _, b := range c.basicBlocks {
+		if b == nil {
+			continue
+		}
+		hasTarget := false
+		for _, m := range b.instructions {
+			if m != nil && m.op == MirPHI && m.resIdx >= 2804 && m.resIdx <= 2809 {
+				hasTarget = true
+				break
+			}
+		}
+		if !hasTarget {
+			continue
+		}
+		parentPCs := make([]uint, 0, len(b.parents))
+		for _, p := range b.parents {
+			if p != nil {
+				parentPCs = append(parentPCs, p.firstPC)
+			}
+		}
+		log.Info("[MIR B2] OUTER-PHI BLOCK header",
+			"firstPC", b.firstPC, "blockNum", b.blockNum,
+			"instructions.len", len(b.instructions),
+			"parents", fmt.Sprintf("%v", parentPCs))
+		for i, m := range b.instructions {
+			if m == nil {
+				continue
+			}
+			opStr := ""
+			for k, o := range m.operands {
+				if o == nil {
+					opStr += fmt.Sprintf(" op%d=nil", k)
+					continue
+				}
+				switch o.kind {
+				case Konst:
+					opStr += fmt.Sprintf(" op%d=K(%x)", k, o.payload)
+				case Variable:
+					if o.def != nil {
+						opStr += fmt.Sprintf(" op%d=V(defPC=%d defOp=%d defBlk=%d defResIdx=%d)",
+							k, o.def.evmPC, o.def.op, o.def.defBlockNum, o.def.resIdx)
+					} else {
+						opStr += fmt.Sprintf(" op%d=V(nil)", k)
+					}
+				case Unknown:
+					opStr += fmt.Sprintf(" op%d=UNK(liveInPos=%d)", k, o.liveInPos)
+				case RuntimeVal:
+					opStr += fmt.Sprintf(" op%d=RT(srcBlkPC=%d stackPos=%d)", k, o.rtSourceBlockPC, o.rtStackPos)
+				default:
+					opStr += fmt.Sprintf(" op%d=?", k)
+				}
+			}
+			log.Info("[MIR B2] OUTER-PHI BLOCK",
+				"firstPC", b.firstPC,
+				"idx", i, "evmPC", m.evmPC,
+				"mirOp", m.op, "resIdx", m.resIdx,
+				"phiStackIndex", m.phiStackIndex,
+				"ops", opStr)
+		}
+	}
 	// Dump pcToBlock summary first.
 	allPCs := make([]uint, 0, len(c.pcToBlock))
 	for pc := range c.pcToBlock {

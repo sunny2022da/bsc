@@ -1788,6 +1788,20 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 					return it.finishResult(ExecResult{Err: err})
 				}
 				it.setResult(m, v)
+				if m.resIdx >= 2804 && m.resIdx <= 2809 && v != nil {
+					prevPC := uint(0)
+					if prev != nil {
+						prevPC = prev.FirstPC()
+					}
+					curPC := uint(0)
+					if cur != nil {
+						curPC = cur.FirstPC()
+					}
+					log.Info("[MIR B2] OUTER-PHI RESULT",
+						"phi.resIdx", m.resIdx,
+						"curPC", curPC, "prevPC", prevPC,
+						"val", v.Hex())
+				}
 				if cur != nil && cur.FirstPC() == 3762 && v != nil {
 					prevPC := uint(0)
 					if prev != nil {
@@ -4394,6 +4408,51 @@ func (it *MIRInterpreter) chargeSStoreEIP2929(slot common.Hash, newVal common.Ha
 }
 
 func (it *MIRInterpreter) evalPhi(cur, prev *MIRBasicBlock, phi *MIR) (result *uint256.Int, retErr error) {
+	if phi != nil && phi.resIdx >= 2804 && phi.resIdx <= 2809 {
+		// Trace outer PHIs whose results feed phi_2841 entry-edge operand.
+		prevPC := uint(0)
+		if prev != nil {
+			prevPC = prev.FirstPC()
+		}
+		curPC := uint(0)
+		if cur != nil {
+			curPC = cur.FirstPC()
+		}
+		parentPCs := make([]uint, 0, len(cur.parents))
+		for _, p := range cur.parents {
+			if p != nil {
+				parentPCs = append(parentPCs, p.FirstPC())
+			}
+		}
+		opDescs := make([]string, len(phi.operands))
+		for j, o := range phi.operands {
+			if o == nil {
+				opDescs[j] = "nil"
+				continue
+			}
+			switch o.kind {
+			case Konst:
+				opDescs[j] = fmt.Sprintf("K(%x)", o.payload)
+			case Variable:
+				if o.def != nil {
+					opDescs[j] = fmt.Sprintf("V(defPC=%d defOp=%d defBlk=%d defResIdx=%d)", o.def.evmPC, o.def.op, o.def.defBlockNum, o.def.resIdx)
+				} else {
+					opDescs[j] = "V(nil)"
+				}
+			case Unknown:
+				opDescs[j] = "UNK"
+			case RuntimeVal:
+				opDescs[j] = fmt.Sprintf("RT(srcBlkPC=%d stackPos=%d)", o.rtSourceBlockPC, o.rtStackPos)
+			default:
+				opDescs[j] = "?"
+			}
+		}
+		log.Info("[MIR B2] OUTER-PHI evalPhi INVOKED",
+			"phi.resIdx", phi.resIdx,
+			"curPC", curPC, "prevPC", prevPC,
+			"parents", fmt.Sprintf("%v", parentPCs),
+			"operands", fmt.Sprintf("%v", opDescs))
+	}
 	if cur != nil && cur.FirstPC() == 3762 {
 		prevPC := uint(0)
 		if prev != nil {
