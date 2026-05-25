@@ -384,10 +384,17 @@ func (c *CFG) Parse() error {
 	c.parseDone = true
 
 	// One-shot dump of block@3754/3762/3793 instructions for shift-register debugging.
+	// Only dump for the contract we're chasing (0x2E90F2eB46ee35Bb179C10513D3F7fE8b0693254
+	// → codeHash 0xeb7764bd977fcb339cd6e661713f4aa19e5365c98c3ea788fcea59abca46e838).
+	if c.codeAddr != (common.Hash{0xeb, 0x77, 0x64, 0xbd, 0x97, 0x7f, 0xcb, 0x33,
+		0x9c, 0xd6, 0xe6, 0x61, 0x71, 0x3f, 0x4a, 0xa1, 0x9e, 0x53, 0x65, 0xc9,
+		0x8c, 0x3e, 0xa7, 0x88, 0xfc, 0xea, 0x59, 0xab, 0xca, 0x46, 0xe8, 0x38}) {
+		return nil
+	}
 	for _, pc := range []uint{3754, 3762, 3793} {
 		b := c.pcToBlock[pc]
 		if b == nil {
-			log.Info("[MIR B2] BLOCK-DUMP missing", "pc", pc)
+			log.Info("[MIR B2] BLOCK-DUMP missing", "codeAddr", c.codeAddr, "pc", pc)
 			continue
 		}
 		parentPCs := make([]uint, 0, len(b.parents))
@@ -396,12 +403,20 @@ func (c *CFG) Parse() error {
 				parentPCs = append(parentPCs, p.firstPC)
 			}
 		}
+		childPCs := make([]uint, 0, len(b.Children()))
+		for _, ch := range b.Children() {
+			if ch != nil {
+				childPCs = append(childPCs, ch.firstPC)
+			}
+		}
 		log.Info("[MIR B2] BLOCK-DUMP header",
+			"codeAddr", c.codeAddr,
 			"firstPC", b.firstPC, "blockNum", b.blockNum,
 			"instructions.len", len(b.instructions),
 			"built", b.built,
 			"entryStack.nil", b.entryStack == nil,
-			"parents", fmt.Sprintf("%v", parentPCs))
+			"parents", fmt.Sprintf("%v", parentPCs),
+			"children", fmt.Sprintf("%v", childPCs))
 		for i, m := range b.instructions {
 			if m == nil {
 				continue
