@@ -785,29 +785,8 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 				}
 				modeCnt := -1
 				modeLen = -1
-				// For loop headers, prefer the LARGER height on ties: dropping the
-				// bottom of an entry-edge stack discards values that downstream
-				// blocks may still reference, causing shift-register loops to use
-				// wrong slot values. For non-loop blocks keep the original "smaller
-				// is safer" behavior.
-				preferLarger := false
-				if c != nil {
-					c.EnsureLoopInfo()
-					preferLarger = block.IsLoopHeader || block.IsInLoop
-				}
-				if !preferLarger {
-					for _, p := range block.parents {
-						if p != nil && p.firstPC >= block.firstPC {
-							preferLarger = true
-							break
-						}
-					}
-				}
 				for l, c := range counts {
-					tieBreak := (c == modeCnt && (modeLen < 0 ||
-						(preferLarger && l > modeLen) ||
-						(!preferLarger && l < modeLen)))
-					if c > modeCnt || tieBreak {
+					if c > modeCnt || (c == modeCnt && (modeLen < 0 || l < modeLen)) {
 						modeLen = l
 						modeCnt = c
 					}
