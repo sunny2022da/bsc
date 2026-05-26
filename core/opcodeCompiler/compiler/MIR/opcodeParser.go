@@ -395,6 +395,44 @@ func (c *CFG) Parse() error {
 	if c.codeAddr != targetHash {
 		return nil
 	}
+	// Walk back from block@3762 through parents to find where the 38-slot
+	// stock-stack-height stops aligning with parse-time tracking.
+	visited := map[*MIRBasicBlock]bool{}
+	var walk func(b *MIRBasicBlock, depth int)
+	walk = func(b *MIRBasicBlock, depth int) {
+		if b == nil || visited[b] || depth > 8 {
+			return
+		}
+		visited[b] = true
+		parentPCs := make([]uint, 0, len(b.parents))
+		for _, p := range b.parents {
+			if p != nil {
+				parentPCs = append(parentPCs, p.firstPC)
+			}
+		}
+		entryLen := -1
+		if b.entryStack != nil {
+			entryLen = len(b.entryStack)
+		}
+		exitLen := -1
+		if b.ExitStack() != nil {
+			exitLen = len(b.ExitStack())
+		}
+		log.Info("[MIR B2] PARENT-CHAIN",
+			"depth", depth,
+			"firstPC", b.firstPC,
+			"blockNum", b.blockNum,
+			"built", b.built,
+			"entryStack.len", entryLen,
+			"exitStack.len", exitLen,
+			"parents", fmt.Sprintf("%v", parentPCs))
+		for _, p := range b.parents {
+			walk(p, depth+1)
+		}
+	}
+	if root := c.pcToBlock[3762]; root != nil {
+		walk(root, 0)
+	}
 	// Find and dump blocks containing PHIs with resIdx in [2804, 2809] (outer
 	// PHIs that feed block@3762's entry-edge operands).
 	for _, b := range c.basicBlocks {
@@ -1365,7 +1403,7 @@ retryBuild:
 	initHeight := stack.size()
 
 	traceStack := c.codeAddr == common.HexToHash("0xeb7764bd977fcb339cd6e661713f4aa19e5365c98c3ea788fcea59abca46e838") &&
-		(block.firstPC == 3754 || block.firstPC == 3762 || block.firstPC == 3793)
+		(block.firstPC == 3373 || block.firstPC == 3754 || block.firstPC == 3762 || block.firstPC == 3793)
 	if traceStack {
 		log.Info("[MIR B2] STACK-TRACE start",
 			"block.firstPC", block.firstPC,
