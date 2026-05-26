@@ -1398,6 +1398,18 @@ func (it *MIRInterpreter) RunFrom(entryPC uint) ExecResult {
 		// Reset the local instruction cursor for this block execution.
 		blockPos = 0
 		it.curEvmOpIndex = -1
+
+		if cur != nil && cur.FirstPC() == 3762 {
+			prevPC := uint(0)
+			if prev != nil {
+				prevPC = prev.FirstPC()
+			}
+			log.Info("[MIR B2] BLOCK-ENTRY 3762",
+				"prevPC", prevPC,
+				"cur.built", cur.built,
+				"instructions.len", len(cur.instructions),
+				"parents.len", len(cur.parents))
+		}
 		it.curBlockConstPrefix = it.ensureBlockConstPrefix(cur)
 		it.curBlockConstDelta, it.curBlockConstTail = it.ensureBlockConstDelta(cur)
 

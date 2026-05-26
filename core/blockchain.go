@@ -3676,6 +3676,18 @@ func (bc *BlockChain) traceCallTreeBothModes(parentRoot common.Hash, block *type
 						})
 					}
 				}
+				// Dump full stack at PC=3762 (block@3762 entry) for stock-vs-MIR shift-register debugging.
+				if pc == 3762 && !enableMIR {
+					stackData := scope.StackData()
+					vals := make([]string, 0, len(stackData))
+					for i := len(stackData) - 1; i >= 0; i-- {
+						vals = append(vals, stackData[i].Hex())
+					}
+					log.Info("[MIR B2] BASE-STACK at PC=3762",
+						"mode", label, "depth", depth,
+						"height", len(stackData),
+						"top→bot", fmt.Sprintf("%v", vals))
+				}
 			},
 		}
 
