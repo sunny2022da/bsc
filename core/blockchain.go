@@ -3688,6 +3688,12 @@ func (bc *BlockChain) traceCallTreeBothModes(parentRoot common.Hash, block *type
 						"height", len(stackData),
 						"top→bot", fmt.Sprintf("%v", vals))
 				}
+				// Probe stack height at ancestor PCs to find where parse and stock diverge.
+				if !enableMIR && (pc == 3373 || pc == 3754 || pc == 3793) {
+					log.Info("[MIR B2] BASE-HEIGHT",
+						"mode", label, "depth", depth,
+						"pc", pc, "height", len(scope.StackData()))
+				}
 			},
 		}
 
