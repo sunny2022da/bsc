@@ -1162,7 +1162,26 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 // connectEdge links parent -> child and records the incoming stack snapshot for child.
 // If the incoming snapshot for this (parent,child) pair changed, invalidate child's entry stack
 // and mark it for rebuild (PHI may be required later).
+func (c *CFG) connectEdgeTraceLog(parent, child *MIRBasicBlock, exitSnapshot []Value) {
+	if c == nil || parent == nil || child == nil {
+		return
+	}
+	if c.codeAddr != common.HexToHash("0xeb7764bd977fcb339cd6e661713f4aa19e5365c98c3ea788fcea59abca46e838") {
+		return
+	}
+	if child.firstPC != 3373 && child.firstPC != 3754 && child.firstPC != 3762 && child.firstPC != 3793 {
+		return
+	}
+	log.Info("[MIR B2] CONNECT-EDGE",
+		"parent.firstPC", parent.firstPC,
+		"child.firstPC", child.firstPC,
+		"snap.len", len(exitSnapshot),
+		"parseDone", c.parseDone,
+		"runtimeEpoch", c.runtimeEpoch)
+}
+
 func (c *CFG) connectEdge(parent, child *MIRBasicBlock, exitSnapshot []Value) {
+	c.connectEdgeTraceLog(parent, child, exitSnapshot)
 	if parent == nil || child == nil {
 		return
 	}
