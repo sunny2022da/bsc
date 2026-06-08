@@ -1169,7 +1169,8 @@ func (c *CFG) connectEdgeTraceLog(parent, child *MIRBasicBlock, exitSnapshot []V
 	if c.codeAddr != common.HexToHash("0xeb7764bd977fcb339cd6e661713f4aa19e5365c98c3ea788fcea59abca46e838") {
 		return
 	}
-	if child.firstPC != 2877 && child.firstPC != 3299 &&
+	if child.firstPC != 2848 && child.firstPC != 3236 &&
+		child.firstPC != 2877 && child.firstPC != 3299 &&
 		child.firstPC != 3373 && child.firstPC != 3754 &&
 		child.firstPC != 3762 && child.firstPC != 3793 {
 		return
@@ -1424,7 +1425,8 @@ retryBuild:
 	initHeight := stack.size()
 
 	traceStack := c.codeAddr == common.HexToHash("0xeb7764bd977fcb339cd6e661713f4aa19e5365c98c3ea788fcea59abca46e838") &&
-		(block.firstPC == 2877 || block.firstPC == 3299 ||
+		(block.firstPC == 2848 || block.firstPC == 3236 ||
+			block.firstPC == 2877 || block.firstPC == 3299 ||
 			block.firstPC == 3373 || block.firstPC == 3754 ||
 			block.firstPC == 3762 || block.firstPC == 3793)
 	if traceStack {
