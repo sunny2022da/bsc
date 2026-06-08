@@ -1435,6 +1435,14 @@ retryBuild:
 			"initHeight", initHeight,
 			"bm", bm)
 	}
+	// Plan B: skeleton-phase broad sweep - log every block's init height for the
+	// target contract, so we can find the first block where MIR's height < stock's.
+	isTargetContract := c.codeAddr == common.HexToHash("0xeb7764bd977fcb339cd6e661713f4aa19e5365c98c3ea788fcea59abca46e838")
+	if isTargetContract && bm == skeletonBuild {
+		log.Info("[MIR B2] SKELETON-BLOCK init",
+			"firstPC", block.firstPC,
+			"initHeight", initHeight)
+	}
 
 	for pc < codeLen {
 		op := compiler.ByteCode(c.rawCode[pc])

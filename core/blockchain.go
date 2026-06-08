@@ -3694,6 +3694,11 @@ func (bc *BlockChain) traceCallTreeBothModes(parentRoot common.Hash, block *type
 						"mode", label, "depth", depth,
 						"pc", pc, "height", len(scope.StackData()))
 				}
+				// Plan B: broad sweep - log stock stack at every JUMPDEST (block boundary) in base mode.
+				if !enableMIR && depth == 1 && vm.OpCode(op) == vm.JUMPDEST {
+					log.Info("[MIR B2] BASE-JUMPDEST",
+						"pc", pc, "height", len(scope.StackData()))
+				}
 			},
 		}
 
