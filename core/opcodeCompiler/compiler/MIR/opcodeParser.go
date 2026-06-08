@@ -435,11 +435,12 @@ func (c *CFG) Parse() error {
 	}
 	// Find and dump blocks containing PHIs with resIdx in [2804, 2809] (outer
 	// PHIs that feed block@3762's entry-edge operands).
+	// Also dump block@1075 (suspected internal-function entry — first divergence point).
 	for _, b := range c.basicBlocks {
 		if b == nil {
 			continue
 		}
-		hasTarget := false
+		hasTarget := b.firstPC == 1075
 		for _, m := range b.instructions {
 			if m != nil && m.op == MirPHI && m.resIdx >= 2804 && m.resIdx <= 2809 {
 				hasTarget = true
@@ -1169,7 +1170,8 @@ func (c *CFG) connectEdgeTraceLog(parent, child *MIRBasicBlock, exitSnapshot []V
 	if c.codeAddr != common.HexToHash("0xeb7764bd977fcb339cd6e661713f4aa19e5365c98c3ea788fcea59abca46e838") {
 		return
 	}
-	if child.firstPC != 2848 && child.firstPC != 3236 &&
+	if child.firstPC != 1075 && child.firstPC != 1067 &&
+		child.firstPC != 2848 && child.firstPC != 3236 &&
 		child.firstPC != 2877 && child.firstPC != 3299 &&
 		child.firstPC != 3373 && child.firstPC != 3754 &&
 		child.firstPC != 3762 && child.firstPC != 3793 {
@@ -1425,7 +1427,8 @@ retryBuild:
 	initHeight := stack.size()
 
 	traceStack := c.codeAddr == common.HexToHash("0xeb7764bd977fcb339cd6e661713f4aa19e5365c98c3ea788fcea59abca46e838") &&
-		(block.firstPC == 2848 || block.firstPC == 3236 ||
+		(block.firstPC == 1075 || block.firstPC == 1067 ||
+			block.firstPC == 2848 || block.firstPC == 3236 ||
 			block.firstPC == 2877 || block.firstPC == 3299 ||
 			block.firstPC == 3373 || block.firstPC == 3754 ||
 			block.firstPC == 3762 || block.firstPC == 3793)
