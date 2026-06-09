@@ -3553,8 +3553,10 @@ func (bc *BlockChain) replayBlockWithoutMIRAndCompare(parentRoot common.Hash, bl
 			// Compare log entries between MIR and base. Differences here (when
 			// status/gas already agree) explain receipt-root mismatches.
 			baseLogs := replayDB.GetLogs(tx.Hash(), block.NumberU64(), block.Hash(), block.Time())
+			logDivFound := false
 			if len(mirR.Logs) != len(baseLogs) {
 				foundDiff = true
+				logDivFound = true
 				log.Error("MIR replay: log count divergence",
 					"block", block.Number(), "txIdx", txIdx, "txHash", tx.Hash(),
 					"mir.logs", len(mirR.Logs), "base.logs", len(baseLogs))
@@ -3564,12 +3566,14 @@ func (bc *BlockChain) replayBlockWithoutMIRAndCompare(parentRoot common.Hash, bl
 					bl := baseLogs[li]
 					if ml.Address != bl.Address {
 						foundDiff = true
+						logDivFound = true
 						log.Error("MIR replay: log[i].Address divergence",
 							"txIdx", txIdx, "li", li,
 							"mir.addr", ml.Address, "base.addr", bl.Address)
 					}
 					if len(ml.Topics) != len(bl.Topics) {
 						foundDiff = true
+						logDivFound = true
 						log.Error("MIR replay: log[i].Topics count divergence",
 							"txIdx", txIdx, "li", li,
 							"mir.topics", len(ml.Topics), "base.topics", len(bl.Topics))
@@ -3577,6 +3581,7 @@ func (bc *BlockChain) replayBlockWithoutMIRAndCompare(parentRoot common.Hash, bl
 						for ti := 0; ti < len(ml.Topics); ti++ {
 							if ml.Topics[ti] != bl.Topics[ti] {
 								foundDiff = true
+								logDivFound = true
 								log.Error("MIR replay: log[i].Topic[t] divergence",
 									"txIdx", txIdx, "li", li, "ti", ti,
 									"mir", ml.Topics[ti], "base", bl.Topics[ti])
@@ -3585,6 +3590,7 @@ func (bc *BlockChain) replayBlockWithoutMIRAndCompare(parentRoot common.Hash, bl
 					}
 					if !bytes.Equal(ml.Data, bl.Data) {
 						foundDiff = true
+						logDivFound = true
 						topicsStr := ""
 						for ti, t := range ml.Topics {
 							topicsStr += fmt.Sprintf(" t%d=%s", ti, t.Hex())
@@ -3597,6 +3603,11 @@ func (bc *BlockChain) replayBlockWithoutMIRAndCompare(parentRoot common.Hash, bl
 							"base.data", fmt.Sprintf("%x", bl.Data))
 					}
 				}
+			}
+			if logDivFound {
+				// Trigger detailed both-modes call tree trace so we can see the JUMPI
+				// or compute that produced the wrong LOG operand.
+				bc.traceCallTreeBothModes(parentRoot, block, blockContext, header, tx, msg, txIdx)
 			}
 
 			receiptIdx++
