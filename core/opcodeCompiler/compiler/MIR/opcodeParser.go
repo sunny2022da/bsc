@@ -878,32 +878,31 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 			block.preferredEntryHeight = -1
 		}
 		if height < 0 {
-			// Use MAX of incoming heights instead of mode-pick (smallest tie).
-			//
-			// Rationale: when a block is an internal-function entry reached from
-			// multiple call sites (each pushing a different number of args + return
-			// addr + caller-frame slots onto the EVM stack), the deepest incoming
-			// captures the true required stack frame depth. Picking the smaller
-			// height silently drops caller-frame slots, breaking downstream code
-			// that references deeper slots (e.g., shift-register loops). Shorter
-			// incomings get RuntimeVal for missing slots via the per-parent PHI
-			// build loop's `else` branch.
-			maxLen := 0
-			for _, s := range valid {
-				if len(s) > maxLen {
-					maxLen = len(s)
+			modeLen := len(valid[0])
+			if len(valid) > 1 {
+				counts := make(map[int]int, 4)
+				for _, s := range valid {
+					counts[len(s)]++
+				}
+				modeCnt := -1
+				modeLen = -1
+				for l, c := range counts {
+					if c > modeCnt || (c == modeCnt && (modeLen < 0 || l < modeLen)) {
+						modeLen = l
+						modeCnt = c
+					}
+				}
+				filtered := make([][]Value, 0, len(valid))
+				for _, s := range valid {
+					if len(s) == modeLen {
+						filtered = append(filtered, s)
+					}
+				}
+				if len(filtered) > 0 {
+					valid = filtered
 				}
 			}
-			filtered := make([][]Value, 0, len(valid))
-			for _, s := range valid {
-				if len(s) == maxLen {
-					filtered = append(filtered, s)
-				}
-			}
-			if len(filtered) > 0 {
-				valid = filtered
-			}
-			height = maxLen
+			height = modeLen
 		}
 
 		// Force PHI creation for loop headers and loop-internal merge points.
