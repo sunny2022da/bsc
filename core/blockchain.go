@@ -3585,8 +3585,14 @@ func (bc *BlockChain) replayBlockWithoutMIRAndCompare(parentRoot common.Hash, bl
 					}
 					if !bytes.Equal(ml.Data, bl.Data) {
 						foundDiff = true
+						topicsStr := ""
+						for ti, t := range ml.Topics {
+							topicsStr += fmt.Sprintf(" t%d=%s", ti, t.Hex())
+						}
 						log.Error("MIR replay: log[i].Data divergence",
 							"txIdx", txIdx, "li", li,
+							"emitter", ml.Address,
+							"topics", topicsStr,
 							"mir.data", fmt.Sprintf("%x", ml.Data),
 							"base.data", fmt.Sprintf("%x", bl.Data))
 					}
