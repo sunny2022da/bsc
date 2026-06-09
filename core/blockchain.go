@@ -18,6 +18,7 @@
 package core
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -3547,6 +3548,49 @@ func (bc *BlockChain) replayBlockWithoutMIRAndCompare(parentRoot common.Hash, bl
 					"base.sysBal", baseSysBal,
 				)
 				bc.traceCallTreeBothModes(parentRoot, block, blockContext, header, tx, msg, txIdx)
+			}
+
+			// Compare log entries between MIR and base. Differences here (when
+			// status/gas already agree) explain receipt-root mismatches.
+			baseLogs := replayDB.GetLogs(tx.Hash(), block.NumberU64(), block.Hash(), block.Time())
+			if len(mirR.Logs) != len(baseLogs) {
+				foundDiff = true
+				log.Error("MIR replay: log count divergence",
+					"block", block.Number(), "txIdx", txIdx, "txHash", tx.Hash(),
+					"mir.logs", len(mirR.Logs), "base.logs", len(baseLogs))
+			} else {
+				for li := 0; li < len(mirR.Logs); li++ {
+					ml := mirR.Logs[li]
+					bl := baseLogs[li]
+					if ml.Address != bl.Address {
+						foundDiff = true
+						log.Error("MIR replay: log[i].Address divergence",
+							"txIdx", txIdx, "li", li,
+							"mir.addr", ml.Address, "base.addr", bl.Address)
+					}
+					if len(ml.Topics) != len(bl.Topics) {
+						foundDiff = true
+						log.Error("MIR replay: log[i].Topics count divergence",
+							"txIdx", txIdx, "li", li,
+							"mir.topics", len(ml.Topics), "base.topics", len(bl.Topics))
+					} else {
+						for ti := 0; ti < len(ml.Topics); ti++ {
+							if ml.Topics[ti] != bl.Topics[ti] {
+								foundDiff = true
+								log.Error("MIR replay: log[i].Topic[t] divergence",
+									"txIdx", txIdx, "li", li, "ti", ti,
+									"mir", ml.Topics[ti], "base", bl.Topics[ti])
+							}
+						}
+					}
+					if !bytes.Equal(ml.Data, bl.Data) {
+						foundDiff = true
+						log.Error("MIR replay: log[i].Data divergence",
+							"txIdx", txIdx, "li", li,
+							"mir.data", fmt.Sprintf("%x", ml.Data),
+							"base.data", fmt.Sprintf("%x", bl.Data))
+					}
+				}
 			}
 
 			receiptIdx++
