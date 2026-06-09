@@ -881,15 +881,42 @@ func (c *CFG) getEntryStackForBlock(block *MIRBasicBlock) *ValueStack {
 			modeLen := len(valid[0])
 			if len(valid) > 1 {
 				counts := make(map[int]int, 4)
+				minLen := -1
+				maxLen := 0
 				for _, s := range valid {
 					counts[len(s)]++
+					if minLen < 0 || len(s) < minLen {
+						minLen = len(s)
+					}
+					if len(s) > maxLen {
+						maxLen = len(s)
+					}
 				}
+				// Heuristic: if incoming heights diverge widely, this is likely an
+				// internal-function-entry block merging caller frames of different
+				// depth (each call site pushes return-addr + args + leaves its own
+				// frame underneath). Mode-pick (smaller) would drop the deepest
+				// caller's frame slots; pick MAX so downstream code that references
+				// those slots (e.g., shift-register loops) gets real values.
+				// Shorter incomings get RuntimeVal for the missing slots via the
+				// per-parent PHI build loop.
+				//
+				// For small differences (typical JUMP/fall-through merge with
+				// slightly different push state), keep mode-pick smaller — picking
+				// MAX there silently keeps a slot that isn't really on the stack
+				// in the chosen path, triggering needsRuntimeEpoch in many other
+				// contracts.
+				const internalFnEntryDivergeThreshold = 5
 				modeCnt := -1
 				modeLen = -1
-				for l, c := range counts {
-					if c > modeCnt || (c == modeCnt && (modeLen < 0 || l < modeLen)) {
-						modeLen = l
-						modeCnt = c
+				if maxLen-minLen >= internalFnEntryDivergeThreshold {
+					modeLen = maxLen
+				} else {
+					for l, c := range counts {
+						if c > modeCnt || (c == modeCnt && (modeLen < 0 || l < modeLen)) {
+							modeLen = l
+							modeCnt = c
+						}
 					}
 				}
 				filtered := make([][]Value, 0, len(valid))
